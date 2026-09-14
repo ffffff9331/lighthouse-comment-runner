@@ -1,0 +1,81 @@
+{
+  "manifest_version": 3,
+  "name": "Lighthouse 自动接单助手 v0.7.83",
+  "description": "Automates first-pass Lighthouse comment tasks with a controlled Chrome session.",
+  "version": "0.7.83",
+  "icons": {
+    "16": "src/assets/icons/icon16.png",
+    "32": "src/assets/icons/icon32.png",
+    "48": "src/assets/icons/icon48.png",
+    "128": "src/assets/icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Lighthouse 自动接单助手 v0.7.83",
+    "default_icon": {
+      "16": "src/assets/icons/icon16.png",
+      "32": "src/assets/icons/icon32.png",
+      "48": "src/assets/icons/icon48.png",
+      "128": "src/assets/icons/icon128.png"
+    }
+  },
+  "options_page": "src/debug/debug.html",
+  "side_panel": {
+    "default_path": "src/debug/debug.html"
+  },
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "tabs",
+    "scripting",
+    "notifications",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://app.lhdao.top/*",
+    "https://x.com/*",
+    "https://twitter.com/*",
+    "https://*.xiaomimimo.com/*",
+    "https://api.openai.com/*",
+    "https://api.deepseek.com/*",
+    "https://api.x.ai/*",
+    "https://generativelanguage.googleapis.com/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://app.lhdao.top/*"
+      ],
+      "js": [
+        "src/content/lighthouse-alert-bridge.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://app.lhdao.top/*"
+      ],
+      "js": [
+        "src/content/lighthouse.js",
+        "src/content/lighthouse-monitor.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://x.com/*",
+        "https://twitter.com/*"
+      ],
+      "js": [
+        "src/content/x.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
