@@ -355,7 +355,7 @@ async function callAIWithSolaRetry(
     for (let index = 0; index < candidates.length; index += 1) {
       const candidate = candidates[index];
       const normalizedCandidate = normalizeBlacklistCandidateText(candidate);
-      const validation = validateFinalReplyText(normalizedCandidate, systemPrompt);
+      const validation = validateFinalReplyText(normalizedCandidate, systemPrompt, options);
       diagnostics.push(createReplyDiagnostic(`${stage}${index + 1}`, candidate, normalizedCandidate, validation));
       if (validation.ok) return { replyText: normalizedCandidate, diagnostics };
     }
@@ -363,7 +363,7 @@ async function callAIWithSolaRetry(
   }
 
   const normalizedReplyText = normalizeBlacklistCandidateText(rawReply);
-  const validation = validateFinalReplyText(normalizedReplyText, systemPrompt);
+  const validation = validateFinalReplyText(normalizedReplyText, systemPrompt, options);
   diagnostics.push(createReplyDiagnostic(stage, rawReply, normalizedReplyText, validation));
   if (validation.ok) return { replyText: normalizedReplyText, diagnostics };
 
@@ -531,18 +531,40 @@ function detectReplyTextDegeneration(value) {
   return { blocked: false, reasonCode: "", reasonText: "" };
 }
 
-function isUsableReplyText(text) {
-  const chineseChars = countReplyChineseChars(text);
-  return chineseChars >= MIN_REPLY_CHINESE_CHARS && chineseChars <= MAX_REPLY_CHINESE_CHARS;
+function getPromptReplyLengthRange(systemPrompt) {
+  const match = String(systemPrompt || "").match(/(\d{1,2})\s*(?:到|至|[-~－—])\s*(\d{1,2})\s*个?\s*(?:汉字|中文字)/i);
+  if (!match) return null;
+  const min = Math.min(Math.max(Number(match[1]), 1), 60);
+  const max = Math.min(Math.max(Number(match[2]), min), 60);
+  return { min, max };
 }
 
-function validateFinalReplyText(text, systemPrompt) {
+function getReplyLengthRange(systemPrompt, options = {}) {
+  const promptRange = getPromptReplyLengthRange(systemPrompt);
+  const taskMin = Number.parseInt(options.minChineseChars, 10);
+  const min = Math.max(
+    MIN_REPLY_CHINESE_CHARS,
+    Number.isFinite(taskMin) ? Math.min(Math.max(taskMin, 1), 60) : MIN_REPLY_CHINESE_CHARS,
+    promptRange?.min || 0
+  );
+  const max = Math.max(min, promptRange?.max || MAX_REPLY_CHINESE_CHARS);
+  return { min, max };
+}
+
+function isUsableReplyText(text, systemPrompt, options = {}) {
+  const chineseChars = countReplyChineseChars(text);
+  const range = getReplyLengthRange(systemPrompt, options);
+  return chineseChars >= range.min && chineseChars <= range.max;
+}
+
+function validateFinalReplyText(text, systemPrompt, options = {}) {
   const normalized = normalizeBlacklistCandidateText(text);
   if (!normalized) {
     return { ok: false, reason: "empty", blacklistWords: [] };
   }
-  if (!isUsableReplyText(normalized)) {
-    return { ok: false, reason: "length", blacklistWords: [] };
+  const range = getReplyLengthRange(systemPrompt, options);
+  if (!isUsableReplyText(normalized, systemPrompt, options)) {
+    return { ok: false, reason: "length", blacklistWords: [], minChineseChars: range.min, maxChineseChars: range.max };
   }
   const blacklistCheck = checkBlacklistedWords(normalized, systemPrompt);
   if (blacklistCheck.hasBlacklisted) {
@@ -566,17 +588,21 @@ function createReplyDiagnostic(stage, rawReply, normalizedReply, validation = {}
     normalized: clipReplyDiagnosticText(normalized, 90),
     charCount: countReplyChineseChars(normalized),
     reason,
-    reasonText: describeReplyFailureReason(reason, normalized, blacklistWords, validation.error),
+    reasonText: describeReplyFailureReason(reason, normalized, blacklistWords, validation.error, validation.minChineseChars, validation.maxChineseChars),
     blacklistWords
   };
 }
 
-function describeReplyFailureReason(reason, normalizedReply, blacklistWords, error) {
+function describeReplyFailureReason(reason, normalizedReply, blacklistWords, error, minChineseChars, maxChineseChars) {
   if (reason === "ok") return "通过";
   if (reason === "timeout") return `AI请求超时：${clipReplyDiagnosticText(error, 120) || "中转站在等待期限内未返回"}`;
   if (reason === "api_error") return `AI接口异常：${clipReplyDiagnosticText(error, 120) || "未知错误"}`;
   if (reason === "empty") return "AI没有返回可用文本";
-  if (reason === "length") return `中文部分长度不合规：${countReplyChineseChars(normalizedReply)}个汉字，要求${MIN_REPLY_CHINESE_CHARS}到${MAX_REPLY_CHINESE_CHARS}个汉字`;
+  if (reason === "length") {
+    const min = Number.isFinite(Number(minChineseChars)) ? Number(minChineseChars) : MIN_REPLY_CHINESE_CHARS;
+    const max = Number.isFinite(Number(maxChineseChars)) ? Number(maxChineseChars) : MAX_REPLY_CHINESE_CHARS;
+    return `中文部分长度不合规：${countReplyChineseChars(normalizedReply)}个汉字，要求${min}到${max}个汉字`;
+  }
   if (reason === "blacklist") {
     const words = Array.isArray(blacklistWords) && blacklistWords.length ? blacklistWords.join("、") : "未知黑名单词";
     return `命中黑名单：${words}`;
@@ -606,7 +632,7 @@ function getValidationRetryWords(validation) {
   }
   const reasonMap = {
     empty: "空回复",
-    length: "回复中文部分必须是5到15个汉字",
+    length: "回复中文部分长度不符合当前系统 Prompt 要求",
     REPLY_DEGENERATE_LOW_VARIETY: "回复字符重复度过高",
     REPLY_DEGENERATE_REPEATED_NGRAM: "回复重复片段过多",
     REPLY_DEGENERATE_REPEATED_WORDS: "回复词语重复度过高"
@@ -614,11 +640,12 @@ function getValidationRetryWords(validation) {
   return [reasonMap[validation.reason] || validation.reason || "回复不符合规则"];
 }
 
-function truncateReplyText(text) {
+function truncateReplyText(text, systemPrompt, options = {}) {
   if (!text) return "";
   const chars = Array.from(String(text).replace(/\s+/g, ""));
-  if (chars.length <= MAX_REPLY_CHINESE_CHARS) return chars.join("");
-  return chars.slice(0, MAX_REPLY_CHINESE_CHARS).join("");
+  const { max } = getReplyLengthRange(systemPrompt, options);
+  if (chars.length <= max) return chars.join("");
+  return chars.slice(0, max).join("");
 }
 
 function extractBlacklistCandidates(replyText) {

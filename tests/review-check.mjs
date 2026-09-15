@@ -77,6 +77,7 @@ const BLACKLIST_GLOBALS = {
 await test("every user fallback reply passes validation against prompt-declared bans", async () => {
   const c = contextFor(engine, [
     "pickUserFallbackReply", "refillFallbackReplyBag", "takeNextValidFallbackReply",
+    "getPromptReplyLengthRange", "getReplyLengthRange",
     "validateFinalReplyText", "isUsableReplyText", "normalizeBlacklistCandidateText",
     "countReplyChineseChars", "detectReplyTextDegeneration", "checkBlacklistedWords",
     "getReplyBlacklistSnapshot", "escapeRegExp"

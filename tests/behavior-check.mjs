@@ -716,6 +716,21 @@ await test("AI timeout records two diagnostics before Lighthouse uses its fallba
   assert.ok(result.diagnostics.every((item) => item.reason === "timeout"));
   assert.ok(result.diagnostics.every((item) => /AI请求超时/.test(item.reasonText)));
 });
+await test("prompt-declared reply length overrides the default validator range", () => {
+  const c = contextFor(engine, ["getPromptReplyLengthRange", "getReplyLengthRange", "isUsableReplyText", "validateFinalReplyText", "normalizeBlacklistCandidateText", "countReplyChineseChars"], {
+    MIN_REPLY_CHINESE_CHARS: 5,
+    MAX_REPLY_CHINESE_CHARS: 15,
+    checkBlacklistedWords: () => ({ hasBlacklisted: false, words: [] }),
+    detectReplyTextDegeneration: () => ({ blocked: false, reasonCode: "" })
+  });
+  const prompt = "回复10到20个汉字为主";
+  const range = c.getReplyLengthRange(prompt);
+  assert.equal(range.min, 10);
+  assert.equal(range.max, 20);
+  assert.equal(c.validateFinalReplyText("一二三四五六七八九十一二三四五六七八", prompt).ok, true);
+  assert.equal(c.validateFinalReplyText("一二三四五六七八九", prompt).reason, "length");
+  assert.equal(c.validateFinalReplyText("一二三四五六七八九十一二三四五六七八九十一", prompt).reason, "length");
+});
 await test("AI timeout has an explicit duration diagnostic", async () => {
   const c = contextFor(engine, ["callAIProvider"], {
     AI_PROVIDER_CONFIG: { deepseek: { endpoint: "https://invalid.test", model: "test" } },
