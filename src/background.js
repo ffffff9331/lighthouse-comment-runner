@@ -1511,7 +1511,7 @@ async function generateAIReplyForTweet(tweet, task, runId = runtimeState.runId) 
       ...(tweet || {}),
       url: (tweet && tweet.url) || (task && task.tweetUrl) || ""
     },
-    { signal: controller.signal, timeout: 60000 }
+    { signal: controller.signal, timeout: 120000 }
   );
   if (controller.signal.aborted || runId !== runtimeState.runId || !runtimeState.running) throw new Error("任务已停止，丢弃 AI 结果");
   runtimeState.currentTask = {

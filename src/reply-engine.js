@@ -103,10 +103,12 @@ const REPLY_HARD_BAN_PHRASES = [
 
 const MIN_REPLY_CHINESE_CHARS = 5;
 const MAX_REPLY_CHINESE_CHARS = 15;
-// One initial request plus five retries. The final attempt may use the
-// multi-candidate prompt, but every provider call shares this total budget.
+// One initial request plus five retries for fast, recoverable provider errors.
+// A timeout gets exactly one delayed retry. Further retries can overlap with a
+// slow relay's in-flight request and cause duplicate paid calls.
 const MAX_AI_NORMAL_ATTEMPTS = 6;
-const DEFAULT_AI_TIMEOUT_MS = 60000;
+const MAX_AI_TIMEOUT_ATTEMPTS = 2;
+const DEFAULT_AI_TIMEOUT_MS = 120000;
 const USER_FALLBACK_REPLIES = [
   "细节很容易被忽略",
   "角度还挺特别的",
@@ -289,11 +291,29 @@ async function callAIWithSolaRetry(
     rawReply = await callAIProvider(provider, apiKey, systemPrompt, tweetContent, options);
   } catch (error) {
     if (options.signal?.aborted) throw new Error("任务已停止");
+    const timedOut = isAIRequestTimeoutError(error);
     diagnostics.push(createReplyDiagnostic(stage, "", "", {
-      reason: "api_error",
+      reason: timedOut ? "timeout" : "api_error",
       error: error?.message || String(error),
       blacklistWords: []
     }));
+    if (timedOut) {
+      if (aiAttempt < MAX_AI_TIMEOUT_ATTEMPTS - 1) {
+        await delay(2000);
+        return callAIWithSolaRetry(
+          provider,
+          apiKey,
+          systemPrompt,
+          tweetContent,
+          options,
+          blacklistRetryCount,
+          false,
+          diagnostics,
+          aiAttempt + 1
+        );
+      }
+      return { replyText: "", diagnostics };
+    }
     if (aiAttempt < MAX_AI_NORMAL_ATTEMPTS - 1) {
       await delay(800);
       return callAIWithSolaRetry(
@@ -358,6 +378,10 @@ async function callAIWithSolaRetry(
     diagnostics,
     aiAttempt
   );
+}
+
+function isAIRequestTimeoutError(error) {
+  return /AI\s*请求超时[：:]\s*\d+ms/i.test(String(error?.message || error || ""));
 }
 
 async function retryAIReplyAfterValidation(
@@ -549,6 +573,7 @@ function createReplyDiagnostic(stage, rawReply, normalizedReply, validation = {}
 
 function describeReplyFailureReason(reason, normalizedReply, blacklistWords, error) {
   if (reason === "ok") return "通过";
+  if (reason === "timeout") return `AI请求超时：${clipReplyDiagnosticText(error, 120) || "中转站在等待期限内未返回"}`;
   if (reason === "api_error") return `AI接口异常：${clipReplyDiagnosticText(error, 120) || "未知错误"}`;
   if (reason === "empty") return "AI没有返回可用文本";
   if (reason === "length") return `中文部分长度不合规：${countReplyChineseChars(normalizedReply)}个汉字，要求${MIN_REPLY_CHINESE_CHARS}到${MAX_REPLY_CHINESE_CHARS}个汉字`;

@@ -675,14 +675,16 @@ await test("AI cancellation aborts fetch without a retry", async () => {
   await assert.rejects(pending, /任务已停止/);
   assert.equal(calls, 1);
 });
-await test("AI generation uses a 60s timeout and five retries", () => {
-  assert.match(engine, /const DEFAULT_AI_TIMEOUT_MS = 60000/);
+await test("AI generation uses a 120s timeout with one controlled timeout retry", () => {
+  assert.match(engine, /const DEFAULT_AI_TIMEOUT_MS = 120000/);
   assert.match(engine, /const MAX_AI_NORMAL_ATTEMPTS = 6/);
-  assert.match(background, /timeout: 60000/);
+  assert.match(engine, /const MAX_AI_TIMEOUT_ATTEMPTS = 2/);
+  assert.match(background, /timeout: 120000/);
+  assert.match(engine, /pickUserFallbackReply\(tweetContent, basePrompt\)/);
 });
 await test("AI provider failure performs exactly five retries", async () => {
   let calls = 0;
-  const c = contextFor(engine, ["callAIProvider", "callAIWithSolaRetry", "createReplyDiagnostic", "clipReplyDiagnosticText", "countReplyChineseChars", "describeReplyFailureReason"], {
+  const c = contextFor(engine, ["callAIProvider", "callAIWithSolaRetry", "isAIRequestTimeoutError", "createReplyDiagnostic", "clipReplyDiagnosticText", "countReplyChineseChars", "describeReplyFailureReason"], {
     MAX_AI_NORMAL_ATTEMPTS: 6,
     AI_PROVIDER_CONFIG: { deepseek: { endpoint: "https://invalid.test", model: "test" } },
     normalizeCustomAIEndpoint: () => "",
@@ -696,6 +698,23 @@ await test("AI provider failure performs exactly five retries", async () => {
   assert.equal(calls, 6);
   assert.equal(result.diagnostics.length, 6);
   assert.ok(result.diagnostics.every((item) => item.reason === "api_error"));
+});
+await test("AI timeout records two diagnostics before Lighthouse uses its fallback", async () => {
+  let calls = 0;
+  const c = contextFor(engine, ["callAIWithSolaRetry", "isAIRequestTimeoutError", "createReplyDiagnostic", "clipReplyDiagnosticText", "countReplyChineseChars", "describeReplyFailureReason"], {
+    MAX_AI_TIMEOUT_ATTEMPTS: 2,
+    callAIProvider: async () => {
+      calls += 1;
+      throw new Error("AI 请求超时：120000ms");
+    },
+    delay: async () => {}
+  });
+  const result = await c.callAIWithSolaRetry("openai", "test-key", "prompt", "tweet", {});
+  assert.equal(calls, 2);
+  assert.equal(result.replyText, "");
+  assert.equal(result.diagnostics.length, 2);
+  assert.ok(result.diagnostics.every((item) => item.reason === "timeout"));
+  assert.ok(result.diagnostics.every((item) => /AI请求超时/.test(item.reasonText)));
 });
 await test("AI timeout has an explicit duration diagnostic", async () => {
   const c = contextFor(engine, ["callAIProvider"], {
