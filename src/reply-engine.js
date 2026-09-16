@@ -110,18 +110,18 @@ const MAX_AI_NORMAL_ATTEMPTS = 6;
 const MAX_AI_TIMEOUT_ATTEMPTS = 2;
 const DEFAULT_AI_TIMEOUT_MS = 120000;
 const USER_FALLBACK_REPLIES = [
-  "细节很容易被忽略",
-  "角度还挺特别的",
-  "原来还能这么理解",
-  "前后对比就清楚了",
-  "关键点说得很直白",
-  "读到这里停了一下",
-  "逻辑一下就顺了",
-  "结论比想象中直接",
-  "问题比想象中现实",
-  "数据放一起更直观",
-  "换个角度就明白了",
-  "细节比结论更有用"
+  "听着像个挺有趣的实验",
+  "评论区已经开始整活了",
+  "回复区的气氛已经到位",
+  "看样子大家都挺会接梗",
+  "一眼看去全是熟人互动",
+  "感觉大家已经玩明白了",
+  "评论区像在开小型团建",
+  "有点想看看后面怎么发展",
+  "大家好像都找到节奏了",
+  "看得出大家都在认真接梗",
+  "今天的评论区格外热闹",
+  "随手一发评论区就热闹了"
 ];
 
 let loadedReplyBlacklist = [...DEFAULT_REPLY_BLACKLIST];
@@ -167,9 +167,19 @@ async function generateLighthouseAIReply(aiConfig, tweet, options = {}) {
     timeout: options.timeout || DEFAULT_AI_TIMEOUT_MS
   });
   const diagnostics = replyResult?.diagnostics || [];
-  const finalReplyText = replyResult?.replyText || await pickUserFallbackReply(tweetContent, basePrompt);
+  let finalReplyText = replyResult?.replyText || "";
+  let fallback = false;
+  if (!finalReplyText) {
+    try {
+      finalReplyText = await pickUserFallbackReply(tweetContent, basePrompt);
+      fallback = true;
+    } catch (error) {
+      error.diagnostics = diagnostics;
+      throw error;
+    }
+  }
 
-  return { ok: true, replyText: finalReplyText, tweetContent, provider, fallback: !replyResult?.replyText, diagnostics };
+  return { ok: true, replyText: finalReplyText, tweetContent, provider, fallback, diagnostics };
 }
 
 async function callAIProvider(provider, apiKey, systemPrompt, tweetContent, options) {

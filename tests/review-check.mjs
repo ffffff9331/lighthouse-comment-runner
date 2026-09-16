@@ -45,18 +45,18 @@ function contextFor(source, names, globals = {}) {
 }
 
 const USER_FALLBACK_REPLIES = [
-  "细节很容易被忽略",
-  "角度还挺特别的",
-  "原来还能这么理解",
-  "前后对比就清楚了",
-  "关键点说得很直白",
-  "读到这里停了一下",
-  "逻辑一下就顺了",
-  "结论比想象中直接",
-  "问题比想象中现实",
-  "数据放一起更直观",
-  "换个角度就明白了",
-  "细节比结论更有用"
+  "听着像个挺有趣的实验",
+  "评论区已经开始整活了",
+  "回复区的气氛已经到位",
+  "看样子大家都挺会接梗",
+  "一眼看去全是熟人互动",
+  "感觉大家已经玩明白了",
+  "评论区像在开小型团建",
+  "有点想看看后面怎么发展",
+  "大家好像都找到节奏了",
+  "看得出大家都在认真接梗",
+  "今天的评论区格外热闹",
+  "随手一发评论区就热闹了"
 ];
 const BLACKLIST_GLOBALS = {
   DEFAULT_AI_SYSTEM_PROMPT: "prompt",
@@ -82,7 +82,7 @@ await test("every user fallback reply passes validation against prompt-declared 
     "countReplyChineseChars", "detectReplyTextDegeneration", "checkBlacklistedWords",
     "getReplyBlacklistSnapshot", "escapeRegExp"
   ], BLACKLIST_GLOBALS);
-  const prompt = "生成词黑名单：细节很容易被忽略";
+  const prompt = "10到20个汉字为主\n生成词黑名单：评论区";
   const seen = [];
   for (let index = 0; index < 12; index += 1) {
     const reply = await c.pickUserFallbackReply("tweet", prompt);
@@ -93,7 +93,7 @@ await test("every user fallback reply passes validation against prompt-declared 
       `fallback reply failed validation: ${reply}`
     );
   }
-  assert.ok(!seen.includes("细节很容易被忽略"), "prompt-banned fallback must never be returned");
+  assert.ok(!seen.some((reply) => reply.includes("评论区")), "prompt-banned fallback must never be returned");
 });
 
 // Failure path: notification icons referenced from the service worker must

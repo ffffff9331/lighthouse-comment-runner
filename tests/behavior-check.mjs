@@ -716,6 +716,29 @@ await test("AI timeout records two diagnostics before Lighthouse uses its fallba
   assert.ok(result.diagnostics.every((item) => item.reason === "timeout"));
   assert.ok(result.diagnostics.every((item) => /AI请求超时/.test(item.reasonText)));
 });
+await test("failed Lighthouse fallback preserves AI diagnostics for the runtime log", async () => {
+  const diagnostics = [{ ok: false, reason: "length", reasonText: "中文部分长度不合规" }];
+  const c = contextFor(engine, ["generateLighthouseAIReply"], {
+    DEFAULT_AI_SYSTEM_PROMPT: "prompt",
+    DEFAULT_AI_TIMEOUT_MS: 120000,
+    ensureReplyBlacklistLoaded: async () => {},
+    normalizeProvider: () => "deepseek",
+    buildTweetContent: () => "tweet",
+    appendReplyHardBanInstruction: (prompt) => prompt,
+    appendEventReplyGuardInstruction: (prompt) => prompt,
+    callAIWithSolaRetry: async () => ({ replyText: "", diagnostics }),
+    pickUserFallbackReply: async () => { throw new Error("兜底回复不可用"); }
+  });
+  await assert.rejects(
+    c.generateLighthouseAIReply({ provider: "deepseek", apiKey: "test", systemPrompt: "prompt" }, {}),
+    (error) => {
+      assert.equal(error.message, "兜底回复不可用");
+      assert.equal(error.diagnostics?.length, 1);
+      assert.equal(error.diagnostics?.[0]?.reason, "length");
+      return true;
+    }
+  );
+});
 await test("prompt-declared reply length overrides the default validator range", () => {
   const c = contextFor(engine, ["getPromptReplyLengthRange", "getReplyLengthRange", "isUsableReplyText", "validateFinalReplyText", "normalizeBlacklistCandidateText", "countReplyChineseChars"], {
     MIN_REPLY_CHINESE_CHARS: 5,
