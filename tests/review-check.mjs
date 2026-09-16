@@ -60,11 +60,11 @@ const USER_FALLBACK_REPLIES = [
 ];
 const BLACKLIST_GLOBALS = {
   DEFAULT_AI_SYSTEM_PROMPT: "prompt",
-  DEFAULT_REPLY_BLACKLIST: ["\n", "确实", "有点东西", "真香"],
+  DEFAULT_REPLY_BLACKLIST: ["\n", "有点东西", "真香"],
   REPLY_STRUCTURAL_BLACKLIST: [{ label: "句首这系起手", regex: /^[\s'"“”‘’「」『』()（）【】]*?(?:这|这个|这条|这类|这种|这波)/i }],
   REPLY_HARD_BAN_PHRASES: ["值得关注"],
   MIN_REPLY_CHINESE_CHARS: 5,
-  MAX_REPLY_CHINESE_CHARS: 15,
+  MAX_REPLY_CHINESE_CHARS: 20,
   USER_FALLBACK_REPLIES,
   fallbackReplyBag: [],
   loadedReplyBlacklist: [],
@@ -94,6 +94,29 @@ await test("every user fallback reply passes validation against prompt-declared 
     );
   }
   assert.ok(!seen.some((reply) => reply.includes("评论区")), "prompt-banned fallback must never be returned");
+});
+
+// Adjacent regression: ordinary conversational wording must not be rejected
+// merely because it appears in an outdated built-in blacklist entry.
+await test("common word 确实 is accepted when the user prompt does not ban it", async () => {
+  const c = contextFor(engine, [
+    "validateFinalReplyText", "isUsableReplyText", "normalizeBlacklistCandidateText",
+    "countReplyChineseChars", "detectReplyTextDegeneration", "checkBlacklistedWords",
+    "getReplyBlacklistSnapshot", "escapeRegExp", "getPromptReplyLengthRange",
+    "getReplyLengthRange"
+  ], BLACKLIST_GLOBALS);
+  const prompt = "5到20个汉字";
+  assert.equal(c.validateFinalReplyText("确实挺不错", prompt).ok, true);
+  assert.equal(c.validateFinalReplyText("确实能感觉到这次细节做得相当认真也很有分寸", prompt).reason, "length");
+});
+
+// The extension loads this shipped text file at runtime. Keep its contents in
+// sync with the in-memory default so a word removed from the default list is
+// not silently reintroduced by the packaged file.
+await test("shipped reply blacklist does not re-ban 确实", () => {
+  const c = contextFor(engine, ["parseReplyBlacklistText"]);
+  const shippedBlacklist = c.parseReplyBlacklistText(read("src/reply_blacklist.txt"));
+  assert.equal(shippedBlacklist.includes("确实"), false);
 });
 
 // Failure path: notification icons referenced from the service worker must

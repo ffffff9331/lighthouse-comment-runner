@@ -760,7 +760,7 @@ await test("Lighthouse runtime logs diagnostics when fallback generation fails",
 await test("prompt-declared reply length overrides the default validator range", () => {
   const c = contextFor(engine, ["getPromptReplyLengthRange", "getReplyLengthRange", "isUsableReplyText", "validateFinalReplyText", "normalizeBlacklistCandidateText", "countReplyChineseChars"], {
     MIN_REPLY_CHINESE_CHARS: 5,
-    MAX_REPLY_CHINESE_CHARS: 15,
+    MAX_REPLY_CHINESE_CHARS: 20,
     checkBlacklistedWords: () => ({ hasBlacklisted: false, words: [] }),
     detectReplyTextDegeneration: () => ({ blocked: false, reasonCode: "" })
   });
@@ -1249,11 +1249,12 @@ if (platform === "xinhuo") {
     const nextPrompt = "new grounded prompt";
     const c = contextFor(background, ["migrateSettings"], {
       LIGHTHOUSE_DEFAULT_AI_SYSTEM_PROMPT: nextPrompt,
+      LIGHTHOUSE_PREVIOUS_DEFAULT_AI_SYSTEM_PROMPT: "previous default prompt",
       DEFAULT_SETTINGS: { replyMode: "post" }
     });
     const migrated = c.migrateSettings({ settingsVersion: 10, aiSystemPrompt: "你是普通中文用户，帮我写一条推文回复。像路过随手回一句。" });
     assert.equal(migrated.settings.aiSystemPrompt, nextPrompt);
-    assert.equal(migrated.settings.settingsVersion, 13);
+    assert.equal(migrated.settings.settingsVersion, 14);
     const custom = c.migrateSettings({ settingsVersion: 10, aiSystemPrompt: "保留我的自定义提示词" });
     assert.equal(custom.settings.aiSystemPrompt, "保留我的自定义提示词");
   });
@@ -1368,15 +1369,20 @@ if (platform === "xinhuo") {
   await test("settings v13 fills Terra model only for Terra and defaults a missing reply mode to post", () => {
     const c = contextFor(background, ["migrateSettings"], {
       LIGHTHOUSE_DEFAULT_AI_SYSTEM_PROMPT: "new prompt",
+      LIGHTHOUSE_PREVIOUS_DEFAULT_AI_SYSTEM_PROMPT: "previous default prompt",
       DEFAULT_SETTINGS: { replyMode: "post" }
     });
     const terra = c.migrateSettings({ settingsVersion: 12, aiProvider: "gpt-5.6-terra", aiModel: "" });
     assert.equal(terra.settings.aiModel, "gpt-5.6-terra");
     assert.equal(terra.settings.replyMode, "post");
-    assert.equal(terra.settings.settingsVersion, 13);
+    assert.equal(terra.settings.settingsVersion, 14);
     const deepseek = c.migrateSettings({ settingsVersion: 12, aiProvider: "deepseek", aiModel: "", replyMode: "fill" });
     assert.equal(deepseek.settings.aiModel, "");
     assert.equal(deepseek.settings.replyMode, "fill");
+    const updatedDefault = c.migrateSettings({ settingsVersion: 13, aiSystemPrompt: "previous default prompt" });
+    assert.equal(updatedDefault.settings.aiSystemPrompt, "new prompt");
+    const custom = c.migrateSettings({ settingsVersion: 13, aiSystemPrompt: "保留我的 10 到 15 字自定义规则" });
+    assert.equal(custom.settings.aiSystemPrompt, "保留我的 10 到 15 字自定义规则");
   });
 }
 console.log(`${platform}: ${passed} behavioral checks passed.`);

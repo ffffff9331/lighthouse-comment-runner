@@ -80,7 +80,7 @@ assert.doesNotMatch(debugPage, /button\.addEventListener\("click", async \(\) =>
 assert.match(xPage, /activeStepName !== "RUN_X_REPLY"/);
 assert.match(xPage, /url\.pathname !== "\/compose\/post"/);
 assert.match(xPage, /Date\.now\(\) - activeStepStartedAt > 45000/);
-assert.match(background, /settingsVersion: 13/);
+assert.match(background, /settingsVersion: 14/);
 assert.match(background, /model: settings\.aiModel/);
 assert.match(background, /aiModel: String\(merged\.aiModel/);
 assert.match(debugPage, /aiModel: fields\.aiModel\.value\.trim\(\)/);

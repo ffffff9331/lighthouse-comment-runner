@@ -10,7 +10,8 @@ const AUTO_RUN_STATE_KEY = "lighthouseAutoRunStateV1";
 // auto run on the next tick.
 const AUTO_RUN_KEEPALIVE_ALARM = "lighthouseAutoRunKeepaliveV1";
 const SITE_X_OPEN_WAIT_MS = 5000;
-const LIGHTHOUSE_DEFAULT_AI_SYSTEM_PROMPT = "根据原推文写一句自然的中文回复。像真实用户刷到后随手留下的感受，简短、有一点具体反应，不必完整表达观点。10到15个汉字为主，可保留必要的英文词。避免宣传腔、总结腔、夸张吹捧、复述原文和模板化感叹。只输出回复。";
+const LIGHTHOUSE_PREVIOUS_DEFAULT_AI_SYSTEM_PROMPT = "根据原推文写一句自然的中文回复。像真实用户刷到后随手留下的感受，简短、有一点具体反应，不必完整表达观点。10到15个汉字为主，可保留必要的英文词。避免宣传腔、总结腔、夸张吹捧、复述原文和模板化感叹。只输出回复。";
+const LIGHTHOUSE_DEFAULT_AI_SYSTEM_PROMPT = "根据原推文写一句自然的中文回复。像真实用户刷到后随手留下的感受，简短、有一点具体反应，不必完整表达观点。5到20个汉字为主，可保留必要的英文词。避免宣传腔、总结腔、夸张吹捧、复述原文和模板化感叹。只输出回复。";
 const MONITOR_COUNTDOWN_CACHE_TTL_MS = 25000;
 const ATTEMPTED_TASK_DEDUPE_MS = 3 * 60 * 1000;
 const MAX_DEFERRED_TASK_DEDUPE_MS = 6 * 60 * 60 * 1000;
@@ -27,7 +28,7 @@ const DEFAULT_MIMO_BASE_URL = "https://api.xiaomimimo.com/v1";
 const DEFAULT_MIMO_API_KEY = "";
 
 const DEFAULT_SETTINGS = {
-  settingsVersion: 13,
+  settingsVersion: 14,
   runMode: "debug",
   actionDelayMs: 1200,
   lockSeatTimeoutMs: 60000,
@@ -2416,6 +2417,15 @@ function migrateSettings(settings) {
     next.settingsVersion = 13;
     changed = true;
   }
+  if (version < 14) {
+    const currentPrompt = String(next.aiSystemPrompt || "").trim();
+    if (currentPrompt === LIGHTHOUSE_PREVIOUS_DEFAULT_AI_SYSTEM_PROMPT) {
+      next.aiSystemPrompt = LIGHTHOUSE_DEFAULT_AI_SYSTEM_PROMPT;
+      changed = true;
+    }
+    next.settingsVersion = 14;
+    changed = true;
+  }
   return { settings: next, changed };
 }
 
@@ -2431,7 +2441,7 @@ function normalizeSettings(settings) {
 
   return {
     ...merged,
-    settingsVersion: 13,
+    settingsVersion: 14,
     runMode: merged.runMode === "auto" ? "auto" : "debug",
     actionDelayMs: Number.isFinite(parsedDelay) ? Math.max(500, parsedDelay) : DEFAULT_SETTINGS.actionDelayMs,
     lockSeatTimeoutMs: Number.isFinite(parsedLockTimeout) ? Math.min(Math.max(parsedLockTimeout, 5000), 300000) : DEFAULT_SETTINGS.lockSeatTimeoutMs,
