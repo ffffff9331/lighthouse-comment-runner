@@ -739,6 +739,24 @@ await test("failed Lighthouse fallback preserves AI diagnostics for the runtime 
     }
   );
 });
+await test("Lighthouse runtime logs diagnostics when fallback generation fails", async () => {
+  const diagnostics = [{ ok: false, reason: "length" }];
+  let logged = [];
+  const c = contextFor(background, ["generateAIReplyForTweet"], {
+    runtimeState: { runId: "run-1", running: true, currentTask: null },
+    activeAIRequests: new Set(),
+    getSettings: async () => ({}),
+    generateLighthouseAIReply: async () => {
+      const error = new Error("兜底回复不可用");
+      error.diagnostics = diagnostics;
+      throw error;
+    },
+    logReplyDiagnostics: (items) => { logged = items; }
+  });
+  await assert.rejects(c.generateAIReplyForTweet({}, {}, "run-1"), /兜底回复不可用/);
+  assert.equal(logged.length, 1);
+  assert.equal(logged[0].reason, "length");
+});
 await test("prompt-declared reply length overrides the default validator range", () => {
   const c = contextFor(engine, ["getPromptReplyLengthRange", "getReplyLengthRange", "isUsableReplyText", "validateFinalReplyText", "normalizeBlacklistCandidateText", "countReplyChineseChars"], {
     MIN_REPLY_CHINESE_CHARS: 5,

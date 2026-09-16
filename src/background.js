@@ -1498,37 +1498,42 @@ async function generateAIReplyForTweet(tweet, task, runId = runtimeState.runId) 
   const controller = new AbortController();
   activeAIRequests.add(controller);
   try {
-  const settings = await getSettings();
-  const result = await generateLighthouseAIReply(
-    {
-      provider: settings.aiProvider,
-      model: settings.aiModel,
-      apiUrl: settings.aiApiUrl,
-      apiKey: settings.aiApiKey,
-      systemPrompt: settings.aiSystemPrompt
-    },
-    {
-      ...(tweet || {}),
-      url: (tweet && tweet.url) || (task && task.tweetUrl) || ""
-    },
-    { signal: controller.signal, timeout: 120000 }
-  );
-  if (controller.signal.aborted || runId !== runtimeState.runId || !runtimeState.running) throw new Error("任务已停止，丢弃 AI 结果");
-  runtimeState.currentTask = {
-    ...(runtimeState.currentTask || task || {}),
-    generatedReplyText: result.replyText,
-    tweetContent: result.tweetContent,
-    aiReplyDiagnostics: Array.isArray(result.diagnostics) ? result.diagnostics : []
-  };
-  const failedDiagnostics = (result.diagnostics || []).filter((item) => item && !item.ok);
-  if (result.fallback) {
-    logReplyDiagnostics(result.diagnostics);
-    log("warn", `AI 请求失败，使用用户兜底回复：${result.replyText}`);
-  } else {
-    if (failedDiagnostics.length) logReplyDiagnostics(result.diagnostics);
-    log("info", `AI 已生成回复：${result.replyText}`);
-  }
-  return { ok: true, replyText: result.replyText, tweetContent: result.tweetContent, provider: result.provider, state: runtimeState };
+    const settings = await getSettings();
+    const result = await generateLighthouseAIReply(
+      {
+        provider: settings.aiProvider,
+        model: settings.aiModel,
+        apiUrl: settings.aiApiUrl,
+        apiKey: settings.aiApiKey,
+        systemPrompt: settings.aiSystemPrompt
+      },
+      {
+        ...(tweet || {}),
+        url: (tweet && tweet.url) || (task && task.tweetUrl) || ""
+      },
+      { signal: controller.signal, timeout: 120000 }
+    );
+    if (controller.signal.aborted || runId !== runtimeState.runId || !runtimeState.running) throw new Error("任务已停止，丢弃 AI 结果");
+    runtimeState.currentTask = {
+      ...(runtimeState.currentTask || task || {}),
+      generatedReplyText: result.replyText,
+      tweetContent: result.tweetContent,
+      aiReplyDiagnostics: Array.isArray(result.diagnostics) ? result.diagnostics : []
+    };
+    const failedDiagnostics = (result.diagnostics || []).filter((item) => item && !item.ok);
+    if (result.fallback) {
+      logReplyDiagnostics(result.diagnostics);
+      log("warn", `AI 请求失败，使用用户兜底回复：${result.replyText}`);
+    } else {
+      if (failedDiagnostics.length) logReplyDiagnostics(result.diagnostics);
+      log("info", `AI 已生成回复：${result.replyText}`);
+    }
+    return { ok: true, replyText: result.replyText, tweetContent: result.tweetContent, provider: result.provider, state: runtimeState };
+  } catch (error) {
+    if (Array.isArray(error?.diagnostics) && error.diagnostics.length) {
+      logReplyDiagnostics(error.diagnostics);
+    }
+    throw error;
   } finally {
     activeAIRequests.delete(controller);
   }
