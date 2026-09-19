@@ -326,6 +326,26 @@ if (platform === "lighthouse") {
     });
     assert.equal(c.hasTaskUnavailableError(), true);
   });
+  await test("marketplace task metadata is never treated as a detail load failure", () => {
+    const c = contextFor(page, ["hasDetailRequestTimeout", "hasRecoverableDetailLoadFailure"], {
+      document: { body: { innerText: "任务广场 任务 ID: abc-123 Request timeout" } },
+      findTaskDetailRoot: () => null,
+      hasTaskDetailOverlayShell: () => false,
+      hasTaskUnavailableError: () => false
+    });
+    assert.equal(c.hasDetailRequestTimeout(), false);
+    assert.equal(c.hasRecoverableDetailLoadFailure(), false);
+  });
+  await test("detail overlay load failure remains detectable", () => {
+    const c = contextFor(page, ["hasDetailRequestTimeout", "hasRecoverableDetailLoadFailure"], {
+      document: { body: { innerText: "Request timeout id: abc-123" } },
+      findTaskDetailRoot: () => null,
+      hasTaskDetailOverlayShell: () => true,
+      hasTaskUnavailableError: () => false
+    });
+    assert.equal(c.hasDetailRequestTimeout(), true);
+    assert.equal(c.hasRecoverableDetailLoadFailure(), true);
+  });
   await test("scrolled-out header icons are not treated as close buttons", () => {
     const icon = { innerText: "", value: "", getAttribute: () => "接单额度说明", getBoundingClientRect: () => ({ top: -172, left: 706, width: 14, height: 14 }) };
     const cross = { innerText: "×", value: "", getAttribute: () => "", getBoundingClientRect: () => ({ top: 40, left: 1400, width: 24, height: 24 }) };

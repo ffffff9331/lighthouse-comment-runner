@@ -1307,7 +1307,10 @@
   }
 
   function hasDetailRequestTimeout() {
-    const text = normalize(document.body?.innerText || "");
+    const detailRoot = findTaskDetailRoot();
+    const text = detailRoot
+      ? normalize(detailRoot.innerText || detailRoot.textContent || "")
+      : (hasTaskDetailOverlayShell() ? normalize(document.body?.innerText || "") : "");
     return text.includes("详情加载失败") || /request\s*timeout/i.test(text);
   }
 
@@ -1405,7 +1408,10 @@
   }
 
   function hasRecoverableDetailLoadFailure() {
-    const text = normalize(document.body?.innerText || "");
+    const detailRoot = findTaskDetailRoot();
+    const text = detailRoot
+      ? normalize(detailRoot.innerText || detailRoot.textContent || "")
+      : (hasTaskDetailOverlayShell() ? normalize(document.body?.innerText || "") : "");
     return text.includes("详情加载失败")
       || text.includes("Failed to fetch")
       || text.includes("Request timeout")
@@ -1415,11 +1421,10 @@
 
   function hasTaskUnavailableError() {
     const detailRoot = findTaskDetailRoot();
-    const detailText = normalize(detailRoot?.innerText || detailRoot?.textContent || "");
-    if (TASK_UNAVAILABLE_MARKERS.some((marker) => detailText.includes(marker))) return true;
-    if (!hasTaskDetailOverlayShell()) return false;
-    const pageText = normalize(document.body?.innerText || "");
-    return TASK_UNAVAILABLE_MARKERS.some((marker) => pageText.includes(marker));
+    const text = detailRoot
+      ? normalize(detailRoot.innerText || detailRoot.textContent || "")
+      : (hasTaskDetailOverlayShell() ? normalize(document.body?.innerText || "") : "");
+    return TASK_UNAVAILABLE_MARKERS.some((marker) => text.includes(marker));
   }
 
   function hasTaskDetailOverlayShell() {
