@@ -308,6 +308,24 @@ if (platform === "lighthouse") {
     assert.equal(make(null).hasTaskDetailLoadingModal(), false);
     assert.equal(make({}).hasTaskDetailLoadingModal(), true);
   });
+  await test("marketplace unavailable labels are not mistaken for a detail error", () => {
+    const c = contextFor(page, ["hasTaskUnavailableError"], {
+      document: { body: { innerText: "任务广场 任务暂时无法打开 请稍后再试" } },
+      TASK_UNAVAILABLE_MARKERS: ["任务暂时无法打开", "请返回任务广场后重试"],
+      findTaskDetailRoot: () => null,
+      hasTaskDetailOverlayShell: () => false
+    });
+    assert.equal(c.hasTaskUnavailableError(), false);
+  });
+  await test("unavailable labels inside a task detail remain a detail error", () => {
+    const c = contextFor(page, ["hasTaskUnavailableError"], {
+      document: { body: { innerText: "任务广场" } },
+      TASK_UNAVAILABLE_MARKERS: ["任务暂时无法打开", "请返回任务广场后重试"],
+      findTaskDetailRoot: () => ({ innerText: "任务暂时无法打开 请返回任务广场后重试" }),
+      hasTaskDetailOverlayShell: () => false
+    });
+    assert.equal(c.hasTaskUnavailableError(), true);
+  });
   await test("scrolled-out header icons are not treated as close buttons", () => {
     const icon = { innerText: "", value: "", getAttribute: () => "接单额度说明", getBoundingClientRect: () => ({ top: -172, left: 706, width: 14, height: 14 }) };
     const cross = { innerText: "×", value: "", getAttribute: () => "", getBoundingClientRect: () => ({ top: 40, left: 1400, width: 24, height: 24 }) };

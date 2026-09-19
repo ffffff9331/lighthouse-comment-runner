@@ -1410,12 +1410,16 @@
       || text.includes("Failed to fetch")
       || text.includes("Request timeout")
       || text.includes("id:")
-      || TASK_UNAVAILABLE_MARKERS.some((marker) => text.includes(marker));
+      || hasTaskUnavailableError();
   }
 
   function hasTaskUnavailableError() {
-    const text = normalize(document.body?.innerText || "");
-    return TASK_UNAVAILABLE_MARKERS.some((marker) => text.includes(marker));
+    const detailRoot = findTaskDetailRoot();
+    const detailText = normalize(detailRoot?.innerText || detailRoot?.textContent || "");
+    if (TASK_UNAVAILABLE_MARKERS.some((marker) => detailText.includes(marker))) return true;
+    if (!hasTaskDetailOverlayShell()) return false;
+    const pageText = normalize(document.body?.innerText || "");
+    return TASK_UNAVAILABLE_MARKERS.some((marker) => pageText.includes(marker));
   }
 
   function hasTaskDetailOverlayShell() {
