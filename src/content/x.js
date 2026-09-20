@@ -28,6 +28,7 @@
   const cancelledRunIds = new Set();
   let taskWidgetObserver = null;
   let taskWidgetDebounceTimer = null;
+  let taskWidgetAssistDisabled = false;
   let lastTaskWidgetKey = "";
   let cachedTaskWidgetControls = null;
   const TASK_WIDGET_CONTROL_SELECTOR = "button,a,[role='button'],[aria-label],[title],[tabindex]";
@@ -243,18 +244,20 @@
   }
 
   function startTaskWidgetAssist() {
-    if (taskWidgetObserver || !normalizeTweetUrl(location.href)) return;
+    if (taskWidgetAssistDisabled || taskWidgetObserver || !normalizeTweetUrl(location.href)) return;
     taskWidgetObserver = new MutationObserver(scheduleTaskWidgetScan);
     taskWidgetObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
     scheduleTaskWidgetScan();
   }
 
   function scheduleTaskWidgetScan() {
+    if (taskWidgetAssistDisabled) return;
     if (taskWidgetDebounceTimer) clearTimeout(taskWidgetDebounceTimer);
     taskWidgetDebounceTimer = setTimeout(scanTaskWidget, 900);
   }
 
   function scanTaskWidget() {
+    if (taskWidgetAssistDisabled) return;
     if (!normalizeTweetUrl(location.href)) return;
     const widget = findLighthouseTaskWidget();
     if (!widget) return;
@@ -266,11 +269,32 @@
     if (key === lastTaskWidgetKey) return;
     lastTaskWidgetKey = key;
 
-    chrome.runtime.sendMessage({
-      type: "X_TASK_WIDGET_HINT",
-      state,
-      tweetUrl: normalizeTweetUrl(location.href)
-    }).catch?.(() => {});
+    sendTaskWidgetHint(state, normalizeTweetUrl(location.href));
+  }
+
+  function sendTaskWidgetHint(state, tweetUrl) {
+    try {
+      chrome.runtime.sendMessage({ type: "X_TASK_WIDGET_HINT", state, tweetUrl }).catch?.((error) => {
+        if (isExtensionContextInvalidatedError(error)) disableTaskWidgetAssist();
+      });
+      return true;
+    } catch (error) {
+      if (!isExtensionContextInvalidatedError(error)) throw error;
+      disableTaskWidgetAssist();
+      return false;
+    }
+  }
+
+  function disableTaskWidgetAssist() {
+    taskWidgetAssistDisabled = true;
+    if (taskWidgetDebounceTimer) clearTimeout(taskWidgetDebounceTimer);
+    taskWidgetDebounceTimer = null;
+    taskWidgetObserver?.disconnect();
+    taskWidgetObserver = null;
+  }
+
+  function isExtensionContextInvalidatedError(error) {
+    return /Extension context invalidated/i.test(String(error?.message || error || ""));
   }
 
   function findLighthouseTaskWidget() {

@@ -770,7 +770,11 @@ async function startAutoRun(options, windowId = null) {
   await ensureAutoRunKeepalive();
   const tab = await getOrCreateLighthouseTab(runtimeState.startOptions?.lighthouseUrl || LIGHTHOUSE_CAMPAIGNS_URL);
   rememberLighthouseTab(tab);
-  await chrome.tabs.update(tab.id, { active: true });
+  if (!await focusLighthouseTabForAutoScan(tab.id)) {
+    log("warn", "Chrome 正在调整 Lighthouse 标签，稍后继续检测任务广场");
+    await delay(Math.max(settings.actionDelayMs, 1000));
+    return startNextAutoTask("retry_after_lighthouse_tab_busy");
+  }
   await waitForTabComplete(tab.id);
   runtimeState.scheduledResumeAt = 0;
   log("info", "全量检测已启动：按旧任务页锁定流程顺序执行");
@@ -806,7 +810,11 @@ async function startNextAutoTask(reason) {
   const tabId = (await getOrCreateLighthouseTab(LIGHTHOUSE_CAMPAIGNS_URL)).id;
   if (!isActiveAutoRun(runId)) return { ok: true, state: runtimeState };
   await rememberLighthouseTabById(tabId);
-  await chrome.tabs.update(tabId, { active: true });
+  if (!await focusLighthouseTabForAutoScan(tabId)) {
+    log("warn", "Chrome 正在调整 Lighthouse 标签，稍后继续检测任务广场");
+    await delay(Math.max(settings.actionDelayMs, 1000));
+    return startNextAutoTask("retry_after_lighthouse_tab_busy");
+  }
   await waitForTabComplete(tabId);
   await delay(settings.actionDelayMs);
   if (!isActiveAutoRun(runId)) return { ok: true, state: runtimeState };
@@ -2091,6 +2099,29 @@ async function getOrCreateLighthouseTab(url) {
   return created;
 }
 
+async function focusLighthouseTabForAutoScan(tabId) {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await chrome.tabs.update(tabId, { active: true });
+      return true;
+    } catch (error) {
+      if (!isTabEditTemporarilyBlocked(error)) throw error;
+      if (attempt >= maxAttempts) {
+        log("warn", `Lighthouse 标签暂时无法激活（Chrome 正在调整标签）：${error.message || String(error)}`);
+        return false;
+      }
+      log("info", `Lighthouse 标签正在被 Chrome 调整，第 ${attempt}/${maxAttempts} 次稍后重试`);
+      await delay(350 * attempt);
+    }
+  }
+  return false;
+}
+
+function isTabEditTemporarilyBlocked(error) {
+  return /Tabs cannot be edited right now|user may be dragging a tab/i.test(String(error?.message || error || ""));
+}
+
 async function getActiveLighthouseTab() {
   const query = { active: true };
   const targetWindowId = getRuntimeWindowId();
@@ -2564,7 +2595,12 @@ async function resumeAutoRunFromSchedule() {
   setStage("auto_starting");
   const tab = await getOrCreateLighthouseTab(runtimeState.startOptions?.lighthouseUrl || LIGHTHOUSE_CAMPAIGNS_URL);
   rememberLighthouseTab(tab);
-  await chrome.tabs.update(tab.id, { active: true });
+  if (!await focusLighthouseTabForAutoScan(tab.id)) {
+    log("warn", "Chrome 正在调整 Lighthouse 标签，稍后继续检测任务广场");
+    await delay(Math.max(settings.actionDelayMs, 1000));
+    await startNextAutoTask("retry_after_lighthouse_tab_busy");
+    return;
+  }
   await waitForTabComplete(tab.id);
   log("info", "全量检测已启动：按旧任务页锁定流程顺序执行");
   setStage("auto_started");
@@ -3027,7 +3063,8 @@ function consumeXOpenCandidate(lighthouseTabId, expectedTweetUrl = "") {
   const pending = runtimeState.pendingXOpen;
   if (!pending || pending.lighthouseTabId !== lighthouseTabId) return null;
   const expected = normalizeTweetUrl(expectedTweetUrl);
-  const index = pending.candidates.findIndex((candidate) => !expected || normalizeTweetUrl(candidate.url) === expected);
+  if (!expected) return null;
+  const index = pending.candidates.findIndex((candidate) => normalizeTweetUrl(candidate.url) === expected);
   if (index < 0) return null;
   const [candidate] = pending.candidates.splice(index, 1);
   clearXOpenWatch();
@@ -3085,6 +3122,7 @@ async function recoverPendingXOpenFromCapturedUrl(tweetUrl) {
 async function findRecentTweetTab(startedAt, lighthouseTabId, windowId, expectedTweetUrl = "") {
   if (!Number.isInteger(windowId)) return null;
   const expected = normalizeTweetUrl(expectedTweetUrl);
+  if (!expected) return null;
   const query = { url: ["https://x.com/*", "https://twitter.com/*"] };
   query.windowId = windowId;
   const tabs = await chrome.tabs.query(query);

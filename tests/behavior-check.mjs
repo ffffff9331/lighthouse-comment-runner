@@ -55,6 +55,181 @@ await test("stopped and stale messages are never sent, cancellation still reache
 });
 
 if (platform === "lighthouse") {
+  await test("auto scan retries Chrome's transient tab-drag lock but preserves real tab errors", async () => {
+    let attempts = 0;
+    const delays = [];
+    const c = contextFor(background, ["focusLighthouseTabForAutoScan", "isTabEditTemporarilyBlocked"], {
+      chrome: { tabs: { update: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("Tabs cannot be edited right now (user may be dragging a tab).");
+      } } },
+      delay: async (ms) => { delays.push(ms); },
+      log() {}
+    });
+    assert.equal(await c.focusLighthouseTabForAutoScan(7), true);
+    assert.equal(attempts, 2);
+    assert.deepEqual(delays, [350]);
+
+    attempts = 0;
+    delays.length = 0;
+    c.chrome.tabs.update = async () => { attempts += 1; };
+    assert.equal(await c.focusLighthouseTabForAutoScan(7), true);
+    assert.equal(attempts, 1);
+    assert.deepEqual(delays, []);
+
+    attempts = 0;
+    delays.length = 0;
+    c.chrome.tabs.update = async () => {
+      attempts += 1;
+      throw new Error("Tabs cannot be edited right now (user may be dragging a tab).");
+    };
+    assert.equal(await c.focusLighthouseTabForAutoScan(7), false);
+    assert.equal(attempts, 3);
+    assert.deepEqual(delays, [350, 700]);
+
+    attempts = 0;
+    c.chrome.tabs.update = async () => { attempts += 1; throw new Error("No tab with id: 7"); };
+    await assert.rejects(() => c.focusLighthouseTabForAutoScan(7), /No tab with id: 7/);
+    assert.equal(attempts, 1);
+  });
+  await test("automatic starts defer scanning when Chrome temporarily cannot focus Lighthouse", async () => {
+    const settings = { replyMode: "post", autoSubmitLighthouse: true, actionDelayMs: 500 };
+    const makeStartContext = (name, initialState) => {
+      const delays = [];
+      const reasons = [];
+      let focusCalls = 0;
+      const common = {
+        LIGHTHOUSE_CAMPAIGNS_URL: "https://app.lhdao.top/campaigns",
+        runtimeState: initialState,
+        chrome: { tabs: { update: async () => { throw new Error("direct Chrome tab activation was used"); } } },
+        getSettings: async () => settings,
+        getAutoRunScheduleState: () => ({ inWindow: true }),
+        clearAutoRunResumeSchedule: async () => {},
+        getOrCreateLighthouseTab: async () => ({ id: 7 }),
+        rememberLighthouseTab() {},
+        focusLighthouseTabForAutoScan: async () => { focusCalls += 1; return false; },
+        delay: async (ms) => { delays.push(ms); },
+        startNextAutoTask: async (reason) => { reasons.push(reason); return { ok: true }; },
+        waitForTabComplete: async () => { throw new Error("must not wait while the tab is busy"); },
+        log() {},
+        setStage() {}
+      };
+      if (name === "start") {
+        Object.assign(common, {
+          createInitialState: () => ({ running: false }),
+          setRuntimeWindow() {},
+          createRunId: () => "run-1",
+          sanitizeAutoRunStartOptions: (options) => options,
+          ensureAutoRunKeepalive: async () => {}
+        });
+      }
+      const c = contextFor(background, [name === "start" ? "startAutoRun" : "resumeAutoRunFromSchedule"], common);
+      return { c, delays, reasons, get focusCalls() { return focusCalls; } };
+    };
+
+    const start = makeStartContext("start", { running: false });
+    await start.c.startAutoRun({}, null);
+    assert.equal(start.focusCalls, 1);
+    assert.deepEqual(start.delays, [1000]);
+    assert.deepEqual(start.reasons, ["retry_after_lighthouse_tab_busy"]);
+
+    const scheduled = makeStartContext("scheduled", {
+      running: true,
+      mode: "auto",
+      lighthouseTabId: null,
+      completed: 0,
+      attempts: 0,
+      failed: 0,
+      startOptions: {}
+    });
+    await scheduled.c.resumeAutoRunFromSchedule();
+    assert.equal(scheduled.focusCalls, 1);
+    assert.deepEqual(scheduled.delays, [1000]);
+    assert.deepEqual(scheduled.reasons, ["retry_after_lighthouse_tab_busy"]);
+  });
+  await test("an unknown task target never adopts an arbitrary Lighthouse-opened X tab", () => {
+    const runtimeState = {
+      pendingXOpen: {
+        lighthouseTabId: 5,
+        candidates: [
+          { id: 11, url: "https://x.com/maly_nft/status/2101501435871744392" },
+          { id: 12, url: "https://x.com/pvyyu42928466/status/2101492955949449264" }
+        ]
+      }
+    };
+    const c = contextFor(background, ["consumeXOpenCandidate"], {
+      runtimeState,
+      normalizeTweetUrl: (url) => String(url || ""),
+      clearXOpenWatch: () => { runtimeState.pendingXOpen = null; }
+    });
+    assert.equal(c.consumeXOpenCandidate(5, ""), null);
+    assert.equal(runtimeState.pendingXOpen.candidates.length, 2);
+    const target = c.consumeXOpenCandidate(5, "https://x.com/pvyyu42928466/status/2101492955949449264");
+    assert.equal(target.id, 12);
+    assert.equal(runtimeState.pendingXOpen, null);
+  });
+  await test("X target wait does not query or adopt recent tabs before the exact URL arrives", async () => {
+    let now = 0;
+    let queries = 0;
+    let adopted = 0;
+    const c = contextFor(background, ["waitForLighthouseOpenedTweet", "findRecentTweetTab"], {
+      runtimeState: { running: true, runId: "run-1", currentTask: { tweetUrl: "" } },
+      Date: { now: () => now },
+      sendToTab: async () => ({ ok: true }),
+      getLighthouseWindowId: async () => 2,
+      normalizeTweetUrl: (url) => String(url || ""),
+      getBoundMatchingTaskXTab: async () => null,
+      consumeXOpenCandidate: () => null,
+      chrome: { tabs: { query: async () => {
+        queries += 1;
+        return [{ id: 11, url: "https://x.com/maly_nft/status/2101501435871744392", windowId: 2, openerTabId: 1, lastAccessed: 0 }];
+      } } },
+      isTweetTab: () => true,
+      isTabInWindow: () => true,
+      adoptCurrentXTab: () => { adopted += 1; },
+      rememberLighthouseTabById: async () => {},
+      checkLighthouseLockFailure: async () => null,
+      delay: async (ms) => { now += ms; },
+      clearXOpenWatch() {},
+      log() {}
+    });
+    const result = await c.waitForLighthouseOpenedTweet({ tweetUrl: "" }, 1, "auto", { timeoutMs: 500, logEveryMs: 500 });
+    assert.equal(result, false);
+    assert.equal(queries, 0);
+    assert.equal(adopted, 0);
+  });
+  await test("stale X content scripts stop widget hints after an extension reload", () => {
+    let disconnected = 0;
+    const cancelledTimers = [];
+    const c = contextFor(xPage, ["sendTaskWidgetHint", "disableTaskWidgetAssist", "isExtensionContextInvalidatedError"], {
+      chrome: { runtime: { sendMessage() { throw new Error("Extension context invalidated."); } } },
+      taskWidgetObserver: { disconnect() { disconnected += 1; } },
+      taskWidgetDebounceTimer: 42,
+      taskWidgetAssistDisabled: false,
+      clearTimeout: (timer) => { cancelledTimers.push(timer); }
+    });
+    assert.equal(c.sendTaskWidgetHint({ kind: "ready" }, "https://x.com/test/status/123"), false);
+    assert.equal(c.taskWidgetAssistDisabled, true);
+    assert.equal(c.taskWidgetObserver, null);
+    assert.equal(c.taskWidgetDebounceTimer, null);
+    assert.equal(disconnected, 1);
+    assert.deepEqual(cancelledTimers, [42]);
+  });
+  await test("rejected X widget hints also stop a stale extension context", async () => {
+    let disconnected = 0;
+    const c = contextFor(xPage, ["sendTaskWidgetHint", "disableTaskWidgetAssist", "isExtensionContextInvalidatedError"], {
+      chrome: { runtime: { sendMessage() { return Promise.reject(new Error("Extension context invalidated.")); } } },
+      taskWidgetObserver: { disconnect() { disconnected += 1; } },
+      taskWidgetDebounceTimer: 42,
+      taskWidgetAssistDisabled: false,
+      clearTimeout() {}
+    });
+    assert.equal(c.sendTaskWidgetHint({ kind: "ready" }, "https://x.com/test/status/123"), true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(c.taskWidgetAssistDisabled, true);
+    assert.equal(c.taskWidgetObserver, null);
+    assert.equal(disconnected, 1);
+  });
   await test("completion DOM rejects instructions and chooses result panel over page ancestor", () => {
     const make = (text, labels, width = 400, height = 300) => ({
       innerText: text,
