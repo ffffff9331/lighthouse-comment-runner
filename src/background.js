@@ -895,6 +895,9 @@ async function startNextAutoTask(reason) {
   if (result.task) {
     markAttemptedTask(result.task);
     runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, result.task);
+    // The five-minute watchdog measures time since the last real order event,
+    // not time since an internal stage transition.
+    touchAutoRunState();
   }
   runtimeState.completionEvidence = null;
   await sendToTab(tabId, { type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId, task: runtimeState.currentTask });
@@ -1957,6 +1960,7 @@ async function handleLighthouseDone(result) {
   if (result && result.ok) {
     if (runtimeState.currentTask) runtimeState.currentTask.completionCounted = true;
     runtimeState.completed += 1;
+    touchAutoRunState();
     // Completed cards are excluded by their own 已完成 state; leaving them in
     // the dedupe table is what made every visible task look "stale" and sent
     // the runner into the reload/cooldown spin right after a finished batch.
@@ -3568,7 +3572,7 @@ function normalizeForLogFilter(text) {
 
 function setStage(stage) {
   runtimeState.stage = stage;
-  touchAutoRunState();
+  persistAutoRunState();
   publishLighthouseMonitorSnapshot("stage");
 }
 

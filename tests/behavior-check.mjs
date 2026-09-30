@@ -54,6 +54,21 @@ await test("stopped and stale messages are never sent, cancellation still reache
   assert.equal(sends, 1);
 });
 
+await test("stage changes do not reset the no-order refresh timer", () => {
+  let saves = 0;
+  const lastProgressAt = 12345;
+  const context = contextFor(background, ["setStage"], {
+    runtimeState: { stage: "selecting_task", lastProgressAt },
+    persistAutoRunState: () => { saves += 1; },
+    publishLighthouseMonitorSnapshot: () => {}
+  });
+  context.setStage("task_select_failed");
+  context.setStage("selecting_task");
+  assert.equal(saves, 2);
+  assert.equal(context.runtimeState.lastProgressAt, lastProgressAt);
+  assert.equal(context.runtimeState.stage, "selecting_task");
+});
+
 if (platform === "lighthouse") {
   await test("auto scan retries Chrome's transient tab-drag lock but preserves real tab errors", async () => {
     let attempts = 0;
@@ -411,6 +426,47 @@ if (platform === "lighthouse") {
     context.runtimeState.stage = "finished";
     await context.handleAutoRunKeepaliveTick();
     assert.equal(cleared, 1);
+  });
+  await test("five-minute watchdog refreshes only an idle marketplace after the last order event", async () => {
+    let reloads = 0;
+    let restarts = 0;
+    const old = Date.now() - 5 * 60 * 1000 - 1;
+    const context = contextFor(background, ["handleAutoRunKeepaliveTick"], {
+      CAMPAIGNS_IDLE_REFRESH_MS: 5 * 60 * 1000,
+      runtimeStateReady: Promise.resolve(),
+      runtimeState: {
+        running: true, mode: "auto", stage: "selecting_task", currentTask: null,
+        lastProgressAt: old, marketplaceRefreshInFlight: false, lighthouseTabId: 7,
+        startOptions: {}
+      },
+      chrome: {
+        runtime: { async getPlatformInfo() {} },
+        tabs: { async reload() { reloads += 1; } }
+      },
+      getRuntimeWindowId: () => 3,
+      createRunId: () => "watchdog-run",
+      cancelCurrentRun: async () => {},
+      clearAutoRunResumeSchedule: async () => {},
+      clearAutoRunKeepalive: async () => {},
+      clearXOpenWatch() {},
+      log() {},
+      setStage() {},
+      waitForTabComplete: async () => {},
+      startAutoRun: async () => { restarts += 1; },
+      tryResumeAutoRunAfterInterruption: async () => false
+    });
+    await context.handleAutoRunKeepaliveTick();
+    assert.equal(reloads, 1);
+    assert.equal(restarts, 1);
+
+    context.runtimeState.lastProgressAt = Date.now();
+    await context.handleAutoRunKeepaliveTick();
+    assert.equal(reloads, 1, "recent order activity must defer refresh");
+
+    context.runtimeState.lastProgressAt = old;
+    context.runtimeState.currentTask = { taskKey: "locked-order", seatLocked: true };
+    await context.handleAutoRunKeepaliveTick();
+    assert.equal(reloads, 1, "an active order must never be refreshed away");
   });
   await test("worker restart resumes an interrupted auto run without a locked seat", async () => {
     let scans = 0;
@@ -1325,11 +1381,12 @@ if (platform === "xinhuo") {
     assert.equal((await c.handleMessage({ type: "X_REPLY_RESULT" }, {})).ignored, true);
   });
   await test("completion count and next scan remain exactly once with overlapping callbacks", async () => {
-    const state = { runId: "r", mode: "auto", running: true, completed: 0, currentTask: { taskKey: "a" }, lighthouseTabId: 1, attemptedTaskRecords: [{ key: "a", expiresAt: Date.now() + 60000 }], attemptedTaskKeys: ["a"] };
+    const state = { runId: "r", mode: "auto", running: true, completed: 0, currentTask: { taskKey: "a" }, lighthouseTabId: 1, lastProgressAt: 1, attemptedTaskRecords: [{ key: "a", expiresAt: Date.now() + 60000 }], attemptedTaskKeys: ["a"] };
     let scans = 0;
     let released = null;
     const c = contextFor(background, ["handleLighthouseDone"], {
       runtimeState: state, hasLatchedLighthouseCompletion: () => true,
+      touchAutoRunState: () => { state.lastProgressAt = Date.now(); },
       getSettings: async () => ({ maxTasksPerRun: 10, actionDelayMs: 0 }),
       isLimitReached: (count, max) => count >= max, log() {},
       closeLighthouseDetailToCampaigns: async () => true, delay: async () => {},
@@ -1340,6 +1397,7 @@ if (platform === "xinhuo") {
     assert.equal(state.completed, 1);
     assert.equal(scans, 1);
     assert.equal(state.currentTask, null);
+    assert.ok(state.lastProgressAt > 1, "confirmed completion resets the no-order timer");
     assert.ok(released && released.taskKey === "a", "completed task must leave the dedupe table");
   });
   await test("only matching run and task can latch completion", () => {
