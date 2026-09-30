@@ -3521,10 +3521,10 @@ function describeTaskForLog(task = {}) {
 
 function isIgnoredNonCommentTask(task = {}) {
   const explicitTaskType = normalizeInline(task.taskType || "");
-  if (explicitTaskType) return explicitTaskType === "原创推文" || explicitTaskType === "转发";
+  if (explicitTaskType) return explicitTaskType === "原创推文" || explicitTaskType === "转发" || explicitTaskType === "关注" || explicitTaskType === "Follow";
 
   const text = normalizeInline([task.title, task.candidateTitle, task.text, task.listText, task.detailText].filter(Boolean).join(" "));
-  return /原创推文|原创建推文|原创内容|发推|发布推文|创建推文|发一条推文|转发|转推|Repost|Retweet/i.test(text);
+  return /原创推文|原创建推文|原创内容|发推|发布推文|创建推文|发一条推文|转发|转推|Repost|Retweet|关注任务|\bFollow\b/i.test(text);
 }
 
 function failStep(result, fallbackMessage) {

@@ -43,6 +43,7 @@
   const DETAIL_TASK_MARKERS = ["评论任务", "Comment", "评论留言", "点赞互动", "点赞", "Like", "关注", "Follow", "完成后回来点击", "Twitter API", "原创推文", "原创建推文", "原创内容", "发推", "转发", "转推", "Repost", "Retweet"];
   const BLOCKED_MARKERS = ["进行中", "已完成", "已提交", "档位不符", "需灯塔严选资格", "当前等级不可", "额度不足"];
   const HARD_FAIL_MARKERS = ["席位已满或无法锁定", "席位已满", "位置已满", "名额已满", "任务已满", "已抢完", "不可领取", "不能参与", "无法参与", "无法锁定", "已结束", "任务失败"];
+  const ACCOUNT_RISK_REVIEW_MARKERS = ["账户风险中", "等待审核", "风险审核"];
   const TASK_UNAVAILABLE_MARKERS = ["任务暂时无法打开", "请返回任务广场后重试"];
   const TIER_MISMATCH_PHRASE = "档位不符，无法领取";
   const COOLDOWN_MARKERS = ["冷却中", "冷却", "等待", "后可"];
@@ -180,7 +181,7 @@
   }
 
   async function debugOpenFirstCommentTask(settings, message = {}) {
-    report("info", "准备打开评论、点赞或关注互动任务");
+    report("info", "准备打开评论或点赞互动任务");
     await ensureCampaignsPage(settings);
     await confirmPagePhase(["campaigns"], settings, "打开评论任务前");
     await ensureAllTaskFilter(settings);
@@ -188,7 +189,7 @@
 
     const selection = await selectNextCommentTask(settings, message.attemptedTaskKeys || []);
     if (!selection || !selection.target) {
-      throw new Error("未找到可执行或可等待的评论、点赞或关注互动任务");
+      throw new Error("未找到可执行或可等待的评论或点赞互动任务");
     }
 
     const task = {
@@ -248,8 +249,8 @@
     return {
       ok: true,
       message: selection.cooldownSniping
-        ? "已在任务广场等待到可执行评论、点赞或关注互动任务并打开详情"
-        : "已打开第一个可执行评论、点赞或关注互动任务详情",
+        ? "已在任务广场等待到可执行评论或点赞互动任务并打开详情"
+        : "已打开第一个可执行评论或点赞互动任务详情",
       task
     };
   }
@@ -343,7 +344,7 @@
         .slice(0, 3)
         .map((entry) => formatCandidateMatchDebug(entry.candidate, entry.score))
         .join(" / ");
-      throw new Error(`未严格匹配到选中评论、点赞或关注互动任务：${selectedTask.title || selectedTask.taskType || "未知任务"}；已排除原创/转发候选 ${ignoredCount} 条；候选=${top || "无"}`);
+      throw new Error(`未严格匹配到选中评论或点赞互动任务：${selectedTask.title || selectedTask.taskType || "未知任务"}；已排除非回复候选 ${ignoredCount} 条；候选=${top || "无"}`);
     }
 
     report("info", `选中任务匹配成功：${formatCandidateMatchDebug(ranked[0].candidate, ranked[0].score)}`);
@@ -847,11 +848,11 @@
       const ignoredNonCommentCandidates = candidates.filter((candidate) => (candidate.isOriginalTweet || candidate.isRetweet) && !candidate.isBlocked);
       if (ignoredNonCommentCandidates.length && Date.now() - lastOriginalSkipReportAt > 15000) {
         lastOriginalSkipReportAt = Date.now();
-        report("info", `已忽略原创/转发任务 ${ignoredNonCommentCandidates.length} 条，只等待评论、点赞或关注互动任务`);
+        report("info", `已忽略非回复任务 ${ignoredNonCommentCandidates.length} 条，只等待评论或点赞互动任务`);
       }
       if (lowBountyCandidates.length && Date.now() - lastLowBountyReportAt > 15000) {
         lastLowBountyReportAt = Date.now();
-        report("info", `已按赏金阈值过滤 ${lowBountyCandidates.length} 条低于 ${minTaskBounty.toFixed(1)}LUX 的评论、点赞或关注互动任务`);
+        report("info", `已按赏金阈值过滤 ${lowBountyCandidates.length} 条低于 ${minTaskBounty.toFixed(1)}LUX 的评论或点赞互动任务`);
       }
       const visibleReadyCandidates = candidates
         .filter((candidate) => candidate.isAutomatable && !candidate.isBlocked && candidate.cooldownMs <= AUTO_DETAIL_PRELOAD_MS && candidate.target)
@@ -894,7 +895,7 @@
         if (staleReadyHitCount >= STALE_READY_REFRESH_HITS) {
           const lowBountyReadyCount = visibleReadyCandidates.filter((candidate) => isBelowMinTaskBounty(candidate.bounty, minTaskBounty)).length;
           const dedupedReadyCount = visibleReadyCandidates.filter((candidate) => candidate.attempted).length;
-          throw buildCampaignsRefreshRequestError(`任务广场连续 ${staleReadyHitCount} 轮出现 ${visibleReadyCandidates.length} 条可做评论、点赞或关注互动任务，但当前都无法进入自动执行（去重 ${dedupedReadyCount} 条，低赏金 ${lowBountyReadyCount} 条），请求刷新任务广场`);
+          throw buildCampaignsRefreshRequestError(`任务广场连续 ${staleReadyHitCount} 轮出现 ${visibleReadyCandidates.length} 条可做评论或点赞互动任务，但当前都无法进入自动执行（去重 ${dedupedReadyCount} 条，低赏金 ${lowBountyReadyCount} 条），请求刷新任务广场`);
         }
       } else {
         staleReadyHitCount = 0;
@@ -906,7 +907,7 @@
         .sort((a, b) => a.cooldownMs - b.cooldownMs);
 
       if (!settings.enableCooldownSniping) {
-        throw new Error("当前没有可做评论、点赞或关注互动任务，且未启用任务广场等待");
+        throw new Error("当前没有可做评论或点赞互动任务，且未启用任务广场等待");
       }
 
       const shortest = cooldownCandidates.find((candidate) => !candidate.attempted) || cooldownCandidates[0];
@@ -915,11 +916,11 @@
         if (visibleReadyCandidates.length > 0 && !ready) {
           const lowBountyReadyCount = visibleReadyCandidates.filter((candidate) => isBelowMinTaskBounty(candidate.bounty, minTaskBounty)).length;
           const dedupedReadyCount = visibleReadyCandidates.filter((candidate) => candidate.attempted).length;
-          report("info", `当前可做评论、点赞或关注互动任务共有 ${visibleReadyCandidates.length} 条，但暂无可执行候选（去重 ${dedupedReadyCount} 条，低赏金 ${lowBountyReadyCount} 条），跳过并等待新任务`);
+          report("info", `当前可做评论或点赞互动任务共有 ${visibleReadyCandidates.length} 条，但暂无可执行候选（去重 ${dedupedReadyCount} 条，低赏金 ${lowBountyReadyCount} 条），跳过并等待新任务`);
         } else if (shortest) {
           report("info", `任务广场最近任务仍在冷却：${formatDuration(shortest.cooldownMs)}，到可抢后再打开详情`);
         } else {
-          report("info", "任务广场暂无可识别评论、点赞或关注互动任务，继续等待列表刷新");
+          report("info", "任务广场暂无可识别评论或点赞互动任务，继续等待列表刷新");
         }
       }
 
@@ -954,7 +955,7 @@
       const cooldown = parseCooldownFromCard(card, rawText);
       const cooldownMs = cooldown.remainingMs;
       const hasCardCooldown = Number.isFinite(cooldownMs) && cooldownMs > 0;
-      const isBlocked = Boolean(cooldown.isBlocked) || (!hasCardCooldown && (
+      const isBlocked = Boolean(cooldown.isBlocked) || /账户风险中|等待审核|风险审核/.test(text) || (!hasCardCooldown && (
         BLOCKED_MARKERS.some((marker) => text.includes(marker))
         || hasHardFailure(text)
         || hasUnsupportedCommentGuidance(text)
@@ -989,6 +990,7 @@
     const value = normalize(text);
     const compact = value.replace(/\s+/g, "").replace(/[，,]/g, "，");
     if (compact.includes(TIER_MISMATCH_PHRASE)) return true;
+    if (hasAccountRiskReviewBlock(value)) return true;
     return hasHardFailure(value);
   }
 
@@ -1139,7 +1141,7 @@
 
   function isAutomatableTaskType(taskType) {
     const value = normalize(taskType);
-    return isCommentEquivalentTaskType(value) || value === "关注" || value === "Follow";
+    return isCommentEquivalentTaskType(value);
   }
 
   function assertSupportedDetailTask(task, settings = {}) {
@@ -1149,10 +1151,10 @@
     const taskType = explicitTaskType || detectTaskTypeFromText(detailText || task.detailText || "");
     const tierMismatch = detailText.replace(/\s+/g, "").replace(/[，,]/g, "，").includes(TIER_MISMATCH_PHRASE);
     const unsupportedGuidance = hasUnsupportedCommentGuidance(detailText);
-    if (!tierMismatch && !unsupportedGuidance && taskType !== "原创推文" && taskType !== "转发") return;
+    if (!tierMismatch && !unsupportedGuidance && (taskType === "评论" || taskType === "点赞互动" || taskType === "点赞")) return;
     const reason = tierMismatch
       ? `平台提示：${TIER_MISMATCH_PHRASE}`
-      : (unsupportedGuidance ? "任务备注要求人工提供内容" : `已识别为${taskType}任务`);
+      : (unsupportedGuidance ? "任务备注要求人工提供内容" : `已识别为${taskType || "非回复"}任务`);
     const error = new Error(`${reason}，永久忽略不再打开`);
     error.permanentIgnore = true;
     error.ignoredTaskType = tierMismatch ? TIER_MISMATCH_PHRASE : (unsupportedGuidance ? "人工评论要求" : taskType);
@@ -1785,7 +1787,7 @@
 
       const detailRoot = findTaskDetailRoot();
       const detailText = normalize(detailRoot?.innerText || document.body.innerText || "");
-      if (hasHardFailure(detailText)) {
+      if (hasBlockingTaskFailure(detailText, settings)) {
         throw new Error(extractHardFailureReason(detailText));
       }
 
@@ -1840,6 +1842,7 @@
   }
 
   function hasLockClickStateChanged(lockButton) {
+    if (getLighthousePreClaimNoticeButton()) return false;
     if (!lockButton.isConnected || isDisabled(lockButton) || !isVisible(lockButton)) return true;
     const text = normalize(document.body.innerText || "");
     return Boolean(extractTweetUrl() || /已锁定|已领取|进行中|前往目标|在 X 打开|请先前往目标/.test(text));
@@ -1852,6 +1855,10 @@
     while (Date.now() - started < timeoutMs) {
       assertActiveRun(runId);
       await confirmLighthouseGuidanceBeforeClaim();
+      if (getLighthousePreClaimNoticeButton()) {
+        await wait(200);
+        continue;
+      }
       const text = normalize(document.body.innerText || "");
       if (hasHardFailure(text)) throw new Error(`锁定点击后失败：${extractHardFailureReason(text)}`);
       if (extractTweetUrl()) return true;
@@ -1863,6 +1870,14 @@
   }
 
   async function confirmLighthouseGuidanceBeforeClaim() {
+    const riskNoticeButton = getLighthousePreClaimNoticeButton();
+    if (riskNoticeButton) {
+      await clickElement(riskNoticeButton, { randomDelay: false });
+      report("info", "检测到 Lighthouse 锁位前风险提醒，已确认继续锁定席位");
+      await wait(150);
+      return true;
+    }
+
     const buttons = Array.from(document.querySelectorAll("button,a,[role='button']"))
       .filter((node) => isVisible(node) && !isDisabled(node))
       .filter((node) => normalize(buttonText(node)) === "确认接单");
@@ -1898,7 +1913,29 @@
     return false;
   }
 
+  function getLighthousePreClaimNoticeButton() {
+    const buttons = Array.from(document.querySelectorAll("button,a,[role='button']"))
+      .filter((node) => isVisible(node) && !isDisabled(node))
+      .filter((node) => /^(?:已了解[，,]?锁定席位)$/.test(normalize(buttonText(node))));
+
+    for (const button of buttons) {
+      let scope = button;
+      for (let depth = 0; scope && depth < 8; depth += 1) {
+        if (scope === document.body || scope === document.documentElement) break;
+        const text = normalize(scope.innerText || scope.textContent || "");
+        if (/接单前需要注意以下事项/.test(text)
+            && /请先阅读下方提醒|目标推文包含外部链接|认真评论/.test(text)
+            && /锁定席位/.test(text)) {
+          return button;
+        }
+        scope = scope.parentElement;
+      }
+    }
+    return null;
+  }
+
   function extractDetailUnavailableReason(text) {
+    if (hasAccountRiskReviewBlock(text)) return extractHardFailureReason(text);
     if (hasHardFailure(text)) return extractHardFailureReason(text);
     if (hasCooldownState(text)) return "详情页仍在等待席位释放";
     const disabledLockText = Array.from(document.querySelectorAll("button,a,[role='button']"))
@@ -2118,7 +2155,13 @@
   }
 
   function extractHardFailureReason(text) {
+    if (/账户风险中|等待审核|风险审核/.test(normalize(text))) return "账户风险中，等待审核";
     return HARD_FAIL_MARKERS.find((marker) => text.includes(marker)) || "任务不可做";
+  }
+
+  function hasAccountRiskReviewBlock(text) {
+    const value = normalize(text).replace(/\s+/g, "");
+    return ACCOUNT_RISK_REVIEW_MARKERS.some((marker) => value.includes(marker));
   }
 
   function parseCooldownFromCard(card, fallbackText) {
@@ -2196,7 +2239,10 @@
 
   function hasCooldownState(text) {
     const value = normalize(text);
-    return COOLDOWN_MARKERS.some((marker) => value.includes(marker));
+    if (/账户风险中|等待审核|风险审核/.test(value)) return false;
+    if (value.includes("冷却") || value.includes("后可")) return true;
+    return /等待(?:下一批|下一波)?(?:席位)?(?:释放|开放)?\s*[·:：-]?\s*(?=\d{1,2}:\d{2}|\d+\s*(?:h(?![A-Za-z])|hr|hour|小时|时|min|m(?![A-Za-z])|分钟|分|sec|s(?![A-Za-z])|秒))/i.test(value)
+      || /等待(?:下一批|下一波)(?:席位)?(?:释放|开放)|(?:下一批|下一波).{0,40}(?:席位|释放|开放)/i.test(value);
   }
 
   function parseDurationMs(text) {

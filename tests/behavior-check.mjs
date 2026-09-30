@@ -332,6 +332,28 @@ if (platform === "lighthouse") {
     assert.equal(context.hasUnsupportedCommentGuidance("评论引导 评价内容观点"), false);
     assert.equal(context.hasUnsupportedCommentGuidance("正文讨论 AI 交易和钱包地址安全"), false);
   });
+  await test("official pre-claim risk notice is confirmed before treating the seat as locked", async () => {
+    let clicks = 0;
+    const notice = { text: "已了解，锁定席位" };
+    const noticeScope = {
+      innerText: "接单前需要注意以下事项 请先阅读下方提醒，再锁定席位。目标推文包含外部链接",
+      parentElement: null
+    };
+    notice.parentElement = noticeScope;
+    const context = contextFor(page, ["getLighthousePreClaimNoticeButton", "confirmLighthouseGuidanceBeforeClaim"], {
+      document: { querySelectorAll: () => [notice], body: {} },
+      normalize: (value) => String(value || "").replace(/\s+/g, " ").trim(),
+      buttonText: (node) => node.text || "",
+      isVisible: () => true,
+      isDisabled: () => false,
+      clickElement: async (node) => { assert.equal(node, notice); clicks += 1; },
+      report() {},
+      wait: async () => {},
+      hasUnsupportedCommentGuidance: () => false
+    });
+    assert.equal(await context.confirmLighthouseGuidanceBeforeClaim(), true);
+    assert.equal(clicks, 1);
+  });
   await test("unrelated page notes cannot permanently block the current detail", () => {
     const detailRoot = { innerText: "评论任务 验证通过即时到账 结算档位 Tier D 锁定席位" };
     const context = contextFor(page, ["hasUnsupportedCommentGuidance", "assertSupportedDetailTask"], {
@@ -1172,6 +1194,43 @@ if (platform === "xinhuo") {
     assert.match(flow, /type: "XINHUO_WAIT_FOR_SUBMISSION_RESULT"/);
   });
 } else {
+  await test("automatic eligibility keeps reply-compatible tasks and excludes follow tasks", () => {
+    const c = contextFor(page, ["isCommentEquivalentTaskType", "isAutomatableTaskType"], {
+      normalize: (value) => String(value || "").trim()
+    });
+    assert.equal(c.isAutomatableTaskType("评论"), true);
+    assert.equal(c.isAutomatableTaskType("点赞互动"), true);
+    assert.equal(c.isAutomatableTaskType("关注"), false);
+    assert.equal(c.isAutomatableTaskType("Follow"), false);
+  });
+  await test("manual task entry also rejects follow tasks before opening their details", () => {
+    const c = contextFor(background, ["isIgnoredNonCommentTask"], {
+      normalizeInline: (value) => String(value || "").replace(/\s+/g, " ").trim()
+    });
+    assert.equal(c.isIgnoredNonCommentTask({ taskType: "评论" }), false);
+    assert.equal(c.isIgnoredNonCommentTask({ taskType: "关注" }), true);
+    assert.equal(c.isIgnoredNonCommentTask({ title: "Follow 任务" }), true);
+  });
+  await test("risk-review lock state is a permanent detail block, not a cooldown", () => {
+    const c = contextFor(page, ["hasAccountRiskReviewBlock", "hasBlockingTaskFailure", "hasCooldownState"], {
+      normalize: (value) => String(value || "").replace(/\s+/g, " ").trim(),
+      TIER_MISMATCH_PHRASE: "档位不符，无法领取",
+      ACCOUNT_RISK_REVIEW_MARKERS: ["账户风险中", "等待审核", "风险审核"],
+      hasHardFailure: () => false,
+      COOLDOWN_MARKERS: ["冷却", "等待", "后可"]
+    });
+    assert.equal(c.hasAccountRiskReviewBlock("账户风险中，等待审核"), true);
+    assert.equal(c.hasBlockingTaskFailure("账户风险中，等待审核"), true);
+    assert.equal(c.hasCooldownState("账户风险中，等待审核"), false);
+  });
+  await test("official release countdown remains eligible after narrowing generic wait matching", () => {
+    const c = contextFor(page, ["hasCooldownState", "parseCooldownMs", "parseDurationMs"], {
+      normalize: (value) => String(value || "").replace(/\s+/g, " ").trim(),
+      COOLDOWN_MARKERS: ["冷却", "等待", "后可"]
+    });
+    assert.equal(c.hasCooldownState("等待下一批释放 25秒"), true);
+    assert.equal(c.parseCooldownMs("等待下一批释放 25秒"), 25000);
+  });
   await test("missing cooldown is unknown, not zero; 10/19/50 second values stay ordered", () => {
     const c = contextFor(page, ["parseCooldownFromCard", "parseCooldownMs", "hasCooldownState", "parseDurationMs"], {
       COOLDOWN_MARKERS: ["冷却", "等待", "后可"], isVisible: () => true, isOwnedByTaskCard: () => true
