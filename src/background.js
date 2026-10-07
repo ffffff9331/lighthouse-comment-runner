@@ -3303,7 +3303,13 @@ function markAttemptedTask(task) {
     runtimeState.attemptedTaskRecords.push(...newKeys.map((key) => ({ key, expiresAt })));
     pruneAttemptedTasks();
     const deferMs = Math.max(0, expiresAt - now);
-    log("info", `已登记去重 ${formatDuration(deferMs)}：${describeTaskForLog(task)}`);
+    if (hasDeferredRescan) {
+      log("info", `已登记延后重试 ${formatDuration(deferMs)}：${describeTaskForLog(task)}`);
+    } else if (task?.seatLocked === true) {
+      log("info", `已登记已锁定订单，完成前不重复抢单：${describeTaskForLog(task)}`);
+    } else {
+      log("info", `已登记失败任务临时去重 ${formatDuration(deferMs)}：${describeTaskForLog(task)}`);
+    }
   }
 }
 

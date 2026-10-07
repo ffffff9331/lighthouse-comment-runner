@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Lighthouse 自动接单助手 v0.7.83",
+  "name": "Lighthouse 自动接单助手 v0.7.85",
   "description": "Automates first-pass Lighthouse comment tasks with a controlled Chrome session.",
-  "version": "0.7.83",
+  "version": "0.7.85",
   "icons": {
     "16": "src/assets/icons/icon16.png",
     "32": "src/assets/icons/icon32.png",
@@ -10,7 +10,7 @@
     "128": "src/assets/icons/icon128.png"
   },
   "action": {
-    "default_title": "Lighthouse 自动接单助手 v0.7.83",
+    "default_title": "Lighthouse 自动接单助手 v0.7.85",
     "default_icon": {
       "16": "src/assets/icons/icon16.png",
       "32": "src/assets/icons/icon32.png",

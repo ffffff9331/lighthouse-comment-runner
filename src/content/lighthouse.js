@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.83";
+  const SCRIPT_VERSION = "0.7.85";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -18,6 +18,8 @@
   };
 
   const DETAIL_BUTTON_TEXTS = ["查看详情", "详情", "评论留言", "去完成", "开始任务", "领取任务", "查看推文", "前往目标", "打开目标"];
+  const INVITATION_MARKERS = ["邀请接单", "邀请任务", "接单邀请", "受邀任务", "邀请单", "被邀请"];
+  const INVITATION_ACCEPT_BUTTON_TEXTS = ["接受邀请", "确认邀请", "同意接单", "接受接单", "立即接单"];
   const LOCK_BUTTON_TEXTS = ["锁定席位", "锁定名额", "抢占席位", "领取任务", "开始任务", "去评论"];
   const DONE_BUTTON_TEXTS = ["我已评论", "提交验证", "提交验证任务", "我已完成", "已完成", "完成任务", "提交任务", "验证任务", "领取奖励"];
   const COMMENT_MARKERS = ["评论留言", "评论", "回复"];
@@ -38,9 +40,10 @@
     "请先锁定席位",
     "我已评论",
     "提交验证",
-    "AI 内容审核"
+    "AI 内容审核",
+    "邀请接单"
   ];
-  const DETAIL_TASK_MARKERS = ["评论任务", "Comment", "评论留言", "点赞互动", "点赞", "Like", "关注", "Follow", "完成后回来点击", "Twitter API", "原创推文", "原创建推文", "原创内容", "发推", "转发", "转推", "Repost", "Retweet"];
+  const DETAIL_TASK_MARKERS = ["评论任务", "Comment", "评论留言", "点赞互动", "点赞", "Like", "关注", "Follow", "完成后回来点击", "Twitter API", "原创推文", "原创建推文", "原创内容", "发推", "转发", "转推", "Repost", "Retweet", "邀请接单", "邀请任务", "接单邀请", "受邀任务", "邀请单", "被邀请"];
   const BLOCKED_MARKERS = ["进行中", "已完成", "已提交", "档位不符", "需灯塔严选资格", "当前等级不可", "额度不足"];
   const HARD_FAIL_MARKERS = ["席位已满或无法锁定", "席位已满", "位置已满", "名额已满", "任务已满", "已抢完", "不可领取", "不能参与", "无法参与", "无法锁定", "已结束", "任务失败"];
   const ACCOUNT_RISK_REVIEW_MARKERS = ["账户风险中", "等待审核", "风险审核"];
@@ -209,6 +212,7 @@
 
     try {
       await openTaskDetailOrFail(selection, settings);
+      await acceptInvitationIfPresent(settings);
       await confirmPagePhase(["detail_ready"], settings, "打开任务详情后");
     } catch (error) {
       error.task = task;
@@ -265,6 +269,7 @@
     await confirmPagePhase(["campaigns"], settings, "打开选中任务前");
     const selection = await findSelectedCountdownCandidate(settings, selectedTask);
     await openTaskDetailOrFail(selection, settings);
+    await acceptInvitationIfPresent(settings);
     await confirmPagePhase(["detail_ready"], settings, "打开选中详情后");
 
     const detailTask = await waitForSelectedTaskTweetTarget(settings, selectedTask.taskType || selection.taskType);
@@ -292,6 +297,7 @@
     await confirmPagePhase(["campaigns"], settings, "打开选中任务前");
     const selection = await findSelectedCountdownCandidate(settings, selectedTask);
     await openTaskDetailOrFail(selection, settings);
+    await acceptInvitationIfPresent(settings);
     await confirmPagePhase(["detail_ready"], settings, "打开选中详情后");
 
     const detailTask = await waitForTaskDetailReady(settings, selectedTask.taskType || selection.taskType);
@@ -484,6 +490,7 @@
 
     const taskBeforeClick = buildTask(settings, selectedTask.taskType || "");
     assertSupportedDetailTask(taskBeforeClick, settings);
+    await acceptInvitationIfPresent(settings);
     const started = Date.now();
     const timeoutMs = getPageWaitMs(settings);
     const deadline = started + timeoutMs;
@@ -501,6 +508,10 @@
       const detailText = normalize(`${detailRoot?.innerText || ""} ${document.body?.innerText || ""}`);
       if (hasBlockingTaskFailure(detailText, settings)) {
         throw new Error(`任务不可做：${extractHardFailureReason(detailText)}`);
+      }
+
+      if (await acceptInvitationIfPresent(settings)) {
+        continue;
       }
 
       const lockButton = findLockButton();
@@ -946,6 +957,7 @@
       const isRetweet = taskType === "转发";
       const isComment = isCommentEquivalentTaskType(taskType);
       const isAutomatable = isAutomatableTaskType(taskType);
+      const isInvitation = isInvitationTaskText(rawText);
       const bounty = parseCandidateBounty(text);
       const title = extractCandidateTitle(rawText, taskType);
       const handle = extractHandle(rawText);
@@ -975,6 +987,7 @@
         attempted: attempted.has(taskKey) || attempted.has(selectionId) || attempted.has(stableTaskKey),
         isComment,
         isAutomatable,
+        isInvitation,
         isOriginalTweet,
         isRetweet,
         isBlocked,
@@ -1056,7 +1069,7 @@
 
   function hasTaskCardActionOrState(card, text) {
     const hasActionText = DETAIL_BUTTON_TEXTS
-      .concat(BLOCKED_MARKERS, HARD_FAIL_MARKERS, COOLDOWN_MARKERS)
+      .concat(INVITATION_MARKERS, INVITATION_ACCEPT_BUTTON_TEXTS, BLOCKED_MARKERS, HARD_FAIL_MARKERS, COOLDOWN_MARKERS)
       .some((marker) => text.includes(marker));
     if (hasActionText) return true;
     return Array.from(card.querySelectorAll?.("button,a,[role='button']") || [])
@@ -1064,6 +1077,7 @@
       .some((node) => {
         const value = buttonText(node);
         return DETAIL_BUTTON_TEXTS.some((marker) => value.includes(marker))
+          || INVITATION_ACCEPT_BUTTON_TEXTS.some((marker) => value.includes(marker))
           || COMMENT_MARKERS.concat(COMMENT_EQUIVALENT_MARKERS, FOLLOW_MARKERS, ORIGINAL_TWEET_MARKERS, RETWEET_MARKERS).some((marker) => value.includes(marker));
       });
   }
@@ -1134,6 +1148,42 @@
     return "";
   }
 
+  function isInvitationTaskText(text) {
+    const value = normalize(text);
+    return INVITATION_MARKERS.some((marker) => value.includes(marker));
+  }
+
+  function isInvitationAcceptLabel(text) {
+    const value = normalize(text);
+    return INVITATION_ACCEPT_BUTTON_TEXTS.some((marker) => value === marker || value.includes(marker));
+  }
+
+  function findInvitationAcceptButton() {
+    const selector = "button,a,[role='button'],input[type='button'],input[type='submit']";
+    return Array.from(document.querySelectorAll(selector))
+      .filter((node) => isVisible(node) && !isDisabled(node))
+      .filter((node) => isInvitationAcceptLabel(buttonText(node)))
+      .find((node) => {
+        let scope = node;
+        for (let depth = 0; scope && depth < 8; depth += 1) {
+          if (scope === document.body || scope === document.documentElement) break;
+          const text = normalize(scope.innerText || scope.textContent || "");
+          if (isInvitationTaskText(text)) return true;
+          scope = scope.parentElement;
+        }
+        return false;
+      }) || null;
+  }
+
+  async function acceptInvitationIfPresent(settings = {}) {
+    const invitationButton = findInvitationAcceptButton();
+    if (!invitationButton) return false;
+    await clickElement(invitationButton, { randomDelay: false });
+    report("info", `检测到邀请接单，已点击：${buttonText(invitationButton)}`);
+    await wait(Math.min(Math.max(Number(settings.actionDelayMs) || 150, 150), 500));
+    return true;
+  }
+
   function isCommentEquivalentTaskType(taskType) {
     const value = normalize(taskType);
     return value === "评论" || value === "点赞互动" || value === "点赞";
@@ -1166,6 +1216,7 @@
     const clickables = Array.from(card.querySelectorAll?.("button,a,[role='button']") || [])
       .filter(isVisible);
     return clickables.find((node) => !isDisabled(node) && DETAIL_BUTTON_TEXTS.some((text) => buttonText(node).includes(text)))
+      || clickables.find((node) => !isDisabled(node) && isInvitationAcceptLabel(buttonText(node)))
       || clickables.find((node) => !isDisabled(node))
       || clickables[0]
       || card;
@@ -1789,6 +1840,10 @@
       const detailText = normalize(detailRoot?.innerText || document.body.innerText || "");
       if (hasBlockingTaskFailure(detailText, settings)) {
         throw new Error(extractHardFailureReason(detailText));
+      }
+
+      if (await acceptInvitationIfPresent(settings)) {
+        continue;
       }
 
       const lockButton = findLockButton();

@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseHighBountyMonitor__";
-  const SCRIPT_VERSION = "0.7.83";
+  const SCRIPT_VERSION = "0.7.85";
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) return;
   if (existingSingleton?.stop) existingSingleton.stop();
@@ -29,10 +29,10 @@
     { markers: ["关注", "Follow"], label: "关注" },
     { markers: ["原创推文", "原创建推文", "原创内容", "发推", "发布推文", "创建推文", "发一条推文", "Create Tweet", "Post Tweet", "Original Post"], label: "原创推文" }
   ];
-  const ACTION_MARKERS = ["查看详情", "评论留言", "冷却中", "进行中", "已完成", "已提交", "席位已满", "去完成", "开始任务", "领取任务"];
+  const ACTION_MARKERS = ["查看详情", "评论留言", "邀请接单", "邀请任务", "接单邀请", "受邀任务", "邀请单", "被邀请", "接受邀请", "确认邀请", "同意接单", "接受接单", "立即接单", "冷却中", "进行中", "已完成", "已提交", "席位已满", "去完成", "开始任务", "领取任务"];
   const BLOCKED_MARKERS = ["进行中", "已完成", "已提交", "席位已满", "名额已满", "已结束", "不可领取", "无法参与", "档位不符", "需灯塔严选资格", "当前等级不可", "额度不足"];
   const COOLING_MARKERS = ["冷却中", "冷却", "后可", "等待"];
-  const READY_MARKERS = ["查看详情", "评论留言", "去完成", "开始任务", "领取任务"];
+  const READY_MARKERS = ["查看详情", "评论留言", "接受邀请", "确认邀请", "同意接单", "接受接单", "立即接单", "去完成", "开始任务", "领取任务"];
 
   let settings = createDefaultSettings();
   let seenTasks = loadSeen();

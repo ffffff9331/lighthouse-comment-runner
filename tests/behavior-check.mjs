@@ -69,6 +69,35 @@ await test("stage changes do not reset the no-order refresh timer", () => {
   assert.equal(context.runtimeState.stage, "selecting_task");
 });
 
+await test("locked orders are not logged as three-minute retry dedupe", () => {
+  const messages = [];
+  const state = {
+    attempts: 0,
+    attemptedTaskRecords: [],
+    attemptedTaskKeys: []
+  };
+  const c = contextFor(background, ["markAttemptedTask"], {
+    runtimeState: state,
+    ATTEMPTED_TASK_DEDUPE_MS: 3 * 60 * 1000,
+    MAX_DEFERRED_TASK_DEDUPE_MS: 6 * 60 * 60 * 1000,
+    getTaskDedupeKeys: () => ["task-locked"],
+    pruneAttemptedTasks() {},
+    getActiveAttemptedTaskKeys: () => [],
+    describeTaskForLog: () => "0.1LUX · @locked",
+    formatDuration: (ms) => `${Math.round(ms / 1000)}s`,
+    log: (_level, message) => messages.push(message),
+    Date: { now: () => 1000 }
+  });
+  c.markAttemptedTask({ seatLocked: true });
+  assert.equal(messages[0], "已登记已锁定订单，完成前不重复抢单：0.1LUX · @locked");
+
+  messages.length = 0;
+  state.attemptedTaskRecords = [];
+  state.attemptedTaskKeys = [];
+  c.markAttemptedTask({});
+  assert.equal(messages[0], "已登记失败任务临时去重 180s：0.1LUX · @locked");
+});
+
 if (platform === "lighthouse") {
   await test("auto scan retries Chrome's transient tab-drag lock but preserves real tab errors", async () => {
     let attempts = 0;
@@ -1259,6 +1288,78 @@ if (platform === "xinhuo") {
     assert.equal(c.isAutomatableTaskType("关注"), false);
     assert.equal(c.isAutomatableTaskType("Follow"), false);
   });
+  await test("invitation task markers and accept labels are recognized narrowly", () => {
+    const c = contextFor(page, ["isInvitationTaskText", "isInvitationAcceptLabel"], {
+      INVITATION_MARKERS: ["邀请接单", "邀请任务", "接单邀请", "受邀任务", "邀请单", "被邀请"],
+      INVITATION_ACCEPT_BUTTON_TEXTS: ["接受邀请", "确认邀请", "同意接单", "接受接单", "立即接单"]
+    });
+    assert.equal(c.isInvitationTaskText("评论任务 · 邀请接单 · 预计获得 0.1 LUX"), true);
+    assert.equal(c.isInvitationAcceptLabel("接受邀请"), true);
+    assert.equal(c.isInvitationAcceptLabel("确认接单"), false);
+  });
+  await test("invitation accept button requires invitation context", () => {
+    const parent = { innerText: "邀请任务 · 评论留言", textContent: "", parentElement: null };
+    const button = { innerText: "接受邀请", textContent: "", parentElement: parent };
+    const c = contextFor(page, ["findInvitationAcceptButton"], {
+      document: { querySelectorAll: () => [button] },
+      INVITATION_MARKERS: ["邀请接单", "邀请任务", "接单邀请", "受邀任务", "邀请单", "被邀请"],
+      INVITATION_ACCEPT_BUTTON_TEXTS: ["接受邀请", "确认邀请", "同意接单", "接受接单", "立即接单"],
+      isInvitationTaskText: (text) => String(text).includes("邀请任务"),
+      isInvitationAcceptLabel: (text) => String(text).includes("接受邀请"),
+      isVisible: () => true,
+      isDisabled: () => false,
+      buttonText: (node) => node.innerText
+    });
+    assert.equal(c.findInvitationAcceptButton(), button);
+
+    parent.innerText = "普通评论任务";
+    assert.equal(c.findInvitationAcceptButton(), null);
+  });
+  await test("present invitation is accepted before the existing lock flow continues", async () => {
+    let clicks = 0;
+    let waits = 0;
+    const button = { innerText: "接受邀请" };
+    const c = contextFor(page, ["acceptInvitationIfPresent"], {
+      findInvitationAcceptButton: () => button,
+      clickElement: async (node, options) => {
+        assert.equal(node, button);
+        assert.equal(options.randomDelay, false);
+        clicks += 1;
+      },
+      buttonText: (node) => node.innerText,
+      report: () => {},
+      wait: async () => { waits += 1; }
+    });
+    assert.equal(await c.acceptInvitationIfPresent({ actionDelayMs: 100 }), true);
+    assert.equal(clicks, 1);
+    assert.equal(waits, 1);
+  });
+  await test("candidate collection preserves invitation state without changing comment eligibility", () => {
+    const card = { innerText: "评论留言 邀请接单 预计获得 0.1 LUX" };
+    const c = contextFor(page, ["collectTaskCandidates"], {
+      isTaskDetailOrRecoverableOverlayOpen: () => false,
+      collectExecutableTaskCards: () => [card],
+      isLikelySingleTaskCard: () => true,
+      detectCandidateTaskType: () => "评论",
+      isCommentEquivalentTaskType: () => true,
+      isAutomatableTaskType: () => true,
+      isInvitationTaskText: () => true,
+      parseCandidateBounty: () => 0.1,
+      extractCandidateTitle: () => "邀请任务",
+      extractHandle: () => "@invite",
+      buildSelectionId: () => "selection-invite",
+      buildStableTaskKey: () => "stable-invite",
+      buildTaskKey: () => "task-invite",
+      parseCooldownFromCard: () => ({ remainingMs: 0, text: "" }),
+      BLOCKED_MARKERS: [],
+      hasHardFailure: () => false,
+      hasUnsupportedCommentGuidance: () => false,
+      findOpenTargetInCard: () => ({})
+    });
+    const [candidate] = c.collectTaskCandidates([]);
+    assert.equal(candidate.isInvitation, true);
+    assert.equal(candidate.isAutomatable, true);
+  });
   await test("manual task entry also rejects follow tasks before opening their details", () => {
     const c = contextFor(background, ["isIgnoredNonCommentTask"], {
       normalizeInline: (value) => String(value || "").replace(/\s+/g, " ").trim()
@@ -1336,6 +1437,7 @@ if (platform === "xinhuo") {
       detectCandidateTaskType: () => "评论",
       isCommentEquivalentTaskType: () => true,
       isAutomatableTaskType: () => true,
+      isInvitationTaskText: () => false,
       parseCandidateBounty: () => 0.1,
       extractCandidateTitle: () => "Branch",
       extractHandle: () => "@yida_w",
