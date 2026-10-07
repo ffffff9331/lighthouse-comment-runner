@@ -9,6 +9,7 @@ const AUTO_RUN_STATE_KEY = "lighthouseAutoRunStateV1";
 // A 30s alarm keeps the worker alive and, if it died anyway, resumes a safe
 // auto run on the next tick.
 const AUTO_RUN_KEEPALIVE_ALARM = "lighthouseAutoRunKeepaliveV1";
+const CAMPAIGNS_IDLE_RELOAD_ALARM = "lighthouseCampaignsIdleReloadV1";
 const SITE_X_OPEN_WAIT_MS = 5000;
 const LIGHTHOUSE_PREVIOUS_DEFAULT_AI_SYSTEM_PROMPT = "根据原推文写一句自然的中文回复。像真实用户刷到后随手留下的感受，简短、有一点具体反应，不必完整表达观点。10到15个汉字为主，可保留必要的英文词。避免宣传腔、总结腔、夸张吹捧、复述原文和模板化感叹。只输出回复。";
 const LIGHTHOUSE_DEFAULT_AI_SYSTEM_PROMPT = "根据原推文写一句自然的中文回复。像真实用户刷到后随手留下的感受，简短、有一点具体反应，不必完整表达观点。5到20个汉字为主，可保留必要的英文词。避免宣传腔、总结腔、夸张吹捧、复述原文和模板化感叹。只输出回复。";
@@ -181,8 +182,9 @@ chrome.runtime.onInstalled.addListener(async () => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name !== AUTO_RUN_KEEPALIVE_ALARM) return;
-  void handleAutoRunKeepaliveTick();
+  if (alarm.name === AUTO_RUN_KEEPALIVE_ALARM || alarm.name === CAMPAIGNS_IDLE_RELOAD_ALARM) {
+    void handleAutoRunKeepaliveTick();
+  }
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -272,6 +274,7 @@ async function handleMessage(message, sender) {
       await cancelCurrentRun();
       await clearAutoRunResumeSchedule();
       await clearAutoRunKeepalive();
+      await clearCampaignsIdleReloadAlarm();
       runtimeState.running = false;
       runtimeState.scheduledResumeAt = 0;
       runtimeState.runId = createRunId();
@@ -459,7 +462,8 @@ async function prepareDebugRunForCommand(windowId, commandType) {
     await Promise.all([
       cancelCurrentRun(),
       clearAutoRunResumeSchedule(),
-      clearAutoRunKeepalive()
+      clearAutoRunKeepalive(),
+      clearCampaignsIdleReloadAlarm()
     ]);
   }
   runtimeState.running = true;
@@ -768,6 +772,7 @@ async function startAutoRun(options, windowId = null) {
   // Armed only once every preflight check has passed; a blocked start must
   // not leave a keepalive alarm ticking.
   await ensureAutoRunKeepalive();
+  await armCampaignsIdleReloadAlarm();
   const tab = await getOrCreateLighthouseTab(runtimeState.startOptions?.lighthouseUrl || LIGHTHOUSE_CAMPAIGNS_URL);
   rememberLighthouseTab(tab);
   if (!await focusLighthouseTabForAutoScan(tab.id)) {
@@ -888,6 +893,12 @@ async function startNextAutoTask(reason) {
     setStage("task_select_failed");
     log(transient ? "info" : "warn", result?.message || result?.error || "任务选择失败，准备尝试下一条");
     await closeLighthouseTaskDetail(tabId, settings, "任务选择失败后关闭详情面板");
+    const reloaded = await reloadLighthouseCampaignsAfterOrder(tabId, "接单失败，已重新加载任务广场");
+    if (reloaded === false) {
+      runtimeState.running = false;
+      setStage("campaigns_reload_failed");
+      return { ok: false, error: "接单失败后重新加载任务广场失败，已停止扫描", state: runtimeState };
+    }
     await delay(settings.actionDelayMs * 2);
     return startNextAutoTask("retry_after_task_select_failed");
   }
@@ -1957,6 +1968,10 @@ async function handleLighthouseDone(result) {
     return recoverAndContinue("缺少本单官方完成证据，不计为完成", { runId, task: runtimeState.currentTask, closeX: false });
   }
   if (runtimeState.currentTask?.completionCounted) return { ok: true, duplicate: true };
+  const hasLockedTask = Boolean(
+    runtimeState.currentTask
+    && (runtimeState.currentTask.seatLocked === true || runtimeState.currentTask.seatLockedAt)
+  );
   if (result && result.ok) {
     if (runtimeState.currentTask) runtimeState.currentTask.completionCounted = true;
     runtimeState.completed += 1;
@@ -1972,6 +1987,20 @@ async function handleLighthouseDone(result) {
   }
 
   const settings = await getSettings();
+  const orderReloadReason = result?.ok ? "接单完成，已重新加载任务广场" : "接单失败，已重新加载任务广场";
+  if (result?.ok || !hasLockedTask) {
+    await closeLighthouseDetailToCampaigns(
+      runtimeState.lighthouseTabId,
+      settings,
+      "正式模式订单结束后关闭任务详情回到广场"
+    );
+    const reloaded = await reloadLighthouseCampaignsAfterOrder(runtimeState.lighthouseTabId, orderReloadReason);
+    if (reloaded === false) {
+      runtimeState.running = false;
+      setStage("campaigns_reload_failed");
+      return { ok: false, error: "订单结束后重新加载任务广场失败，已停止扫描", state: runtimeState };
+    }
+  }
   if (!result?.ok && !settings.autoSubmitLighthouse) {
     runtimeState.running = false;
     setStage("finished");
@@ -1986,7 +2015,6 @@ async function handleLighthouseDone(result) {
     return { ok: true, state: runtimeState };
   }
 
-  await closeLighthouseDetailToCampaigns(runtimeState.lighthouseTabId, settings, "正式模式完成后关闭任务详情回到广场");
   await delay(settings.actionDelayMs * 2);
   if (runId !== runtimeState.runId || !runtimeState.running) return { ok: false, cancelled: true };
   runtimeState.currentTask = null;
@@ -2031,6 +2059,12 @@ async function recoverAndContinue(message, options = {}) {
     const tab = await getOrCreateLighthouseTab(LIGHTHOUSE_CAMPAIGNS_URL);
     rememberLighthouseTab(tab);
     await closeLighthouseTaskDetail(tab.id, settings, "异常恢复时关闭任务详情");
+    const reloaded = await reloadLighthouseCampaignsAfterOrder(tab.id, "接单失败，已重新加载任务广场");
+    if (reloaded === false) {
+      runtimeState.running = false;
+      setStage("campaigns_reload_failed");
+      return { ok: false, error: "接单失败后重新加载任务广场失败，已停止扫描", state: runtimeState };
+    }
   } catch (error) {
     log("warn", `关闭任务详情失败，稍后重试：${error.message}`);
   }
@@ -2197,6 +2231,23 @@ async function refreshLighthouseCampaignsTab(tabId, reason = "") {
   } catch (error) {
     log("warn", `刷新任务广场失败：${error.message}`);
     return { ok: false, skippedCooldown: false, message: error.message || "刷新任务广场失败" };
+  }
+}
+
+async function reloadLighthouseCampaignsAfterOrder(tabId, reason = "") {
+  if (!Number.isInteger(tabId)) {
+    log("warn", "订单结束后缺少 Lighthouse 任务广场标签页，无法重新加载");
+    return false;
+  }
+  try {
+    await chrome.tabs.reload(tabId);
+    await waitForTabComplete(tabId);
+    lastCampaignsRefreshAt = Date.now();
+    log("info", reason || "订单结束，已重新加载 Lighthouse 任务广场");
+    return true;
+  } catch (error) {
+    log("warn", `订单结束后重新加载任务广场失败：${error.message || String(error)}`);
+    return false;
   }
 }
 
@@ -3637,15 +3688,41 @@ async function clearAutoRunKeepalive() {
   } catch (_) {}
 }
 
+async function armCampaignsIdleReloadAlarm() {
+  try {
+    if (typeof chrome === "undefined" || !chrome.alarms) return;
+    await chrome.alarms.create(CAMPAIGNS_IDLE_RELOAD_ALARM, {
+      delayInMinutes: CAMPAIGNS_IDLE_REFRESH_MS / 60000
+    });
+  } catch (_) {
+    // The keepalive watchdog remains as a fallback when this alarm is unavailable.
+  }
+}
+
+async function clearCampaignsIdleReloadAlarm() {
+  try {
+    if (typeof chrome === "undefined" || !chrome.alarms) return;
+    await chrome.alarms.clear(CAMPAIGNS_IDLE_RELOAD_ALARM);
+  } catch (_) {}
+}
+
 async function handleAutoRunKeepaliveTick() {
   await runtimeStateReady;
   if (runtimeState.running && (runtimeState.mode === "auto" || runtimeState.mode === "selected_once")) {
     // Any extension API call resets the MV3 idle timer; the alarm wake itself
     // already restarted the 30s window, this touch makes it deterministic.
     try { await chrome.runtime.getPlatformInfo(); } catch (_) {}
+    const currentTask = runtimeState.currentTask || {};
+    const noCurrentTask = !runtimeState.currentTask;
+    const hasLockedTask = Boolean(
+      runtimeState.currentTask
+      && (currentTask.seatLocked === true || currentTask.seatLockedAt)
+    );
+    const hasUnclaimedTask = Boolean(runtimeState.currentTask && !hasLockedTask);
+    const noActiveOrder = noCurrentTask || hasUnclaimedTask;
+    const isSelectingTaskStage = runtimeState.stage === "selecting_task";
     if (runtimeState.mode === "auto"
-      && runtimeState.stage === "selecting_task"
-      && !runtimeState.currentTask
+      && noActiveOrder
       && Date.now() - Number(runtimeState.lastProgressAt || 0) >= CAMPAIGNS_IDLE_REFRESH_MS
       && !runtimeState.marketplaceRefreshInFlight
       && Number.isInteger(runtimeState.lighthouseTabId)) {
@@ -3653,11 +3730,12 @@ async function handleAutoRunKeepaliveTick() {
       try {
         const options = runtimeState.startOptions || {};
         const windowId = getRuntimeWindowId();
-        log("info", "Lighthouse 任务广场连续 5 分钟无活动，停止当前运行并重新执行全量检测");
+        log("info", `Lighthouse 任务广场连续 5 分钟无活动（${isSelectingTaskStage ? "任务选择阶段" : "流程空闲阶段"}），停止当前运行并重新执行全量检测`);
         const marketplaceTabId = runtimeState.lighthouseTabId;
         await cancelCurrentRun();
         await clearAutoRunResumeSchedule();
         await clearAutoRunKeepalive();
+        await clearCampaignsIdleReloadAlarm();
         runtimeState.running = false;
         runtimeState.scheduledResumeAt = 0;
         runtimeState.runId = createRunId();
@@ -3681,6 +3759,7 @@ async function handleAutoRunKeepaliveTick() {
   if (await tryResumeAutoRunAfterInterruption()) return;
   // No active run and nothing safe to resume: stop keeping the worker awake.
   await clearAutoRunKeepalive();
+  await clearCampaignsIdleReloadAlarm();
 }
 
 async function tryResumeAutoRunAfterInterruption() {
@@ -3707,6 +3786,7 @@ async function tryResumeAutoRunAfterInterruption() {
   runtimeState.runId = createRunId();
   runtimeState.running = true;
   runtimeState.mode = "auto";
+  await armCampaignsIdleReloadAlarm();
   runtimeState.xTabId = null;
   runtimeState.xTabWindowId = null;
   runtimeState.lastXResult = null;
@@ -3719,6 +3799,9 @@ async function tryResumeAutoRunAfterInterruption() {
 function touchAutoRunState() {
   runtimeState.lastProgressAt = Date.now();
   persistAutoRunState();
+  if (runtimeState.running && runtimeState.mode === "auto") {
+    void armCampaignsIdleReloadAlarm();
+  }
 }
 
 function persistAutoRunState() {

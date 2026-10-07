@@ -164,7 +164,8 @@ if (platform === "lighthouse") {
           setRuntimeWindow() {},
           createRunId: () => "run-1",
           sanitizeAutoRunStartOptions: (options) => options,
-          ensureAutoRunKeepalive: async () => {}
+          ensureAutoRunKeepalive: async () => {},
+          armCampaignsIdleReloadAlarm: async () => {}
         });
       }
       const c = contextFor(background, [name === "start" ? "startAutoRun" : "resumeAutoRunFromSchedule"], common);
@@ -440,7 +441,9 @@ if (platform === "lighthouse") {
     let platformPokes = 0;
     const context = contextFor(background, ["handleAutoRunKeepaliveTick", "tryResumeAutoRunAfterInterruption", "clearAutoRunKeepalive"], {
       AUTO_RUN_KEEPALIVE_ALARM: "lighthouseAutoRunKeepaliveV1",
+      CAMPAIGNS_IDLE_REFRESH_MS: 5 * 60 * 1000,
       runtimeStateReady: Promise.resolve(),
+      clearCampaignsIdleReloadAlarm: async () => {},
       runtimeState: { running: true, mode: "auto" },
       chrome: {
         alarms: { async clear() { cleared += 1; return true; } },
@@ -477,25 +480,51 @@ if (platform === "lighthouse") {
       cancelCurrentRun: async () => {},
       clearAutoRunResumeSchedule: async () => {},
       clearAutoRunKeepalive: async () => {},
+      clearCampaignsIdleReloadAlarm: async () => {},
       clearXOpenWatch() {},
       log() {},
       setStage() {},
       waitForTabComplete: async () => {},
-      startAutoRun: async () => { restarts += 1; },
+      startAutoRun: async () => {
+        restarts += 1;
+        context.runtimeState.running = true;
+        context.runtimeState.mode = "auto";
+      },
       tryResumeAutoRunAfterInterruption: async () => false
     });
     await context.handleAutoRunKeepaliveTick();
     assert.equal(reloads, 1);
     assert.equal(restarts, 1);
 
+    context.runtimeState.stage = "campaigns_returned";
+    context.runtimeState.currentTask = null;
+    context.runtimeState.lastProgressAt = old;
+    await context.handleAutoRunKeepaliveTick();
+    assert.equal(reloads, 2, "idle stages must also refresh after five minutes without an order");
+    assert.equal(restarts, 2);
+
     context.runtimeState.lastProgressAt = Date.now();
     await context.handleAutoRunKeepaliveTick();
-    assert.equal(reloads, 1, "recent order activity must defer refresh");
+    assert.equal(reloads, 2, "recent order activity must defer refresh");
 
     context.runtimeState.lastProgressAt = old;
     context.runtimeState.currentTask = { taskKey: "locked-order", seatLocked: true };
     await context.handleAutoRunKeepaliveTick();
-    assert.equal(reloads, 1, "an active order must never be refreshed away");
+    assert.equal(reloads, 2, "an active order must never be refreshed away");
+  });
+  await test("order boundaries perform a real browser reload before the next scan", async () => {
+    let reloads = 0;
+    const messages = [];
+    const context = contextFor(background, ["reloadLighthouseCampaignsAfterOrder"], {
+      chrome: { tabs: { async reload(tabId) { reloads += 1; assert.equal(tabId, 7); } } },
+      waitForTabComplete: async (tabId) => assert.equal(tabId, 7),
+      log: (_level, message) => messages.push(message),
+      Date: { now: () => 12345 }
+    });
+    assert.equal(await context.reloadLighthouseCampaignsAfterOrder(7, "接单完成，已重新加载任务广场"), true);
+    assert.equal(reloads, 1);
+    assert.deepEqual(messages, ["接单完成，已重新加载任务广场"]);
+    assert.equal(await context.reloadLighthouseCampaignsAfterOrder(null), false);
   });
   await test("worker restart resumes an interrupted auto run without a locked seat", async () => {
     let scans = 0;
@@ -516,6 +545,7 @@ if (platform === "lighthouse") {
       setStage() {},
       createRunId: () => "resumed-run",
       describeTaskForLog: () => "0.1LUX · @a · t",
+      armCampaignsIdleReloadAlarm: async () => {},
       chrome: { tabs: { async sendMessage(tabId, message) { cancelledRunIds.push({ tabId, runId: message.runId }); return { ok: true }; } } },
       async startNextAutoTask(reason) {
         scans += 1;
@@ -713,6 +743,7 @@ if (platform === "lighthouse") {
       },
       async clearAutoRunResumeSchedule() { clearCount += 1; },
       async clearAutoRunKeepalive() { keepaliveClearCount += 1; },
+      async clearCampaignsIdleReloadAlarm() {},
       createRunId: () => "debug-run",
       setRuntimeWindow(windowId) { context.runtimeState.runtimeWindowId = windowId; },
       setStage(stage) { context.runtimeState.stage = stage; },
@@ -1492,6 +1523,7 @@ if (platform === "xinhuo") {
       getSettings: async () => ({ maxTasksPerRun: 10, actionDelayMs: 0 }),
       isLimitReached: (count, max) => count >= max, log() {},
       closeLighthouseDetailToCampaigns: async () => true, delay: async () => {},
+      reloadLighthouseCampaignsAfterOrder: async () => {},
       releaseAttemptedTask(task) { released = task; state.attemptedTaskRecords = []; state.attemptedTaskKeys = []; },
       startNextAutoTask: async () => { scans += 1; return { ok: true }; }
     });
@@ -1501,6 +1533,34 @@ if (platform === "xinhuo") {
     assert.equal(state.currentTask, null);
     assert.ok(state.lastProgressAt > 1, "confirmed completion resets the no-order timer");
     assert.ok(released && released.taskKey === "a", "completed task must leave the dedupe table");
+  });
+  await test("failed order reloads the browser before retrying the next scan", async () => {
+    const state = {
+      runId: "r",
+      mode: "auto",
+      running: true,
+      completed: 0,
+      failed: 0,
+      currentTask: { taskKey: "a", seatLocked: false },
+      lighthouseTabId: 1
+    };
+    let reloads = 0;
+    let scans = 0;
+    const c = contextFor(background, ["handleLighthouseDone"], {
+      runtimeState: state,
+      hasLatchedLighthouseCompletion: () => false,
+      getSettings: async () => ({ maxTasksPerRun: 10, actionDelayMs: 0, autoSubmitLighthouse: true }),
+      isLimitReached: () => false,
+      log() {},
+      closeLighthouseDetailToCampaigns: async () => true,
+      reloadLighthouseCampaignsAfterOrder: async () => { reloads += 1; },
+      delay: async () => {},
+      startNextAutoTask: async () => { scans += 1; return { ok: true }; }
+    });
+    await c.handleLighthouseDone({ ok: false, message: "接单失败" });
+    assert.equal(state.failed, 1);
+    assert.equal(reloads, 1);
+    assert.equal(scans, 1);
   });
   await test("only matching run and task can latch completion", () => {
     const state = { running: true, runId: "r", currentTask: { taskKey: "a", tweetUrl: "https://x.com/a/status/1" } };
