@@ -11,6 +11,7 @@
 - 通过 Lighthouse 官方完成状态和任务广场收入变化进行完成核验。
 - 任务完成后自动返回任务广场，异常时保留已接订单，避免串单。
 - 侧边栏提供运行控制、倒计时面板、详细日志、回复记录和配置管理。
+- 停止后保留订单和历史日志；后台重新唤醒时静默读取停止状态，仅真正中断的运行记录恢复提示。
 
 ## 安装
 
@@ -60,7 +61,7 @@ node tests/regression-check.mjs
 node --test tests/*.test.cjs
 ```
 
-其中 `claim-recovery.test.cjs` 覆盖放号延期、继续扫描和已点击接单后的未知结果保护；`monitor-cards.test.cjs` 覆盖任务卡识别与重复项合并。测试使用离线模拟，不会实际接单或发布评论。
+其中 `claim-recovery.test.cjs` 覆盖放号延期、继续扫描和已点击接单后的未知结果保护；`monitor-cards.test.cjs` 覆盖任务卡识别与重复项合并。`composite-task-types.test.cjs` 和 `composite-x-actions.test.cjs` 覆盖评论＋点赞的类型保留、任务面板延迟加载、动作执行与失败保护。`stopped-state-restore.test.cjs` 覆盖停止后后台多次唤醒不重复记录日志、订单保留和中断恢复。测试使用离线模拟，不会实际接单或发布评论。
 
 也可以检查全部 JavaScript 语法：
 

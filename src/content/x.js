@@ -1,7 +1,7 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerXSingleton__";
   const RUN_LOCK_KEY = "__lighthouseCommentTaskRunnerXRunLock__";
-  const SCRIPT_VERSION = "0.7.86";
+  const SCRIPT_VERSION = "0.7.88";
   const INSTANCE_ID = `x-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const RESERVED_X_HANDLE_SLUGS = new Set(["home", "explore", "notifications", "messages", "jobs", "i", "settings"]);
   const existingSingleton = globalThis[SINGLETON_KEY];
@@ -102,7 +102,8 @@
     await simulateReadingBeforeReply(settings);
     assertActiveRun(runId);
 
-    const taskActions = inferTaskActions(task);
+    const taskActions = await waitForTaskActions(task, settings);
+    assertActiveRun(runId);
     const followResult = taskActions.needsFollow
       ? await followCurrentTweetAuthorIfNeeded(settings)
       : { ok: true, status: "not_required", message: "当前任务不要求关注" };
@@ -119,6 +120,11 @@
     const likeResult = taskActions.needsLike
       ? await likeCurrentTweetIfNeeded(settings)
       : { ok: true, status: "not_required", message: "当前任务不要求点赞" };
+    assertActiveRun(runId);
+    if (!likeResult.ok) {
+      return { ok: false, message: likeResult.message || "当前任务要求点赞，但未确认点赞成功", mode: "like",
+        tweet, follow: followResult, like: likeResult, taskActions, xInstanceId: INSTANCE_ID };
+    }
     if (!taskActions.needsComment) {
       assertActiveRun(runId);
       return {
@@ -130,13 +136,19 @@
         tweet,
         follow: followResult,
         like: likeResult,
+        taskActions,
         xInstanceId: INSTANCE_ID
       };
     }
 
-    const dedupeResult = await detectExistingReplyBeforeWriting(tweet, task, settings);
+    const officialCommentComplete = taskActions.steps
+      .filter((step) => step.action === "comment").every((step) => step.completed);
+    const dedupeResult = officialCommentComplete
+      ? { replied: true, source: "x_current_task", message: "官网当前任务已确认评论完成" }
+      : await detectExistingReplyBeforeWriting(tweet, task, settings);
     if (dedupeResult.replied) {
-      return buildDedupeReplyResult(tweet, dedupeResult, likeResult);
+      assertActiveRun(runId);
+      return { ...buildDedupeReplyResult(tweet, dedupeResult, likeResult), follow: followResult, taskActions };
     }
 
     assertActiveRun(runId);
@@ -149,7 +161,7 @@
     if (settings.replyProvider === "sola_bridge") {
       assertActiveRun(runId);
       const bridged = await trySolaBridge({ ...(task || {}), replyText, tweet }, settings);
-      if (bridged.ok) return { ...bridged, replyText, tweet };
+      if (bridged.ok) return { ...bridged, replyText, tweet, like: likeResult, follow: followResult, taskActions };
     }
 
     assertActiveRun(runId);
@@ -164,20 +176,23 @@
         replyText,
         tweet,
         like: likeResult,
+        taskActions,
         xInstanceId: INSTANCE_ID
       };
     }
 
     assertActiveRun(runId);
     const postResult = await clickPostButtonAndVerify(settings);
+    assertActiveRun(runId);
     return {
-      ok: true,
-      message: postResult.message || "已按 Sola 流程发送 X 回复并确认成功",
+      ok: postResult?.ok === true,
+      message: postResult?.message || (postResult?.ok ? "已按 Sola 流程发送 X 回复并确认成功" : "当前任务要求评论，但未确认回复发送成功"),
       mode: "post",
       replyText,
       tweet,
       follow: followResult,
       like: likeResult,
+      taskActions,
       xInstanceId: INSTANCE_ID,
       verify: postResult
     };
@@ -197,38 +212,110 @@
   }
 
   function inferTaskActions(task = {}) {
-    const taskType = normalizeText(task.taskType || "").toLowerCase();
-    const declaredComment = /评论|回复|comment|reply/i.test(taskType);
-    const declaredLike = /点赞|like/i.test(taskType);
-    const declaredFollow = /关注|follow/i.test(taskType);
-    const widget = findLighthouseTaskWidget();
-    let requirementText = normalizeText(widget?.innerText || "");
-
-    if (!requirementText.includes("停留时长") || !/(当前任务|要完成)/.test(requirementText)) {
-      const panel = queryAccessibleElements("div,section,article")
-        .filter((node) => isVisible(node))
-        .map((node) => ({ node, text: normalizeText(node.innerText || node.textContent || "") }))
-        .filter((entry) => entry.text.includes("停留时长") && /(当前任务|要完成)/.test(entry.text))
-        .sort((a, b) => {
-          const aRect = a.node.getBoundingClientRect();
-          const bRect = b.node.getBoundingClientRect();
-          return (aRect.width * aRect.height) - (bRect.width * bRect.height);
-        })[0];
-      requirementText = panel?.text || requirementText;
+    const panels = new Map();
+    // The official current-task control is also present while disabled.
+    // Never infer requirements from tweet text or another task card.
+    for (const button of queryAccessibleElements("button.lh-cur-btn")) {
+      if (!isVisible(button)) continue;
+      let node = button.parentElement;
+      for (let depth = 0; node && node !== document.body && depth < 10; depth += 1, node = node.parentElement) {
+        if (!isVisible(node)) continue;
+        const parsed = parseCurrentTaskRequirements(node.innerText || node.textContent || "");
+        if (!parsed.complete) continue;
+        panels.set(node, parsed);
+        break;
+      }
     }
+    if (panels.size !== 1) {
+      return { complete: false, source: "unresolved", requirementText: "",
+        reason: panels.size > 1 ? "存在多个当前任务面板，无法确定本单要求" : "当前任务要求尚未完整加载" };
+    }
+    return [...panels.values()][0];
+  }
 
-    const hasRequirements = requirementText.includes("停留时长") && /(当前任务|要完成)/.test(requirementText);
-    const needsComment = hasRequirements
-      ? /要完成[\s\S]{0,100}(评论|回复)/.test(requirementText)
-      : (declaredComment || (!declaredLike && !declaredFollow));
-    const needsLike = hasRequirements
-      ? /要完成[\s\S]{0,100}(点赞|喜欢|like)/i.test(requirementText)
-      : declaredLike;
-    const needsFollow = hasRequirements
-      ? /要完成[\s\S]{0,100}(关注|follow)/i.test(requirementText)
-      : declaredFollow;
+  function parseCurrentTaskRequirements(text) {
+    const value = normalizeText(text);
+    const current = value.match(/当前任务/g) || [];
+    const sections = value.match(/要完成/g) || [];
+    if (current.length !== 1 || sections.length !== 1 || !/LUX\b/i.test(value) || /XINHUO|薪火/.test(value)) return { complete: false };
+    const section = value.match(/要完成\s*[:：]?([\s\S]*?)停留时长\s*[:：]?\s*(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\s*s?/i);
+    if (!section || !section[1].trim()) return { complete: false };
+    const steps = [];
+    const pattern = /(评论|回复|点赞|喜欢|关注|转发|转推|引用|收藏|comment|reply|like|follow|repost|retweet|quote)\s*[:：]?\s*(待完成|未完成|已完成|pending|completed|done)/gi;
+    for (const match of section[1].matchAll(pattern)) {
+      const label = match[1];
+      const action = /^(评论|回复|comment|reply)$/i.test(label) ? "comment"
+        : /^(点赞|喜欢|like)$/i.test(label) ? "like"
+        : /^(关注|follow)$/i.test(label) ? "follow" : "unsupported";
+      steps.push({ action, label, status: match[2], completed: /^(已完成|completed|done)$/i.test(match[2]) });
+    }
+    // Every requirement must have a recognized action/status pair. A partial
+    // "评论 加载中" row or an unknown "投票 待完成" cannot become pure-like.
+    const unparsed = section[1].replace(pattern, "").replace(/[\s|,，、:：;；·•\-✓✔✅☑○●\uFE0F]/gu, "");
+    if (!steps.length || unparsed) return { complete: false };
+    return { complete: true, source: "x_current_task", requirementText: section[1].trim(), steps,
+      needsComment: steps.some((step) => step.action === "comment"),
+      needsLike: steps.some((step) => step.action === "like"),
+      needsFollow: steps.some((step) => step.action === "follow"),
+      unsupported: steps.filter((step) => step.action === "unsupported").map((step) => step.label),
+      dwellSeconds: Number(section[2]), requiredDwellSeconds: Number(section[3]) };
+  }
 
-    return { needsComment, needsLike, needsFollow, requirementText, source: hasRequirements ? "x_widget" : "task_type" };
+  async function waitForTaskActions(task = {}, settings = {}) {
+    const runId = activeRunId;
+    const started = Date.now();
+    const timeoutMs = 15000;
+    let signature = "", stableSince = 0, current = null;
+    const declared = normalizeText(task.taskType || "");
+    const missingDeclaredActions = (actions) => (/评论|回复|comment|reply/i.test(declared) && !actions.needsComment)
+      || (/点赞|like/i.test(declared) && !actions.needsLike)
+      || (/关注|follow/i.test(declared) && !actions.needsFollow);
+    while (Date.now() - started < timeoutMs) {
+      assertActiveRun(runId);
+      current = inferTaskActions(task);
+      if (current.complete) {
+        const nextSignature = JSON.stringify(current.steps.map(({action, label}) => [action, label]));
+        if (nextSignature !== signature) { signature = nextSignature; stableSince = Date.now(); }
+        const missingDeclared = missingDeclaredActions(current);
+        // A partial widget must not downgrade a composite list declaration.
+        // Give it the full hydration window before reporting a conflict.
+        if (Date.now() - stableSince >= 750 && !missingDeclared) return confirmTaskActions(current, runId);
+      } else {
+        signature = "";
+        stableSince = 0;
+      }
+      await wait(250);
+    }
+    assertActiveRun(runId);
+    current = inferTaskActions(task);
+    const finalSignature = current.complete ? JSON.stringify(current.steps.map(({action, label}) => [action, label])) : "";
+    if (current.complete && finalSignature === signature && Date.now() - stableSince >= 750) {
+      if (missingDeclaredActions(current)) {
+        throw new Error(`X 任务要求冲突：列表要求 ${declared}，官网当前任务面板仅显示 ${current.steps.map((step) => step.label).join("、")}；未执行点赞或评论，请核对本单`);
+      }
+      return confirmTaskActions(current, runId);
+    }
+    throw new Error(`等待 X 当前任务要求超时：${current.reason || "未读到完整的行动要求和停留时长"}，未执行点赞或评论`);
+  }
+
+  function confirmTaskActions(actions, runId, note = "") {
+    if (actions.unsupported.length) throw new Error(`当前任务包含尚未支持的动作：${actions.unsupported.join("、")}，未执行点赞或评论`);
+    const summary = actions.steps.map((step) => `${step.label}（${step.status}）`).join("、");
+    try {
+      chrome.runtime.sendMessage({ type: "CONTENT_LOG", runId, level: "info",
+        text: `X 任务要求识别来源：官网当前任务面板；要求：${summary}${note ? `；${note}` : ""}` })?.catch?.(() => {});
+    } catch (_) {}
+    return actions;
+  }
+
+  function describeTaskWidgetCompletionBlock() {
+    const actions = inferTaskActions();
+    if (!actions.complete) return actions.reason || "未读到完整当前任务要求，无法确认未完成步骤";
+    const pending = actions.steps.filter((step) => !step.completed).map((step) => `${step.label}（${step.status}）`);
+    const dwell = actions.dwellSeconds >= actions.requiredDwellSeconds
+      ? `停留时长已满足 ${actions.dwellSeconds}/${actions.requiredDwellSeconds}s`
+      : `停留时长尚不足 ${actions.dwellSeconds}/${actions.requiredDwellSeconds}s`;
+    return `${pending.length ? `官网仍有未完成动作：${pending.join("、")}` : "官网动作均已完成"}；${dwell}；验证按钮尚未解锁`;
   }
 
   function startTaskWidgetAssist() {
@@ -774,7 +861,7 @@
       await wait(250);
     }
 
-    const reason = "停留时长或完成步骤尚未解锁，未找到可点击的提交任务按钮";
+    const reason = describeTaskWidgetCompletionBlock();
     return { ok: false, message: `X 任务闭环超时：${reason}${submitText ? `：${submitText}` : ""}` };
   }
 
@@ -1223,7 +1310,7 @@
       const verified = await waitForLikeApplied(article, 4000).catch(() => false);
       return verified
         ? { ok: true, status: "liked", message: "已点赞当前推文" }
-        : { ok: true, status: "clicked_unverified", message: "已点击点赞但未确认状态" };
+        : { ok: false, status: "clicked_unverified", message: "已点击点赞但未确认状态，不继续提交本单" };
     } catch (error) {
       return { ok: false, status: "error", message: `点赞跳过：${error.message || String(error)}` };
     }

@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseHighBountyMonitor__";
-  const SCRIPT_VERSION = "0.7.86";
+  const SCRIPT_VERSION = "0.7.88";
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) return;
   if (existingSingleton?.stop) existingSingleton.stop();
@@ -336,7 +336,7 @@
 
   function buildSelectionId(info) {
     return [
-      info.taskType || "任务",
+      detectScopedTaskType(info.taskType || "") || info.taskType || "任务",
       Number(info.bounty || 0).toFixed(2),
       normalize(info.handle || ""),
       normalize(info.title || "").slice(0, 80),
@@ -442,10 +442,21 @@
 
   function detectTaskType(source) {
     const text = typeof source === "string" ? normalize(source) : getTaskTypeScopeText(source);
-    for (const entry of TASK_TYPES) {
-      if (entry.markers.some((marker) => text.includes(marker))) return entry.label;
-    }
-    return "";
+    return detectScopedTaskType(text);
+  }
+
+  function detectScopedTaskType(text) {
+    const value = normalize(text).replace(/\s+/g, "");
+    if (!value) return "";
+    const labels = value.match(/原创推文|原创建推文|原创内容|发布推文|创建推文|发一条推文|CreateTweet|PostTweet|OriginalPost|发推|转发|转推|Repost|Retweet|关注|Follow|评论留言|评论|回复|Comment|Reply|点赞互动|点赞|Like|赞/gi) || [];
+    const remainder = value.replace(/原创推文|原创建推文|原创内容|发布推文|创建推文|发一条推文|CreateTweet|PostTweet|OriginalPost|发推|转发|转推|Repost|Retweet|关注|Follow|评论留言|评论|回复|Comment|Reply|点赞互动|点赞|Like|赞/gi, "").replace(/任务|[+＋&＆、,/／·|与和]/g, "");
+    if (remainder || !labels.length) return "";
+    if (labels.some((label) => /原创|发推|发布推文|创建推文|发一条推文|CreateTweet|PostTweet|OriginalPost/i.test(label))) return "原创推文";
+    if (labels.some((label) => /转发|转推|Repost|Retweet/i.test(label))) return "转发";
+    if (labels.some((label) => /关注|Follow/i.test(label))) return "关注";
+    const comment = labels.some((label) => /评论|回复|Comment|Reply/i.test(label));
+    const like = labels.some((label) => /赞|Like/i.test(label));
+    return comment && like ? "评论+点赞" : comment ? "评论" : like ? "点赞互动" : "";
   }
 
   function getTaskTypeScopeText(card) {
@@ -459,7 +470,7 @@
   }
 
   function hasTaskTypeMarker(text) {
-    return TASK_TYPES.some((entry) => entry.markers.some((marker) => text.includes(marker)));
+    return Boolean(detectScopedTaskType(text));
   }
 
   function extractCardHeaderText(rawText) {
@@ -469,8 +480,8 @@
       .filter(Boolean);
     const header = [];
     for (const line of lines) {
-      if (/预计获得|LUX|冷却|查看详情|活动周期|长期有效/i.test(line)) break;
-      header.push(line);
+      if (/预计获得|LUX|冷却|查看详情|活动周期|长期有效|TARGET TWEET|目标推文/i.test(line)) break;
+      if (detectScopedTaskType(line)) header.push(line);
       if (header.length >= 8) break;
     }
     return header.join(" ");
@@ -488,6 +499,7 @@
   function isUsefulTitle(text, taskType) {
     if (!text || text.length < 2 || text.length > 120) return false;
     if (text === taskType) return false;
+    if (detectScopedTaskType(text)) return false;
     if (/活动周期|长期有效|预计获得|LUX|冷却|查看详情|评论留言|已完成|进行中|席位|PROMO|官方/.test(text)) return false;
     if (/^\d+(?:\.\d+)?$/.test(text)) return false;
     return true;

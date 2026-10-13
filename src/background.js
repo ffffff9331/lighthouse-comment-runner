@@ -3797,7 +3797,11 @@ async function restoreAutoRunState() {
       completionEvidence: saved.completionEvidence?.incomeVerified && !saved.completionEvidence.officialCompletion ? null : (saved.completionEvidence || null),
       runId: saved.runId || createRunId()
     };
-    log("warn", mayResume ? "Chrome 后台恢复了中断的 Lighthouse 状态，等待保活闹钟自动续跑（先核对订单）" : "已恢复 Lighthouse 订单记录，保持停止状态");
+    // Reading an already-stopped snapshot is not a new run event. Logging it
+    // here would append and persist another warning on every worker wakeup.
+    if (saved.running === true) {
+      log("warn", mayResume ? "Chrome 后台恢复了中断的 Lighthouse 状态，等待保活闹钟自动续跑（先核对订单）" : "已恢复 Lighthouse 订单记录，保持停止状态");
+    }
     if (mayResume) await ensureAutoRunKeepalive();
   } catch (_) {
     // A corrupt or stale snapshot must never prevent a fresh run.

@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.86";
+  const SCRIPT_VERSION = "0.7.88";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -189,7 +189,7 @@
   function mergeSelectedTaskIdentity(selectedTask = {}, detailTask = {}) {
     return {
       ...detailTask,
-      taskType: selectedTask?.taskType || detailTask?.taskType || "评论",
+      taskType: mergeTaskTypes(selectedTask?.taskType, detailTask?.taskType) || "评论",
       taskKey: selectedTask?.taskKey || detailTask?.taskKey,
       selectionId: selectedTask?.selectionId || detailTask?.selectionId,
       stableTaskKey: selectedTask?.stableTaskKey || detailTask?.stableTaskKey,
@@ -242,7 +242,7 @@
       taskKey: selection.taskKey,
       selectionId: selection.selectionId,
       stableTaskKey: selection.stableTaskKey,
-      taskType: selection.taskType || detectedDetailTask.taskType,
+      taskType: mergeTaskTypes(selection.taskType, detectedDetailTask.taskType),
       bounty: selection.bounty,
       handle: selection.handle,
       candidateTitle: selection.title,
@@ -256,7 +256,7 @@
       taskKey: selection.taskKey,
       selectionId: selection.selectionId,
       stableTaskKey: selection.stableTaskKey,
-      taskType: selection.taskType,
+      taskType: detailTask.taskType,
       bounty: selection.bounty,
       handle: selection.handle,
       candidateTitle: selection.title,
@@ -288,7 +288,7 @@
     await acceptInvitationIfPresent(settings);
     await confirmPagePhase(["detail_ready"], settings, "打开选中详情后");
 
-    const detailTask = await waitForSelectedTaskTweetTarget(settings, selectedTask.taskType || selection.taskType);
+    const detailTask = await waitForSelectedTaskTweetTarget(settings, mergeTaskTypes(selectedTask.taskType, selection.taskType));
     return {
       ok: true,
       message: detailTask.awaitingXTabAdoption ? "已点击选中任务详情的在 X 打开控件" : "已从选中任务详情提取推文链接",
@@ -316,7 +316,7 @@
     await acceptInvitationIfPresent(settings);
     await confirmPagePhase(["detail_ready"], settings, "打开选中详情后");
 
-    const detailTask = await waitForTaskDetailReady(settings, selectedTask.taskType || selection.taskType);
+    const detailTask = await waitForTaskDetailReady(settings, mergeTaskTypes(selectedTask.taskType, selection.taskType));
     assertSupportedDetailTask(detailTask, settings);
     return {
       ok: true,
@@ -383,10 +383,18 @@
 
   function canonicalSupportedTaskType(taskType) {
     const value = normalize(taskType);
-    if (value === "点赞" || value === "Like") return "点赞互动";
-    if (value === "评论留言" || value === "回复") return "评论";
-    if (FOLLOW_MARKERS.some((marker) => value.includes(marker))) return "关注";
-    return value;
+    return detectScopedTaskType(value) || value;
+  }
+
+  function mergeTaskTypes(selectedType, detailType) {
+    const selected = canonicalSupportedTaskType(selectedType || "");
+    const detail = canonicalSupportedTaskType(detailType || "");
+    const unsupported = [selected, detail].find((type) => ["原创推文", "转发", "关注"].includes(type));
+    if (unsupported) return unsupported;
+    if (selected === "评论+点赞" || detail === "评论+点赞") return "评论+点赞";
+    // A later detail read may only carry buildTask's legacy comment default.
+    // Keep the selected explicit type unless either view proves a composite.
+    return selected || detail;
   }
 
   function formatCandidateMatchDebug(candidate, score) {
@@ -1122,22 +1130,24 @@
   }
 
   function detectScopedTaskType(text) {
-    const value = normalize(text);
+    const value = normalize(text).replace(/\s+/g, "");
     if (!value) return "";
-    if (COMMENT_EQUIVALENT_MARKERS.some((marker) => value.includes(marker))) return "点赞互动";
-    if (COMMENT_MARKERS.some((marker) => value.includes(marker))) return "评论";
-    if (FOLLOW_MARKERS.some((marker) => value.includes(marker))) return "关注";
-    if (isOriginalTweetTaskText(value)) return "原创推文";
-    if (isRetweetTaskText(value)) return "转发";
-    return "";
+    const labels = value.match(/原创推文|原创建推文|原创内容|发布推文|创建推文|发一条推文|CreateTweet|PostTweet|OriginalPost|发推|转发|转推|Repost|Retweet|关注|Follow|评论留言|评论|回复|Comment|Reply|点赞互动|点赞|Like|赞/gi) || [];
+    const remainder = value.replace(/原创推文|原创建推文|原创内容|发布推文|创建推文|发一条推文|CreateTweet|PostTweet|OriginalPost|发推|转发|转推|Repost|Retweet|关注|Follow|评论留言|评论|回复|Comment|Reply|点赞互动|点赞|Like|赞/gi, "").replace(/任务|[+＋&＆、,/／·|与和]/g, "");
+    if (remainder || !labels.length) return "";
+    if (labels.some((label) => /原创|发推|发布推文|创建推文|发一条推文|CreateTweet|PostTweet|OriginalPost/i.test(label))) return "原创推文";
+    if (labels.some((label) => /转发|转推|Repost|Retweet/i.test(label))) return "转发";
+    if (labels.some((label) => /关注|Follow/i.test(label))) return "关注";
+    const comment = labels.some((label) => /评论|回复|Comment|Reply/i.test(label));
+    const like = labels.some((label) => /赞|Like/i.test(label));
+    return comment && like ? "评论+点赞" : comment ? "评论" : like ? "点赞互动" : "";
   }
 
   function collectTaskTypeBadgeText(card) {
-    const markerText = COMMENT_MARKERS.concat(COMMENT_EQUIVALENT_MARKERS, FOLLOW_MARKERS, ORIGINAL_TWEET_MARKERS, RETWEET_MARKERS);
-    return Array.from(card.querySelectorAll?.("button,a,[role='button'],span,p,strong,b,small") || [])
+    return Array.from(card?.querySelectorAll?.("button,a,[role='button'],span,p,strong,b,small") || [])
       .filter(isVisible)
       .map((node) => normalize(node.innerText || node.textContent || node.getAttribute("aria-label") || ""))
-      .filter((text) => text && text.length <= 32 && markerText.some((marker) => text.includes(marker)))
+      .filter((text) => text && text.length <= 32 && detectScopedTaskType(text))
       .join(" ");
   }
 
@@ -1148,21 +1158,15 @@
       .filter(Boolean);
     const header = [];
     for (const line of lines) {
-      if (/预计获得|LUX|冷却|查看详情|活动周期|长期有效/i.test(line)) break;
-      header.push(line);
+      if (/预计获得|LUX|冷却|查看详情|活动周期|长期有效|TARGET TWEET|目标推文/i.test(line)) break;
+      if (detectScopedTaskType(line)) header.push(line);
       if (header.length >= 8) break;
     }
     return header.join(" ");
   }
 
   function detectTaskTypeFromText(text) {
-    if (isOriginalTweetTaskText(text)) return "原创推文";
-    if (isRetweetTaskText(text)) return "转发";
-    const value = normalize(text);
-    if (COMMENT_EQUIVALENT_MARKERS.some((marker) => value.includes(marker))) return "点赞互动";
-    if (COMMENT_MARKERS.some((marker) => value.includes(marker))) return "评论";
-    if (FOLLOW_MARKERS.some((marker) => value.includes(marker))) return "关注";
-    return "";
+    return detectScopedTaskType(text) || detectScopedTaskType(extractCardHeaderText(text));
   }
 
   function isInvitationTaskText(text) {
@@ -1203,7 +1207,7 @@
 
   function isCommentEquivalentTaskType(taskType) {
     const value = normalize(taskType);
-    return value === "评论" || value === "点赞互动" || value === "点赞";
+    return value === "评论" || value === "评论+点赞" || value === "评论+赞" || value === "点赞互动" || value === "点赞";
   }
 
   function isAutomatableTaskType(taskType) {
@@ -1218,7 +1222,7 @@
     const taskType = explicitTaskType || detectTaskTypeFromText(detailText || task.detailText || "");
     const tierMismatch = detailText.replace(/\s+/g, "").replace(/[，,]/g, "，").includes(TIER_MISMATCH_PHRASE);
     const unsupportedGuidance = hasUnsupportedCommentGuidance(detailText);
-    if (!tierMismatch && !unsupportedGuidance && (taskType === "评论" || taskType === "点赞互动" || taskType === "点赞")) return;
+    if (!tierMismatch && !unsupportedGuidance && ["评论", "评论+点赞", "评论+赞", "点赞互动", "点赞"].includes(taskType)) return;
     const reason = tierMismatch
       ? `平台提示：${TIER_MISMATCH_PHRASE}`
       : (unsupportedGuidance ? "任务备注要求人工提供内容" : `已识别为${taskType || "非回复"}任务`);
@@ -1256,6 +1260,7 @@
 
   function isCandidateTitleLine(line, taskType) {
     if (!line || line === taskType) return false;
+    if (detectScopedTaskType(line)) return false;
     if (line.length < 2 || line.length > 120) return false;
     if (/活动周期|长期有效|预计获得|LUX|冷却|查看详情|评论留言|已完成|进行中|席位|PROMO|官方/.test(line)) return false;
     if (/^\d+(?:\.\d+)?$/.test(line)) return false;
@@ -1264,7 +1269,7 @@
 
   function buildSelectionId(info) {
     return [
-      info.taskType || "任务",
+      canonicalSupportedTaskType(info.taskType || "") || "任务",
       Number(info.bounty || 0).toFixed(2),
       normalize(info.handle || ""),
       normalize(info.title || "").slice(0, 80),
@@ -1275,7 +1280,7 @@
   function buildStableTaskKey(info) {
     return [
       "stable",
-      info.taskType || "任务",
+      canonicalSupportedTaskType(info.taskType || "") || "任务",
       Number(info.bounty || 0).toFixed(2),
       normalize(info.handle || "").toLowerCase(),
       normalize(info.title || "").slice(0, 80)
@@ -2056,12 +2061,12 @@
   function buildTask(settings, taskTypeHint = "") {
     const detailRoot = findTaskDetailRoot() || document.body;
     const detailText = normalize(detailRoot.innerText || document.body.innerText).slice(0, 1800);
-    const normalizedTaskTypeHint = normalize(taskTypeHint);
+    const taskType = mergeTaskTypes(taskTypeHint, detectCandidateTaskType(detailRoot, detailRoot.innerText || ""));
     return {
       source: "lighthouse",
       title: extractTitle(detailRoot),
       tweetUrl: extractTweetUrl(detailRoot),
-      taskType: normalizedTaskTypeHint || detectTaskTypeFromText(detailText) || "评论",
+      taskType: taskType || "评论",
       taskKey: buildTaskKey(detailText),
       detailText,
       createdAt: new Date().toISOString()
