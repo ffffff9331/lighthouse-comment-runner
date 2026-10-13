@@ -27,11 +27,11 @@
 - 运行模式、单次任务上限、接单尝试上限。
 - 最低赏金、倒计时抢单、轮询间隔和锁席位超时。
 - X 回复模式和 Lighthouse 自动提交。
-- AI 模型名称、Responses API 地址、API Key 和系统提示词。
+- AI 模型名称、API Key 和系统提示词。
 - 可选的运行时间段。
 - 倒计时监控、最低监控赏金和语音提醒。
 
-默认 AI 模型为 `gpt-5.6-terra`。自定义 API 地址应使用 HTTPS，并填写兼容 Responses API 的接口地址，例如 `https://.../v1/responses`。
+默认 AI 模型为 `gpt-5.6-terra`，可自行填写其他模型。AI 回复固定使用 `https://api.vayne.cc.cd/v1/responses`，接口配置只保留模型与 API Key 输入，不提供地址或协议入口。原地址不匹配的旧 Key 会清除，需要重新填写中转站 Key；系统提示词保持不变。
 
 ## 自动流程
 

@@ -2345,7 +2345,7 @@
 
   async function getLiveAutoMinTaskBounty(fallbackSettings = {}) {
     try {
-      const stored = await chrome.storage.local.get(["settings"]);
+      const stored = await chrome.runtime.sendMessage({ type: "GET_CONTENT_SETTINGS" });
       return getAutoMinTaskBounty({
         ...(fallbackSettings || {}),
         ...(stored?.settings || {})

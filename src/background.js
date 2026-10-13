@@ -45,7 +45,7 @@ const DEFAULT_SETTINGS = {
   readingSimulationMs: 4000,
   aiProvider: "gpt-5.6-terra",
   aiModel: "gpt-5.6-terra",
-  aiApiUrl: "",
+  aiApiUrl: "https://api.vayne.cc.cd/v1/responses",
   aiApiKey: "",
   aiSystemPrompt: LIGHTHOUSE_DEFAULT_AI_SYSTEM_PROMPT,
   runWindowEnabled: false,
@@ -70,7 +70,7 @@ const DEFAULT_MONITOR_SETTINGS = {
 
 let runIdSequence = 0;
 let runtimeState = createInitialState();
-const runtimeStateReady = restoreAutoRunState();
+const runtimeStateReady = chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" }).then(restoreAutoRunState);
 const activeAIRequests = new Set();
 let monitorCountdowns = { tasks: [], timestamp: 0 };
 let lastXTaskWidgetNotifyAt = 0;
@@ -169,6 +169,7 @@ function publishLighthouseMonitorSnapshot(reason = "update", options = {}) {
 publishLighthouseMonitorSnapshot("startup", { force: true });
 
 chrome.runtime.onInstalled.addListener(async () => {
+  await runtimeStateReady;
   const stored = await chrome.storage.local.get(["settings", "monitorSettings"]);
   if (!stored.settings) {
     await chrome.storage.local.set({ settings: DEFAULT_SETTINGS });
@@ -188,6 +189,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!isAuthorizedMessage(message, sender)) {
+    sendResponse({ ok: false, error: "消息来源无权执行此操作" });
+    return false;
+  }
   handleMessage(message, sender)
     .then(sendResponse)
     .catch((error) => {
@@ -250,7 +255,10 @@ async function handleMessage(message, sender) {
 
   switch (message.type) {
     case "GET_STATE":
+      if (sender?.tab && !String(sender.url || "").startsWith("chrome-extension://")) return { ok: false, error: "完整设置仅限扩展界面访问" };
       return { ok: true, state: runtimeState, settings: await getSettings() };
+    case "GET_CONTENT_SETTINGS":
+      return { ok: true, settings: { autoMinTaskBounty: (await getSettings()).autoMinTaskBounty } };
     case "SAVE_SETTINGS":
       await chrome.storage.local.set({ settings: normalizeSettings(message.settings) });
       if (runtimeState.running && runtimeState.mode === "auto" && runtimeState.stage === "auto_waiting_schedule") {
@@ -425,6 +433,20 @@ async function handleMessage(message, sender) {
   }
 }
 
+function isAuthorizedMessage(message, sender) {
+  if (sender?.id !== chrome.runtime.id) return false;
+  if (String(sender.url || "").startsWith(chrome.runtime.getURL(""))) return true;
+  if (!Number.isInteger(sender?.tab?.id) || (sender.frameId ?? 0) !== 0) return false;
+  const url = String(sender.url || "");
+  if (/^https:\/\/(?:x|twitter)\.com\//.test(url)) {
+    return ["GENERATE_AI_REPLY", "QUERY_TWEET_REPLY_HISTORY", "X_TASK_WIDGET_HINT", "X_REPLY_RESULT"].includes(message?.type);
+  }
+  if (/^https:\/\/app\.lhdao\.top\//.test(url)) {
+    return ["GET_CONTENT_SETTINGS", "CONTENT_LOG", "DEBUG_TASK_CANDIDATE", "LIGHTHOUSE_TARGET_TWEET_URL", "LIGHTHOUSE_TASK_READY", "LIGHTHOUSE_TASK_DONE", "HIGH_BOUNTY_ALERT", "MONITOR_COUNTDOWN_SYNC", "MONITOR_GET_STATUS", "MONITOR_MIGRATE_SETTINGS"].includes(message?.type);
+  }
+  return false;
+}
+
 function getMessageWindowId(message, sender) {
   const senderWindowId = sender?.tab?.windowId;
   if (Number.isInteger(senderWindowId)) return senderWindowId;
@@ -482,6 +504,11 @@ function enqueueManualDebugCommand(message, windowId) {
 }
 
 async function runManualDebugCommand(message, windowId) {
+  if (["DEBUG_OPEN_CAMPAIGNS", "DEBUG_OPEN_FIRST_TASK", "DEBUG_FAST_X_CLAIM_REPLY_VERIFY"].includes(message.type)
+      && (runtimeState.uncertainAction || ((runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed)
+        && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId)))) {
+    return { ok: false, error: "旧订单尚未核对，不能接管或打开另一任务", state: runtimeState };
+  }
   const lockResult = lockRuntimeWindowForCommand(windowId, message.type);
   if (!lockResult.ok) {
     return { ok: false, error: lockResult.error, state: runtimeState };
@@ -742,6 +769,9 @@ async function openDebugPage(windowId = null) {
 
 async function startAutoRun(options, windowId = null) {
   if (runtimeState.running) return { ok: false, error: "当前流程仍在执行" };
+  if (runtimeState.uncertainAction || ((runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed) && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId))) {
+    return { ok: false, error: "旧订单尚未核对，请先确认本单结果，不能清空后接新单", state: runtimeState };
+  }
   runtimeState = createInitialState();
   setRuntimeWindow(windowId);
   runtimeState.runId = createRunId();
@@ -919,6 +949,9 @@ async function startNextAutoTask(reason) {
 }
 
 async function debugOpenCampaigns(windowId = null) {
+  if (runtimeState.uncertainAction || ((runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed) && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId))) {
+    return { ok: false, error: "旧订单尚未核对，已保留当前订单和页面", state: runtimeState };
+  }
   runtimeState = createInitialState();
   setRuntimeWindow(windowId);
   runtimeState.runId = createRunId();
@@ -945,6 +978,9 @@ async function debugOpenCampaigns(windowId = null) {
 }
 
 async function debugOpenFirstTask() {
+  if (runtimeState.uncertainAction || ((runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed) && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId))) {
+    return { ok: false, error: "旧订单尚未核对，不能打开另一任务", state: runtimeState };
+  }
   const tabId = await resolveLighthouseTab();
   const settings = await getSettings();
   await chrome.tabs.update(tabId, { active: true });
@@ -1053,6 +1089,9 @@ async function debugRunXReply() {
 }
 
 async function debugFastXClaimReplyVerify(selectedTask = null, windowId = null) {
+  if (runtimeState.uncertainAction || ((runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed) && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId))) {
+    return { ok: false, error: "旧订单尚未核对，不能清空后启动快速流程", state: runtimeState };
+  }
   const settings = await getSettings();
   const selected = selectedTask ? { ...selectedTask } : null;
   runtimeState = createInitialState();
@@ -1133,6 +1172,9 @@ async function debugFastXClaimReplyVerify(selectedTask = null, windowId = null) 
 }
 
 async function startSelectedCountdownTask(selectedTask = null, windowId = null) {
+  if (runtimeState.uncertainAction || ((runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed) && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId))) {
+    return { ok: false, error: "旧订单尚未核对，不能切换到另一订单", state: runtimeState };
+  }
   if (!selectedTask) {
     log("error", "未选中倒计时任务，请先在任务倒计时列表点击一条任务");
     return { ok: false, error: "未选中任务", state: runtimeState };
@@ -1161,6 +1203,9 @@ async function startSelectedCountdownTask(selectedTask = null, windowId = null) 
 }
 
 async function runSelectedCountdownTask(selectedTask = null, windowId = null) {
+  if (runtimeState.uncertainAction || ((runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed) && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId))) {
+    return { ok: false, error: "旧订单尚未核对，不能切换到另一订单", state: runtimeState };
+  }
   runtimeState = createInitialState();
   setRuntimeWindow(windowId);
   runtimeState.runId = createRunId();
@@ -1840,10 +1885,13 @@ async function waitForLighthouseTaskCompletionAndReturn(runId, settings) {
   return result;
 }
 
-// The completion overlay occasionally never renders even though the task was
-// paid. Before stopping the whole run on that timeout, compare the plaza's
-// own paid-income header against the baseline captured at task start.
+// Aggregate income is supplementary only: delayed payment for another order
+// must never manufacture completion evidence for the current task.
 async function verifyCompletionByPlazaIncome(tabId, runId, settings) {
+  const evidence = runtimeState.completionEvidence;
+  if (!evidence || evidence.runId !== runId
+      || evidence.taskKey !== runtimeState.currentTask?.taskKey
+      || (evidence.incomeVerified && !evidence.officialCompletion)) return null;
   const bounty = Number(runtimeState.currentTask?.bounty || 0);
   const baseline = Number(runtimeState.incomeAtTaskStart);
   if (runId !== runtimeState.runId || !runtimeState.running) return null;
@@ -1854,7 +1902,7 @@ async function verifyCompletionByPlazaIncome(tabId, runId, settings) {
     log("warn", `完成弹窗未出现，且今日收入未见本单赏金（开始 ${baseline}，当前 ${Number.isFinite(incomeNow) ? incomeNow : "不可读"}），仍按未完成处理`);
     return null;
   }
-  latchIncomeVerifiedCompletion(runId);
+  if (!latchIncomeVerifiedCompletion(runId)) return null;
   const returned = await closeLighthouseDetailToCampaigns(tabId, settings, "收入核验通过，返回广场");
   setStage("campaigns_returned");
   log("warn", `官网完成弹窗未出现，但任务广场今日收入已入账本单赏金（+${bounty} LUX），按已到账处理并返回广场`);
@@ -1875,12 +1923,13 @@ async function readPlazaTodayIncome(tabId, runId = runtimeState.runId) {
 
 function latchIncomeVerifiedCompletion(runId) {
   if (runId !== runtimeState.runId || !runtimeState.running || !runtimeState.currentTask?.taskKey) return false;
+  const evidence = runtimeState.completionEvidence;
+  if (!evidence || evidence.runId !== runId
+      || evidence.taskKey !== runtimeState.currentTask.taskKey
+      || (evidence.incomeVerified && !evidence.officialCompletion)) return false;
   runtimeState.completionEvidence = {
-    runId,
-    taskKey: runtimeState.currentTask.taskKey,
-    tweetUrl: normalizeTweetUrl(runtimeState.currentTask.tweetUrl || ""),
-    observedAt: new Date().toISOString(),
-    text: "任务广场今日收入核验通过",
+    ...evidence,
+    officialCompletion: true,
     incomeVerified: true
   };
   touchAutoRunState();
@@ -1894,12 +1943,14 @@ function latchLighthouseCompletion(evidence, runId) {
   const expectedUrl = normalizeTweetUrl(runtimeState.currentTask?.tweetUrl || "");
   if (evidence.tweetUrl && expectedUrl && normalizeTweetUrl(evidence.tweetUrl) !== expectedUrl) return false;
   runtimeState.completionEvidence = { ...evidence };
+  runtimeState.uncertainAction = null;
   return true;
 }
 
 function hasLatchedLighthouseCompletion(runId) {
   const evidence = runtimeState.completionEvidence;
-  return Boolean(evidence && evidence.runId === runId && evidence.taskKey === runtimeState.currentTask?.taskKey);
+  return Boolean(evidence && evidence.runId === runId && evidence.taskKey === runtimeState.currentTask?.taskKey
+    && (!evidence.incomeVerified || evidence.officialCompletion));
 }
 
 async function handleXReplyResult(result, message = {}) {
@@ -2311,7 +2362,7 @@ async function getSettings() {
   const stored = await chrome.storage.local.get(["settings"]);
   const migrated = migrateSettings(stored.settings || {});
   const normalized = normalizeSettings(migrated.settings);
-  if (migrated.changed || !stored.settings) {
+  if (migrated.changed || !stored.settings || stored.settings.aiApiUrl !== normalized.aiApiUrl || stored.settings.aiApiKey !== normalized.aiApiKey) {
     await chrome.storage.local.set({ settings: normalized });
   }
   return normalized;
@@ -2517,6 +2568,9 @@ function migrateSettings(settings) {
 
 function normalizeSettings(settings) {
   const merged = { ...DEFAULT_SETTINGS, ...(settings || {}) };
+  const aiApiUrl = "https://api.vayne.cc.cd/v1/responses";
+  const aiApiKey = String(settings?.aiApiUrl || "").trim() === aiApiUrl
+    ? String(merged.aiApiKey || "").trim() : "";
   const parsedMax = Number.parseInt(merged.maxTasksPerRun, 10);
   const parsedAttempts = Number.parseInt(merged.maxTaskAttempts, 10);
   const parsedDelay = Number.parseInt(merged.actionDelayMs, 10);
@@ -2545,8 +2599,8 @@ function normalizeSettings(settings) {
       : 4000,
     aiProvider: "gpt-5.6-terra",
     aiModel: String(merged.aiModel || "gpt-5.6-terra").trim().slice(0, 128) || "gpt-5.6-terra",
-    aiApiUrl: String(merged.aiApiUrl || "").trim(),
-    aiApiKey: String(merged.aiApiKey || "").trim(),
+    aiApiUrl,
+    aiApiKey,
     aiSystemPrompt: String(merged.aiSystemPrompt || LIGHTHOUSE_DEFAULT_AI_SYSTEM_PROMPT).trim(),
     runWindowEnabled: false,
     runWindowStart: normalizeClockTime(merged.runWindowStart, DEFAULT_SETTINGS.runWindowStart),
@@ -2562,6 +2616,20 @@ function isLimitReached(count, limit) {
 
 async function sendToTab(tabId, payload) {
   payload = { ...payload, platform: "lighthouse", task: payload.task || runtimeState.currentTask };
+  const claimsOrder = ["START_LIGHTHOUSE_COMMENT_TASK", "DEBUG_LOCK_SEAT_AND_EXTRACT", "WAIT_SELECTED_COUNTDOWN_AND_LOCK", "RUN_X_WIDGET_CLAIM"].includes(payload.type);
+  let claimIntent = null;
+  const sentState = runtimeState;
+  const sentRunId = runtimeState.runId;
+  const stale = () => runtimeState !== sentState || runtimeState.runId !== sentRunId;
+  const readOnlyOrCancel = /^(?:CANCEL_|CHECK_|READ_|MONITOR_GET_)/.test(payload.type)
+    || ["BEGIN_LIGHTHOUSE_COMPLETION_WATCH", "WAIT_LIGHTHOUSE_COMPLETION_RETURN"].includes(payload.type);
+  if (runtimeState.uncertainAction && !readOnlyOrCancel) {
+    return { ok: false, uncertain: true, message: "旧动作结果未知，禁止重复执行，请先核对本单" };
+  }
+  if (payload.settings) {
+    const allowed = ["actionDelayMs", "lockSeatTimeoutMs", "autoSubmitLighthouse", "autoMinTaskBounty", "enableCooldownSniping", "maxCooldownWaitMs", "cooldownPollMs", "replyMode", "replyProvider", "readingSimulationMs", "taskDetailLoadTimeoutMs", "detailOverlayStaleMs"];
+    payload.settings = Object.fromEntries(allowed.filter((key) => Object.hasOwn(payload.settings, key)).map((key) => [key, payload.settings[key]]));
+  }
   for (let attempt = 1; attempt <= 8; attempt += 1) {
     if (payload.runId && !payload.type.startsWith("CANCEL_") &&
         (payload.runId !== runtimeState.runId || !runtimeState.running)) {
@@ -2569,14 +2637,67 @@ async function sendToTab(tabId, payload) {
     }
     try {
       await ensureLighthouseAlertBridge(tabId);
-      return await chrome.tabs.sendMessage(tabId, payload);
+      if (!payload.type.startsWith("CANCEL_") && (stale() || (payload.runId && !runtimeState.running))) {
+        return { ok: false, cancelled: true, message: "流程已变化，未发送旧消息" };
+      }
+      if (runtimeState.uncertainAction && runtimeState.uncertainAction !== claimIntent && !readOnlyOrCancel) {
+        return { ok: false, uncertain: true, message: "旧动作结果未知，禁止重复执行，请先核对本单" };
+      }
+      if (claimsOrder && !claimIntent) {
+        claimIntent = { type: payload.type, taskKey: payload.task?.taskKey || "", runId: payload.runId, tabId };
+        runtimeState.uncertainAction = claimIntent;
+        // A terminated worker must retain an unanswered claim, even before its task is known.
+        await persistAutoRunState(true);
+        if (stale() || payload.runId !== runtimeState.runId || !runtimeState.running) {
+          if (runtimeState.uncertainAction === claimIntent) {
+            delete runtimeState.uncertainAction;
+            await persistAutoRunState(true);
+          }
+          return { ok: false, cancelled: true, message: "流程已停止，未发送接单动作" };
+        }
+      }
+      const result = await chrome.tabs.sendMessage(tabId, payload);
+      if (!payload.type.startsWith("CANCEL_") && (stale() || (payload.runId && !runtimeState.running))) {
+        return { ok: false, cancelled: true, message: "流程已变化，未采用旧回执" };
+      }
+      if (claimIntent && runtimeState.uncertainAction === claimIntent) {
+        const claimedTask = result?.task?.seatLocked || result?.task?.claimed || result?.task?.seatLockedAt;
+        if (claimedTask || result?.claimed === true) {
+          runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, result.task || payload.task,
+            result.claimed === true ? { claimed: true, seatLocked: true } : {});
+        } else if (!(result?.ok === false && (result.transient || result.permanentIgnore || result.refreshRequested || (result.claimed === false && result.clicks === 0)))) {
+          runtimeState.running = false;
+          setStage("action_result_unknown");
+          return { ok: false, uncertain: true, message: "接单回执未确认订单状态，已保留执行意图，请先核对本单" };
+        }
+        delete runtimeState.uncertainAction;
+        await persistAutoRunState(true);
+        if (stale() || (payload.runId && !runtimeState.running)) {
+          return { ok: false, cancelled: true, message: "流程已变化，订单已保存但不再继续旧流程" };
+        }
+      }
+      return result;
     } catch (error) {
+      if (!payload.type.startsWith("CANCEL_") && stale()) {
+        return { ok: false, cancelled: true, message: "流程已变化，未将旧错误写入当前任务" };
+      }
       if (isReceivingEndMissingError(error)) {
+        if (claimIntent && runtimeState.uncertainAction === claimIntent) {
+          delete runtimeState.uncertainAction;
+          await persistAutoRunState(true);
+          claimIntent = null;
+        }
         const injected = await ensureContentScriptInjected(tabId);
         if (injected) {
           await delay(300);
           continue;
         }
+      } else if (!readOnlyOrCancel) {
+        runtimeState.uncertainAction = { type: payload.type, taskKey: payload.task?.taskKey || "", runId: payload.runId, tabId };
+        runtimeState.running = false;
+        runtimeState.stage = "action_result_unknown";
+        log("error", `动作 ${payload.type} 的回执丢失，结果未知；已停止，禁止自动重发，请先核对本单`);
+        return { ok: false, uncertain: true, message: "动作可能已执行，回执丢失，未自动重试" };
       }
       if (attempt === 8) {
         log("error", `标签页消息失败：${error.message}`);
@@ -3651,19 +3772,21 @@ async function restoreAutoRunState() {
   try {
     const stored = await chrome.storage.local.get([AUTO_RUN_STATE_KEY]);
     const saved = stored[AUTO_RUN_STATE_KEY];
-    if (!saved || typeof saved !== "object" || !saved.running || saved.mode !== "auto") return;
+    if (!saved || typeof saved !== "object") return;
+    const mayResume = saved.running === true && saved.mode === "auto" && !saved.uncertainAction;
     runtimeState = {
       ...createInitialState(),
       ...saved,
       running: false,
       mode: "idle",
-      stage: "interrupted_not_resumed",
+      stage: mayResume ? "interrupted_not_resumed" : "stopped",
       logs: Array.isArray(saved.logs) ? saved.logs.slice(0, 120) : [],
       pendingXOpen: null,
+      completionEvidence: saved.completionEvidence?.incomeVerified && !saved.completionEvidence.officialCompletion ? null : (saved.completionEvidence || null),
       runId: saved.runId || createRunId()
     };
-    log("warn", "Chrome 后台恢复了中断的 Lighthouse 状态，等待保活闹钟自动续跑");
-    await ensureAutoRunKeepalive();
+    log("warn", mayResume ? "Chrome 后台恢复了中断的 Lighthouse 状态，等待保活闹钟自动续跑（先核对订单）" : "已恢复 Lighthouse 订单记录，保持停止状态");
+    if (mayResume) await ensureAutoRunKeepalive();
   } catch (_) {
     // A corrupt or stale snapshot must never prevent a fresh run.
   }
@@ -3764,6 +3887,7 @@ async function handleAutoRunKeepaliveTick() {
 
 async function tryResumeAutoRunAfterInterruption() {
   if (runtimeState.running) return true;
+  if (runtimeState.uncertainAction) return false;
   if (runtimeState.mode !== "idle" || runtimeState.stage !== "interrupted_not_resumed") return false;
   const savedTask = runtimeState.currentTask || {};
   const hasLockedIncompleteSeat = Boolean(
@@ -3804,12 +3928,13 @@ function touchAutoRunState() {
   }
 }
 
-function persistAutoRunState() {
+function persistAutoRunState(requireSuccess = false) {
   const snapshot = {
     ...runtimeState,
     pendingXOpen: null,
     logs: Array.isArray(runtimeState.logs) ? runtimeState.logs.slice(0, 120) : []
   };
+  if (requireSuccess) return chrome.storage.local.set({ [AUTO_RUN_STATE_KEY]: snapshot });
   chrome.storage.local.set({ [AUTO_RUN_STATE_KEY]: snapshot }, () => {
     void chrome.runtime.lastError;
   });

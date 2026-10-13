@@ -1586,7 +1586,7 @@ if (platform === "xinhuo") {
     c.releaseAttemptedTask({ taskKey: "task-1", tweetUrl: "https://x.com/a/status/1" });
     assert.deepEqual([...c.runtimeState.attemptedTaskRecords].map((r) => r.key), ["https://x.com/other/status/9", "stable|评论|0.10||old"]);
   });
-  await test("completion-overlay timeout is rescued by plaza income verification", async () => {
+  await test("completion-overlay timeout is not rescued by unrelated aggregate income", async () => {
     const state = {
       running: true, runId: "r", mode: "auto", completionEvidence: null,
       currentTask: { taskKey: "a", bounty: 0.1, tweetUrl: "https://x.com/a/status/1" },
@@ -1603,10 +1603,10 @@ if (platform === "xinhuo") {
       readPlazaTodayIncome: async () => 0.4
     });
     const result = await c.waitForLighthouseTaskCompletionAndReturn("r", {});
-    assert.equal(result.ok, true);
-    assert.equal(result.incomeVerified, true);
-    assert.equal(state.completionEvidence.incomeVerified, true);
-    assert.equal(state.completionEvidence.taskKey, "a");
+    assert.equal(result.ok, false);
+    assert.equal(result.timedOut, true);
+    assert.equal(result.incomeVerified, undefined);
+    assert.equal(state.completionEvidence, null);
   });
   await test("income verification never rescues when the bounty did not land", async () => {
     const state = {

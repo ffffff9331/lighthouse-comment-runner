@@ -15,7 +15,6 @@ const fields = {
   replyMode: document.getElementById("replyMode"),
   replyProvider: document.getElementById("replyProvider"),
   aiModel: document.getElementById("aiModel"),
-  aiApiUrl: document.getElementById("aiApiUrl"),
   aiApiKey: document.getElementById("aiApiKey"),
   aiSystemPrompt: document.getElementById("aiSystemPrompt"),
   monitorEnabled: document.getElementById("monitorEnabled"),
@@ -390,7 +389,7 @@ function readSettings() {
     replyProvider: fields.replyProvider.value,
     aiProvider: "gpt-5.6-terra",
     aiModel: fields.aiModel.value.trim(),
-    aiApiUrl: fields.aiApiUrl.value.trim(),
+    aiApiUrl: "https://api.vayne.cc.cd/v1/responses",
     aiApiKey: fields.aiApiKey.value.trim(),
     aiSystemPrompt: fields.aiSystemPrompt.value.trim()
   };
@@ -433,7 +432,6 @@ function renderSettings(settings) {
   fields.replyMode.value = settings.replyMode;
   fields.replyProvider.value = settings.replyProvider;
   fields.aiModel.value = settings.aiModel || "gpt-5.6-terra";
-  fields.aiApiUrl.value = settings.aiApiUrl || "";
   fields.aiApiKey.value = settings.aiApiKey || "";
   fields.aiSystemPrompt.value = settings.aiSystemPrompt || "";
   renderRunModeHint(settings.runMode || "debug");
