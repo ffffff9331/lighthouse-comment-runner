@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.85";
+  const SCRIPT_VERSION = "0.7.86";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -123,34 +123,38 @@
     }
 
     const operation = claimRoute ? {
-      key: JSON.stringify([message.runId, message.type, message.selectedTask || null])
+      key: JSON.stringify([message.runId, message.type, message.selectedTask || null]),
+      claimActionAttempted: false
     } : null;
     if (operation) claimOperation = operation;
-    const resultPromise = Promise.resolve().then(handler);
-    if (operation) {
-      operation.promise = resultPromise
-        .catch((error) => ({ ok: false, message: error.message || String(error) }))
-        .finally(() => { if (claimOperation === operation) claimOperation = null; });
-    }
-    resultPromise
-      .then((result) => {
-        if (isCurrentInstance()) sendResponse(result);
-      })
+    const resultPromise = Promise.resolve().then(handler)
+      .then((result) => operation ? { ...result, claimActionAttempted: operation.claimActionAttempted } : result)
       .catch((error) => {
-        if (!isCurrentInstance()) return;
         const messageText = error.message || String(error);
         const transient = Boolean(error.transient) || isTransientLoadError(messageText) || hasDetailRequestTimeout();
-        report(error.permanentIgnore ? "warn" : (transient ? "info" : "error"), messageText);
-        sendResponse({
+        const deferredRelease = Boolean(error.deferredRelease);
+        const safeDeferredRelease = deferredRelease && operation?.claimActionAttempted === false;
+        if (isCurrentInstance()) report(error.permanentIgnore ? "warn" : (transient || safeDeferredRelease ? "info" : "error"), messageText);
+        return {
           ok: false,
           message: messageText,
           transient,
+          deferredRelease,
           refreshRequested: Boolean(error.refreshRequested),
           permanentIgnore: Boolean(error.permanentIgnore),
           ignoredTaskType: error.ignoredTaskType || "",
+          ...(operation ? { claimActionAttempted: operation.claimActionAttempted } : {}),
           task: error.task || buildTask(message.settings)
-        });
+        };
       });
+    // Duplicates must receive the same structured receipt, including whether
+    // a claim action happened and when an unclaimed task may be rescanned.
+    if (operation) {
+      operation.promise = resultPromise.finally(() => { if (claimOperation === operation) claimOperation = null; });
+    }
+    (operation?.promise || resultPromise).then((result) => {
+      if (isCurrentInstance()) sendResponse(result);
+    });
     return true;
   });
 
@@ -169,18 +173,30 @@
 
   async function runCommentTask(settings, message = {}) {
     const openResult = await debugOpenFirstCommentTask(settings, message);
-    const lockResult = await debugLockSeatAndExtract(settings);
-    const task = {
-      ...(lockResult.task || {}),
-      taskType: openResult.task?.taskType || lockResult.task?.taskType || "评论",
-      taskKey: openResult.task?.taskKey || lockResult.task?.taskKey,
-      selectionId: openResult.task?.selectionId || lockResult.task?.selectionId,
-      stableTaskKey: openResult.task?.stableTaskKey || lockResult.task?.stableTaskKey,
-      bounty: openResult.task?.bounty || lockResult.task?.bounty,
-      handle: openResult.task?.handle || lockResult.task?.handle,
-      candidateTitle: openResult.task?.candidateTitle || lockResult.task?.candidateTitle
-    };
+    let lockResult;
+    try {
+      lockResult = await debugLockSeatAndExtract(settings);
+    } catch (error) {
+      // Detail text and its taskKey can change with the countdown. Preserve
+      // the selected list identity so deferred retries exclude the same card.
+      error.task = mergeSelectedTaskIdentity(openResult.task, error.task || buildTask(settings));
+      throw error;
+    }
+    const task = mergeSelectedTaskIdentity(openResult.task, lockResult.task);
     return { ok: true, message: "已提取评论任务并打开推文", task, openResult };
+  }
+
+  function mergeSelectedTaskIdentity(selectedTask = {}, detailTask = {}) {
+    return {
+      ...detailTask,
+      taskType: selectedTask?.taskType || detailTask?.taskType || "评论",
+      taskKey: selectedTask?.taskKey || detailTask?.taskKey,
+      selectionId: selectedTask?.selectionId || detailTask?.selectionId,
+      stableTaskKey: selectedTask?.stableTaskKey || detailTask?.stableTaskKey,
+      bounty: selectedTask?.bounty || detailTask?.bounty,
+      handle: selectedTask?.handle || detailTask?.handle,
+      candidateTitle: selectedTask?.candidateTitle || detailTask?.candidateTitle
+    };
   }
 
   async function debugOpenFirstCommentTask(settings, message = {}) {
@@ -520,7 +536,7 @@
         const candidateUrl = normalizeTweetUrl(hrefBeforeClick || taskBeforeClick.tweetUrl);
         lockButton.scrollIntoView({ block: "center", inline: "center" });
         await wait(Math.max(settings.actionDelayMs || 500, 500));
-        await clickElement(lockButton, { randomDelay: false });
+        await clickElement(lockButton, { randomDelay: false, claimAction: true });
         report("info", `已点击锁定席位按钮：${buttonText(lockButton)}，等待按钮状态变化`);
         await confirmLighthouseGuidanceBeforeClaim();
         await verifyLockClickAccepted(settings, lockButton);
@@ -604,6 +620,7 @@
     const remainingMs = Math.max(0, Number(releaseCountdown?.remainingMs || 0));
     const rescanInMs = Math.max(250, remainingMs - AUTO_DETAIL_PRELOAD_MS);
     const error = new Error(`详情页下一批放号仍需 ${formatDuration(remainingMs)}，返回广场并在剩余 1 分钟时重新扫描本任务`);
+    error.deferredRelease = true;
     error.task = {
       ...(task || {}),
       deferUntil: Date.now() + rescanInMs
@@ -1178,7 +1195,7 @@
   async function acceptInvitationIfPresent(settings = {}) {
     const invitationButton = findInvitationAcceptButton();
     if (!invitationButton) return false;
-    await clickElement(invitationButton, { randomDelay: false });
+    await clickElement(invitationButton, { randomDelay: false, claimAction: true });
     report("info", `检测到邀请接单，已点击：${buttonText(invitationButton)}`);
     await wait(Math.min(Math.max(Number(settings.actionDelayMs) || 150, 150), 500));
     return true;
@@ -1331,7 +1348,11 @@
       if (!detailNavigationStarted && clickCount < maxClickAttempts && isCampaignsListOpen() && Date.now() - lastClickAt >= getTaskEntryRetryWaitMs(settings)) {
         clickCount += 1;
         lastClickAt = Date.now();
-        await clickElement(target);
+        // A list entry can accept/claim directly. Match its complete label;
+        // a fallback card's prose can mention these words without claiming.
+        const entryLabels = [buttonText(target), target.getAttribute?.("aria-label")].map(normalize);
+        const claimAction = entryLabels.some((label) => INVITATION_ACCEPT_BUTTON_TEXTS.includes(label) || LOCK_BUTTON_TEXTS.includes(label));
+        await clickElement(target, { claimAction });
         report("info", `已点击任务入口，第 ${clickCount} 次，等待点击后复核`);
         await wait(250);
         continue;
@@ -1884,7 +1905,7 @@
     const maxAttempts = 3;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       if (!isVisible(lockButton) || isDisabled(lockButton)) return;
-      await clickElement(lockButton, { randomDelay: false });
+      await clickElement(lockButton, { randomDelay: false, claimAction: true });
       await confirmLighthouseGuidanceBeforeClaim();
       const started = Date.now();
       while (Date.now() - started < 250) {
@@ -1927,7 +1948,7 @@
   async function confirmLighthouseGuidanceBeforeClaim() {
     const riskNoticeButton = getLighthousePreClaimNoticeButton();
     if (riskNoticeButton) {
-      await clickElement(riskNoticeButton, { randomDelay: false });
+      await clickElement(riskNoticeButton, { randomDelay: false, claimAction: true });
       report("info", "检测到 Lighthouse 锁位前风险提醒，已确认继续锁定席位");
       await wait(150);
       return true;
@@ -1960,7 +1981,7 @@
         throw error;
       }
 
-      await clickElement(button, { randomDelay: false });
+      await clickElement(button, { randomDelay: false, claimAction: true });
       report("info", "检测到 Lighthouse 接单备注引导，已点击确认接单");
       await wait(150);
       return true;
@@ -2374,6 +2395,9 @@
     if (options.randomDelay !== false) {
       await randomClickDelay();
     }
+    // Mark before dispatch: a handler can perform the action and then throw.
+    // Invitation/confirmation buttons can claim an order just like a lock.
+    if (options.claimAction && claimOperation) claimOperation.claimActionAttempted = true;
     try {
       node.click();
       return;

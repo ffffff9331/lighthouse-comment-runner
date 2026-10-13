@@ -906,31 +906,38 @@ async function startNextAutoTask(reason) {
       await delay(settings.actionDelayMs * 2);
       return startNextAutoTask("retry_after_permanent_ignore");
     }
-    const transient = !!result?.transient;
+    const deferredRelease = result?.deferredRelease === true;
+    const transient = !!result?.transient && !deferredRelease;
     if (transient) {
       runtimeState.attempts += 1;
-    } else {
+    } else if (!deferredRelease) {
       runtimeState.failed += 1;
     }
     const failedTask = transient ? null : (result?.task || runtimeState.currentTask)
       ? { ...(runtimeState.currentTask || {}), ...(result?.task || {}) }
       : null;
     if (failedTask) {
+      // A late receipt can arrive after its rescan deadline. Keep it eligible
+      // almost immediately instead of applying normal failure deduplication.
+      const retryNow = Date.now();
+      if (deferredRelease && Number(failedTask.deferUntil) <= retryNow) {
+        failedTask.deferUntil = retryNow + 250;
+      }
       markAttemptedTask(failedTask);
     } else if (!transient) {
       runtimeState.attempts += 1;
     }
-    setStage("task_select_failed");
-    log(transient ? "info" : "warn", result?.message || result?.error || "任务选择失败，准备尝试下一条");
-    await closeLighthouseTaskDetail(tabId, settings, "任务选择失败后关闭详情面板");
-    const reloaded = await reloadLighthouseCampaignsAfterOrder(tabId, "接单失败，已重新加载任务广场");
+    setStage(deferredRelease ? "task_release_deferred" : "task_select_failed");
+    log(transient || deferredRelease ? "info" : "warn", result?.message || result?.error || "任务选择失败，准备尝试下一条");
+    await closeLighthouseTaskDetail(tabId, settings, deferredRelease ? "等待下一批放号，关闭详情继续扫描任务广场" : "任务选择失败后关闭详情面板");
+    const reloaded = await reloadLighthouseCampaignsAfterOrder(tabId, deferredRelease ? "已登记放号前重试时间，重新加载任务广场继续检测其他任务" : "接单失败，已重新加载任务广场");
     if (reloaded === false) {
       runtimeState.running = false;
       setStage("campaigns_reload_failed");
       return { ok: false, error: "接单失败后重新加载任务广场失败，已停止扫描", state: runtimeState };
     }
     await delay(settings.actionDelayMs * 2);
-    return startNextAutoTask("retry_after_task_select_failed");
+    return startNextAutoTask(deferredRelease ? "retry_after_deferred_release" : "retry_after_task_select_failed");
   }
 
   if (result.task) {
@@ -2662,12 +2669,17 @@ async function sendToTab(tabId, payload) {
       }
       if (claimIntent && runtimeState.uncertainAction === claimIntent) {
         const claimedTask = result?.task?.seatLocked || result?.task?.claimed || result?.task?.seatLockedAt;
+        // New receipts explicitly distinguish rejection before any claim
+        // action. Older content scripts retain their narrower retry rules.
+        const safelyUnclaimed = result?.ok === false && result.claimActionAttempted !== true
+          && (result.claimActionAttempted === false || result.transient || result.permanentIgnore || result.refreshRequested || (result.claimed === false && result.clicks === 0));
         if (claimedTask || result?.claimed === true) {
           runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, result.task || payload.task,
             result.claimed === true ? { claimed: true, seatLocked: true } : {});
-        } else if (!(result?.ok === false && (result.transient || result.permanentIgnore || result.refreshRequested || (result.claimed === false && result.clicks === 0)))) {
+        } else if (!safelyUnclaimed) {
           runtimeState.running = false;
           setStage("action_result_unknown");
+          log("error", `接单动作 ${payload.type} 未确认订单状态，已停止并保留执行意图；不会自动重试，请先核对本单${result?.message ? `。页面回执：${result.message}` : ""}`);
           return { ok: false, uncertain: true, message: "接单回执未确认订单状态，已保留执行意图，请先核对本单" };
         }
         delete runtimeState.uncertainAction;

@@ -57,7 +57,10 @@
 node tests/behavior-check.mjs
 node tests/review-check.mjs
 node tests/regression-check.mjs
+node --test tests/*.test.cjs
 ```
+
+其中 `claim-recovery.test.cjs` 覆盖放号延期、继续扫描和已点击接单后的未知结果保护；`monitor-cards.test.cjs` 覆盖任务卡识别与重复项合并。测试使用离线模拟，不会实际接单或发布评论。
 
 也可以检查全部 JavaScript 语法：
 

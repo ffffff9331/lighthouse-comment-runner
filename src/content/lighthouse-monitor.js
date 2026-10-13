@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseHighBountyMonitor__";
-  const SCRIPT_VERSION = "0.7.85";
+  const SCRIPT_VERSION = "0.7.86";
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) return;
   if (existingSingleton?.stop) existingSingleton.stop();
@@ -46,6 +46,8 @@
   let lastSyncAt = 0;
   let lastForcedSyncAt = 0;
   let extensionContextRetired = false;
+  const taskCardIdentities = new WeakMap();
+  let nextTaskCardIdentity = 0;
 
   function isExtensionContextInvalidated(error) {
     return /Extension context invalidated|context invalidated/i.test(String(error?.message || error || ""));
@@ -204,18 +206,20 @@
     return best;
   }
 
-  function isLikelySingleTaskCard(node) {
+  function isLikelySingleTaskCard(node, { allowUnknownType = false, minHeight = 140, allowSingleColumn = false } = {}) {
     if (!isVisible(node)) return false;
 
     const text = normalize(node.innerText || "");
     if (!text.includes("预计获得") || !/\bLUX\b/i.test(text)) return false;
-    if (!detectTaskType(node)) return false;
+    if (!allowUnknownType && !detectTaskType(node)) return false;
     if (!ACTION_MARKERS.some((marker) => text.includes(marker))) return false;
     if (countMatches(text, "预计获得") !== 1) return false;
 
     const rect = node.getBoundingClientRect();
-    if (rect.width < 160 || rect.height < 140) return false;
-    if (rect.width > Math.min(window.innerWidth * 0.55, 680)) return false;
+    if (rect.width < 160 || rect.height < minHeight) return false;
+    const explicitCardBoundary = node.tagName === "BUTTON" || node.getAttribute?.("role") === "button";
+    const maxWidthRatio = allowSingleColumn && explicitCardBoundary ? 0.98 : 0.55;
+    if (rect.width > Math.min(window.innerWidth * maxWidthRatio, 680)) return false;
     if (rect.height > Math.min(window.innerHeight * 0.75, 620)) return false;
 
     return true;
@@ -255,6 +259,7 @@
       handle,
       tweetUrl,
       taskKey,
+      taskIdentity: getTaskCardIdentity(card),
       selectionId,
       text: text.slice(0, 300),
       sourceConfidence
@@ -283,8 +288,9 @@
   function findFallbackCard(node) {
     let current = node;
     for (let depth = 0; current && depth < 7; depth += 1) {
-      const text = normalize(current.innerText || "");
-      if (text.includes("预计获得") && /\bLUX\b/i.test(text)) return current;
+      // Keep compact/unknown task variants, but never promote a plaza tab's
+      // multi-card ancestor into a task just because it contains a reward.
+      if (isLikelySingleTaskCard(current, { allowUnknownType: true, minHeight: 100, allowSingleColumn: true })) return current;
       current = current.parentElement;
     }
     return null;
@@ -313,6 +319,7 @@
       handle,
       tweetUrl,
       taskKey: `${taskType}|${bounty}|${title}|${text.slice(0, 120)}`,
+      taskIdentity: getTaskCardIdentity(card),
       selectionId,
       text: text.slice(0, 300),
       sourceConfidence: 55
@@ -553,15 +560,61 @@
   }
 
   function dedupeTasks(tasks) {
-    const seen = new Set();
+    const indices = new Map();
     const result = [];
     for (const task of tasks) {
-      const key = `${task.taskType}|${task.bounty}|${task.title}|${task.countdownSec}|${task.isBlocked}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      result.push(task);
+      // Status and countdown change; neither is an order's identity. DOM
+      // identity also keeps different tasks by the same author separate.
+      const key = task.taskIdentity;
+      if (!key || !indices.has(key)) {
+        if (key) indices.set(key, result.length);
+        result.push(task);
+        continue;
+      }
+      const index = indices.get(key);
+      const previous = result[index];
+      const confidence = Number(task.sourceConfidence || 0) - Number(previous.sourceConfidence || 0);
+      if (confidence > 0 || (confidence === 0 && taskStatusConfidence(task) > taskStatusConfidence(previous))) {
+        result[index] = task;
+      }
     }
     return result;
+  }
+
+  function getTaskCardIdentity(card) {
+    // Primary and fallback can select different wrappers around the same
+    // compact card. The sole reward label is shared by both wrappers.
+    const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        return normalize(node.nodeValue).includes("预计获得") ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+      }
+    });
+    const identityNode = walker.nextNode() ? walker.currentNode.parentElement || card : card;
+    if (taskCardIdentities.has(identityNode)) return taskCardIdentities.get(identityNode);
+    const links = [card, ...Array.from(card.querySelectorAll?.("a[href]") || [])];
+    const campaignIds = new Set();
+    for (const node of links) {
+      const href = node.getAttribute?.("href") || node.href;
+      if (!href) continue;
+      try {
+        const url = new URL(href, location.href);
+        if (url.origin !== location.origin || url.searchParams.get("view") === "bonus") continue;
+        const match = url.pathname.match(/^\/campaigns\/([^/]+)\/?$/);
+        if (match) campaignIds.add(match[1]);
+      } catch (_) {}
+    }
+    const identity = campaignIds.size === 1 ? `campaign:${[...campaignIds][0]}` : `card:${++nextTaskCardIdentity}`;
+    taskCardIdentities.set(identityNode, identity);
+    return identity;
+  }
+
+  function taskStatusConfidence(task) {
+    // Equal-quality copies can disagree while the SPA updates. Prefer an
+    // explicit restriction/countdown over advertising an uncertain opening.
+    if (task.isBlocked) return 3;
+    if (task.isCooling) return 2;
+    if (task.isReady) return 1;
+    return 0;
   }
 
   function sortTasksForDisplay(a, b) {
