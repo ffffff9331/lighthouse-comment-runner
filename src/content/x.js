@@ -1,7 +1,7 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerXSingleton__";
   const RUN_LOCK_KEY = "__lighthouseCommentTaskRunnerXRunLock__";
-  const SCRIPT_VERSION = "0.7.88";
+  const SCRIPT_VERSION = "0.7.90";
   const INSTANCE_ID = `x-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const RESERVED_X_HANDLE_SLUGS = new Set(["home", "explore", "notifications", "messages", "jobs", "i", "settings"]);
   const existingSingleton = globalThis[SINGLETON_KEY];
@@ -31,12 +31,22 @@
   let taskWidgetAssistDisabled = false;
   let lastTaskWidgetKey = "";
   let cachedTaskWidgetControls = null;
+  let automationPaused = false;
+  let automationPauseEpoch = 0;
+  let automationPauseReady = null;
+  let automationPauseLoaded = false;
   const TASK_WIDGET_CONTROL_SELECTOR = "button,a,[role='button'],[aria-label],[title],[tabindex]";
   const TASK_WIDGET_CLICKABLE_SELECTOR = "button,a,[role='button'],[tabindex]";
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (globalThis[SINGLETON_KEY]?.instanceId !== INSTANCE_ID) return false;
+    if (message.type === "AUTOMATION_PAUSE_CHANGED") {
+      applyAutomationPause(message.paused);
+      sendResponse({ ok: true, paused: automationPaused });
+      return true;
+    }
     if (message.type === "CANCEL_X_RUN") {
+      if (message.paused === true) applyAutomationPause(true);
       if (message.runId) cancelledRunIds.add(message.runId);
       if (!message.runId || message.runId === activeRunId) activeRunId = `cancelled-${Date.now()}`;
       sendResponse({ ok: true });
@@ -55,6 +65,8 @@
   });
 
   function executeXStep(message, action) {
+    if (automationPauseReady && !automationPauseLoaded) return automationPauseReady.then(() => executeXStep(message, action));
+    if (automationPaused) return Promise.resolve({ ok: false, cancelled: true, message: "运行已停止，页面自动操作已暂停" });
     const target = normalizeTweetUrl(message.task?.tweetUrl || "");
     if (!message.runId || message.platform !== "lighthouse" || !target || target !== normalizeTweetUrl(location.href)) {
       return Promise.resolve({ ok: false, message: "拒绝执行：平台或当前任务推文不匹配" });
@@ -81,6 +93,7 @@
     })
       .catch((error) => ({ ok: false, message: error.message || String(error) }))
       .finally(() => {
+        if (activeStepKey !== key) return;
         activeStepKey = "";
         activeStepName = "";
         activeStepStartedAt = 0;
@@ -92,6 +105,29 @@
   }
 
   startTaskWidgetAssist();
+
+  function applyAutomationPause(paused) {
+    automationPauseEpoch += 1;
+    automationPauseLoaded = true;
+    automationPaused = Boolean(paused);
+    globalThis[SINGLETON_KEY].paused = automationPaused;
+    if (!automationPaused) {
+      taskWidgetAssistDisabled = false;
+      startTaskWidgetAssist();
+      return;
+    }
+    if (activeRunId) cancelledRunIds.add(activeRunId);
+    activeRunId = "";
+    activeStepKey = "";
+    activeStepName = "";
+    activeStepStartedAt = 0;
+    activeTargetUrl = "";
+    stepResults.clear();
+    cachedTaskWidgetControls = null;
+    lastTaskWidgetKey = "";
+    if (globalThis[RUN_LOCK_KEY]?.instanceId === INSTANCE_ID) globalThis[RUN_LOCK_KEY].active = false;
+    disableTaskWidgetAssist();
+  }
 
   async function runReply(task, settings) {
     const runId = activeRunId;
@@ -299,6 +335,7 @@
   }
 
   function confirmTaskActions(actions, runId, note = "") {
+    assertActiveRun(runId);
     if (actions.unsupported.length) throw new Error(`当前任务包含尚未支持的动作：${actions.unsupported.join("、")}，未执行点赞或评论`);
     const summary = actions.steps.map((step) => `${step.label}（${step.status}）`).join("、");
     try {
@@ -319,6 +356,16 @@
   }
 
   function startTaskWidgetAssist() {
+    if (!automationPauseReady) {
+      const epoch = automationPauseEpoch;
+      automationPaused = true;
+      automationPauseReady = Promise.resolve().then(() => chrome.runtime.sendMessage({ type: "GET_CONTENT_SETTINGS" }))
+        .then((status) => {
+          if (epoch === automationPauseEpoch && status?.ok) applyAutomationPause(status.paused === true);
+        }).catch(() => {}).finally(() => { automationPauseLoaded = true; });
+      return;
+    }
+    if (automationPaused) return;
     if (taskWidgetAssistDisabled || taskWidgetObserver || !normalizeTweetUrl(location.href)) return;
     taskWidgetObserver = new MutationObserver(scheduleTaskWidgetScan);
     taskWidgetObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
@@ -326,13 +373,13 @@
   }
 
   function scheduleTaskWidgetScan() {
-    if (taskWidgetAssistDisabled) return;
+    if (automationPaused || taskWidgetAssistDisabled) return;
     if (taskWidgetDebounceTimer) clearTimeout(taskWidgetDebounceTimer);
     taskWidgetDebounceTimer = setTimeout(scanTaskWidget, 900);
   }
 
   function scanTaskWidget() {
-    if (taskWidgetAssistDisabled) return;
+    if (automationPaused || taskWidgetAssistDisabled) return;
     if (!normalizeTweetUrl(location.href)) return;
     const widget = findLighthouseTaskWidget();
     if (!widget) return;
@@ -348,6 +395,7 @@
   }
 
   function sendTaskWidgetHint(state, tweetUrl) {
+    if (taskWidgetAssistDisabled) return false;
     try {
       chrome.runtime.sendMessage({ type: "X_TASK_WIDGET_HINT", state, tweetUrl }).catch?.((error) => {
         if (isExtensionContextInvalidatedError(error)) disableTaskWidgetAssist();
@@ -840,9 +888,11 @@
       let verifyButton = findDocumentVerifyActionButton();
       if (!verifyButton) {
         const widget = await revealTaskWidgetArea(settings);
+        assertActiveRun(runId);
         verifyButton = findVerifyActionButton(widget);
       }
       if (verifyButton) {
+        assertActiveRun(runId);
         submitText = getNodeActionText(verifyButton);
         const widgetBeforeClick = findLighthouseTaskWidget();
         const textBeforeClick = normalizeText(widgetBeforeClick?.innerText || "");
@@ -1494,14 +1544,19 @@
   }
 
   async function fillReplyText(text, settings) {
+    const runId = activeRunId;
+    assertActiveRun(runId);
     const textbox = await findReplyBox({ timeoutMs: 12000 });
+    assertActiveRun(runId);
     if (!(await activateReplyInput(textbox))) {
       throw new Error("回复框激活失败");
     }
 
     await wait(settings.actionDelayMs / 2);
+    assertActiveRun(runId);
     await clearReplyBoxIfNeeded(textbox);
     await wait(300);
+    assertActiveRun(runId);
     await pasteTextLikeUser(text, textbox);
 
     const stable = await waitForReplyBoxContentStable(text, 15000, 2000);
@@ -1568,7 +1623,7 @@
         return null;
       }, timeoutMs, "未找到回复框");
     } catch (error) {
-      if (soft) return null;
+      if (soft && !automationPaused && !/已取消|已暂停/.test(error?.message || "")) return null;
       throw error;
     }
   }
@@ -2288,9 +2343,12 @@
   }
 
   async function clickElement(node, options = {}) {
+    const runId = activeRunId;
+    assertActiveRun(runId);
     if (options.randomDelay !== false) {
       await randomClickDelay();
     }
+    assertActiveRun(runId);
     try {
       node.scrollIntoView({ block: "center", inline: "center" });
     } catch (_) {}
@@ -2340,6 +2398,7 @@
   }
 
   function assertActiveRun(runId) {
+    if (globalThis.__lighthouseCommentTaskRunnerXSingleton__?.paused) throw new Error("运行已停止，页面自动操作已暂停");
     const currentTarget = normalizeTweetUrl(location.href);
     if (activeTargetUrl && currentTarget !== activeTargetUrl && !isExpectedReplyComposeTransition()) {
       throw new Error("目标推文已变化，取消本单操作");

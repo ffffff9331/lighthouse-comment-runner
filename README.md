@@ -11,7 +11,10 @@
 - 通过 Lighthouse 官方完成状态和任务广场收入变化进行完成核验。
 - 任务完成后自动返回任务广场，异常时保留已接订单，避免串单。
 - 侧边栏提供运行控制、倒计时面板、详细日志、回复记录和配置管理。
-- 停止后保留订单和历史日志；后台重新唤醒时静默读取停止状态，仅真正中断的运行记录恢复提示。
+- 停止会取消当前流程，清空本轮订单状态、倒计时、统计和运行日志，仅保留一条停止记录；设置与回复历史保留，后台唤醒后保持停止。
+- 任务广场连续等待 5 分钟仍无可执行任务时，先确认未尝试接单，再刷新并继续检测；已点击接单或结果未知的动作保留核对，不自动重发。
+- 单步按钮从所选步骤继续执行后续流程。接管前核对旧流程的取消回执，停止按钮取消整条步骤队列；保存设置失败后可重试，不会锁死按钮。
+- 广场已加载但没有可执行评论任务时正常等待新任务，不再把只有原创任务或空列表误判为页面一直加载。
 
 ## 安装
 
@@ -61,7 +64,7 @@ node tests/regression-check.mjs
 node --test tests/*.test.cjs
 ```
 
-其中 `claim-recovery.test.cjs` 覆盖放号延期、继续扫描和已点击接单后的未知结果保护；`monitor-cards.test.cjs` 覆盖任务卡识别与重复项合并。`composite-task-types.test.cjs` 和 `composite-x-actions.test.cjs` 覆盖评论＋点赞的类型保留、任务面板延迟加载、动作执行与失败保护。`stopped-state-restore.test.cjs` 覆盖停止后后台多次唤醒不重复记录日志、订单保留和中断恢复。测试使用离线模拟，不会实际接单或发布评论。
+其中 `claim-recovery.test.cjs` 覆盖放号延期、继续扫描和已点击接单后的未知结果保护；`monitor-cards.test.cjs` 覆盖任务卡识别与重复项合并。`composite-task-types.test.cjs` 和 `composite-x-actions.test.cjs` 覆盖评论＋点赞的类型保留、任务面板延迟加载、动作执行与失败保护。`stopped-state-restore.test.cjs` 覆盖旧版已停止快照的订单和日志兼容读取、中断恢复，以及停止后重启不自动运行；`manual-stop-reset.test.cjs` 覆盖新版停止清理与设置、回复历史保留。`idle-refresh-recovery.test.cjs` 覆盖五分钟冷却等待后的安全刷新续扫，以及刷新、停止和延迟回执并发时的保护。`manual-takeover.test.cjs`、`manual-step-stop.test.cjs` 和 `step-queue.test.cjs` 覆盖单步接管、停止后取消后续步骤、迟到回执和异常后重试；`campaigns-readiness.test.cjs` 覆盖空广场、只有原创任务和未加载页面的区分。测试使用离线模拟，不会实际接单或发布评论。
 
 也可以检查全部 JavaScript 语法：
 

@@ -42,7 +42,7 @@ assert.match(background, /function getTaskMergeIdentity/);
 assert.match(background, /tweetUrl: overrideUrl \|\| nextUrl \|\| \(sameTask \? currentUrl : ""\)/);
 assert.match(background, /let capturedTargetRecoveryPromise = null/);
 assert.match(background, /let directTweetOpenPromise = null/);
-assert.match(waitFunction, /getBoundMatchingTaskXTab\(currentExpectedUrl\)/);
+assert.match(waitFunction, /getBoundMatchingTaskXTab\(currentExpectedUrl, isCurrent\)/);
 assert.match(background, /locked_task_target_unavailable/);
 assert.match(background, /locked_task_recovery_blocked/);
 assert.match(background, /lockFailed: true/);

@@ -1,4 +1,7 @@
 (() => {
+  // The background enables this only for an explicitly started run. A fresh
+  // page must keep native dialogs until that permission reaches MAIN world.
+  if (window.__lighthouseAutomationPaused__ !== false) window.__lighthouseAutomationPaused__ = true;
   const BRIDGE_KEY = "__lighthouseUnverifiedLinkAlertBridge__";
   if (window[BRIDGE_KEY]) return;
   window[BRIDGE_KEY] = true;
@@ -9,6 +12,7 @@
   }
 
   function publishTargetTweetUrl(url) {
+    if (window.__lighthouseAutomationPaused__ !== false) return;
     const tweetUrl = normalizeTweetUrl(url);
     if (!tweetUrl) return;
     window.dispatchEvent(new CustomEvent("lighthouse-target-tweet-url", {
@@ -23,6 +27,7 @@
   // conscious decision — this bridge exists to skip a warning on purpose.
   const nativeAlert = window.alert.bind(window);
   window.alert = (message) => {
+    if (window.__lighthouseAutomationPaused__ !== false) return nativeAlert(message);
     const text = String(message || "");
     if (/此推文含有未经验证的链接[\s\S]*KOL\s*接单时仔细分辨/.test(text)) {
       window.dispatchEvent(new CustomEvent("lighthouse-unverified-link-alert-dismissed"));

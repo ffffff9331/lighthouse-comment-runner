@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseHighBountyMonitor__";
-  const SCRIPT_VERSION = "0.7.88";
+  const SCRIPT_VERSION = "0.7.90";
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) return;
   if (existingSingleton?.stop) existingSingleton.stop();
@@ -46,8 +46,28 @@
   let lastSyncAt = 0;
   let lastForcedSyncAt = 0;
   let extensionContextRetired = false;
-  const taskCardIdentities = new WeakMap();
+  let automationPaused = true;
+  let automationPauseEpoch = 0;
+  const pendingWaits = new Map();
+  let taskCardIdentities = new WeakMap();
   let nextTaskCardIdentity = 0;
+
+  function applyAutomationPause(paused) {
+    automationPauseEpoch += 1;
+    automationPaused = Boolean(paused);
+    if (!automationPaused) {
+      if (settings.enabled) start();
+      return;
+    }
+    stop();
+    seenTasks.clear();
+    saveSeen();
+    lastCountdownData = [];
+    lastSyncAt = 0;
+    lastForcedSyncAt = 0;
+    taskCardIdentities = new WeakMap();
+    nextTaskCardIdentity = 0;
+  }
 
   function isExtensionContextInvalidated(error) {
     return /Extension context invalidated|context invalidated/i.test(String(error?.message || error || ""));
@@ -62,7 +82,7 @@
   }
 
   function sendRuntimeMessage(message, warningLabel = "同步失败") {
-    if (extensionContextRetired) return;
+    if (extensionContextRetired || automationPaused) return;
     try {
       const request = chrome.runtime.sendMessage(message);
       if (request?.catch) {
@@ -108,6 +128,7 @@
   }
 
   async function loadPersistentSettings() {
+    const epoch = automationPauseEpoch;
     const legacy = loadLegacySettings();
     try {
       const response = await chrome.runtime.sendMessage({
@@ -117,6 +138,8 @@
       if (response?.ok) {
         settings = normalizeMonitorSettings(response);
       }
+      const pauseStatus = legacy ? await chrome.runtime.sendMessage({ type: "MONITOR_GET_STATUS" }) : response;
+      if (epoch === automationPauseEpoch && pauseStatus?.ok) applyAutomationPause(pauseStatus.paused === true);
       if (legacy) {
         try {
           localStorage.removeItem(LEGACY_SETTINGS_KEY);
@@ -637,7 +660,7 @@
   }
 
   function syncCountdowns(options = {}) {
-    if (extensionContextRetired) return;
+    if (extensionContextRetired || automationPaused) return;
     const force = Boolean(options.force);
     if (!settings.enabled && !force) return;
 
@@ -660,6 +683,8 @@
   }
 
   async function collectCountdownSnapshot(options = {}) {
+    if (automationPaused) return { ok: true, paused: true, tasks: [], timestamp: 0 };
+    const epoch = automationPauseEpoch;
     const force = Boolean(options.force);
     const allowRetry = Boolean(options.allowRetry);
     if (force) {
@@ -671,6 +696,7 @@
 
     for (let attempt = 1; attempt <= SNAPSHOT_MAX_ATTEMPTS; attempt += 1) {
       await wait(SNAPSHOT_RETRY_MS);
+      if (automationPaused || epoch !== automationPauseEpoch) return { ok: true, paused: true, tasks: [], timestamp: 0 };
       syncCountdowns({ force: true });
       if (lastCountdownData.length > 0) break;
     }
@@ -679,6 +705,7 @@
   }
 
   function scanForHighBounty() {
+    if (automationPaused) return;
     if (extensionContextRetired) return;
     if (!settings.enabled) return;
 
@@ -783,6 +810,7 @@
   }
 
   function enqueueSpeech(text) {
+    if (automationPaused) return;
     if (speechQueue.length >= 3) {
       speechQueue = speechQueue.slice(-2);
     }
@@ -791,9 +819,10 @@
   }
 
   function processSpeechQueue() {
-    if (isSpeaking || speechQueue.length === 0) return;
+    if (automationPaused || isSpeaking || speechQueue.length === 0) return;
     isSpeaking = true;
     const text = speechQueue.shift();
+    const epoch = automationPauseEpoch;
 
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = "zh-CN";
@@ -805,10 +834,12 @@
     if (chosen) utterance.voice = chosen;
 
     utterance.onend = () => {
+      if (epoch !== automationPauseEpoch) return;
       isSpeaking = false;
       processSpeechQueue();
     };
     utterance.onerror = () => {
+      if (epoch !== automationPauseEpoch) return;
       isSpeaking = false;
       processSpeechQueue();
     };
@@ -859,10 +890,15 @@
   }
 
   function wait(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    if (automationPaused) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => { pendingWaits.delete(timer); resolve(); }, ms);
+      pendingWaits.set(timer, resolve);
+    });
   }
 
   function onDomChange() {
+    if (automationPaused) return;
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       scanForHighBounty();
@@ -894,7 +930,7 @@
   }
 
   function start() {
-    if (extensionContextRetired || observer) return;
+    if (extensionContextRetired || automationPaused || !settings.enabled || observer) return;
     observer = new MutationObserver(onDomChange);
     observer.observe(document.body, { childList: true, subtree: true });
     scanForHighBounty();
@@ -909,6 +945,11 @@
   });
 
   function stop() {
+    speechQueue = [];
+    isSpeaking = false;
+    try { speechSynthesis.cancel(); } catch (_) {}
+    for (const [timer, resolve] of pendingWaits) { clearTimeout(timer); resolve(); }
+    pendingWaits.clear();
     if (observer) {
       observer.disconnect();
       observer = null;
@@ -936,8 +977,13 @@
   };
 
   chrome.runtime?.onMessage?.addListener?.((msg, _sender, sendResponse) => {
+    if (msg.type === "AUTOMATION_PAUSE_CHANGED" || (msg.type === "CANCEL_LIGHTHOUSE_RUN" && msg.paused === true)) {
+      applyAutomationPause(msg.type === "CANCEL_LIGHTHOUSE_RUN" ? true : msg.paused);
+      sendResponse({ ok: true, paused: automationPaused });
+      return true;
+    }
     if (msg.type === "MONITOR_GET_STATUS") {
-      sendResponse({ ok: true, enabled: settings.enabled, minBounty: settings.minBounty, voiceEnabled: settings.voiceEnabled, voiceName: settings.voiceName, seenCount: seenTasks.size });
+      sendResponse({ ok: true, paused: automationPaused, enabled: settings.enabled, minBounty: settings.minBounty, voiceEnabled: settings.voiceEnabled, voiceName: settings.voiceName, seenCount: seenTasks.size });
       return;
     }
     if (msg.type === "MONITOR_APPLY_SETTINGS") {

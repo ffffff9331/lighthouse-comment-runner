@@ -728,6 +728,7 @@ if (platform === "lighthouse") {
     let clearCount = 0;
     let keepaliveClearCount = 0;
     const context = contextFor(background, ["prepareDebugRunForCommand"], {
+      manualDebugCommandEpoch: 0,
       runtimeState: {
         running: true,
         mode: "auto",
@@ -749,7 +750,9 @@ if (platform === "lighthouse") {
       setStage(stage) { context.runtimeState.stage = stage; },
       log() {}
     });
-    await context.prepareDebugRunForCommand(7, "DEBUG_RUN_X_REPLY");
+    const prepared = await context.prepareDebugRunForCommand(7, "DEBUG_RUN_X_REPLY");
+    assert.equal(prepared.ok, true);
+    assert.equal(prepared.runId, "debug-run");
     assert.equal(cancelCount, 1);
     assert.equal(clearCount, 1);
     assert.equal(keepaliveClearCount, 1);
@@ -785,6 +788,7 @@ if (platform === "lighthouse") {
     let releaseFirst;
     const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
     const context = contextFor(background, ["enqueueManualDebugCommand"], {
+      manualDebugCommandEpoch: 0,
       manualDebugCommandTail: Promise.resolve(),
       async runManualDebugCommand(message) {
         active += 1;
@@ -817,6 +821,7 @@ if (platform === "lighthouse") {
     }));
     const context = contextFor(debugPanel, ["runStepQueue"], {
       commandQueueRunning: false,
+      activeStepQueue: null,
       stepButtons: buttons,
       async saveSettings() {},
       setStepButtonsDisabled() {},
@@ -841,6 +846,7 @@ if (platform === "lighthouse") {
     }));
     const context = contextFor(debugPanel, ["runStepQueue"], {
       commandQueueRunning: false,
+      activeStepQueue: null,
       stepButtons: buttons,
       async saveSettings() {},
       setStepButtonsDisabled() {},
@@ -864,6 +870,7 @@ if (platform === "lighthouse") {
     }));
     const context = contextFor(debugPanel, ["runStepQueue"], {
       commandQueueRunning: false,
+      activeStepQueue: null,
       stepButtons: buttons,
       async saveSettings() {},
       setStepButtonsDisabled() {},
@@ -922,6 +929,7 @@ await test("concurrent platform claim messages share one claim operation", async
     ? page.indexOf("  function isCurrentInstance(")
     : page.indexOf("  async function selectAndClaim(");
   vm.runInContext(`${page.slice(0, end)}
+    ${platform === "lighthouse" ? declaration(page, "assertActiveRun") : ""}
     function runCommentTask() { return action(); }
     function selectAndClaim() { return action(); }
   })();`, context);

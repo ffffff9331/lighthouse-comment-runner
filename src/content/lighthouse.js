@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.88";
+  const SCRIPT_VERSION = "0.7.90";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -52,14 +52,44 @@
   const COOLDOWN_MARKERS = ["冷却中", "冷却", "等待", "后可"];
   const AUTO_DETAIL_PRELOAD_MS = 60000;
   const AUTO_DETAIL_MAX_RELEASE_WAIT_MS = 60000;
+  const CAMPAIGNS_IDLE_REFRESH_MS = 5 * 60 * 1000;
   const STALE_READY_REFRESH_THRESHOLD = 3;
   const STALE_READY_REFRESH_HITS = 2;
   let activeRunId = "";
   const cancelledRunIds = new Set();
   let claimOperation = null;
+  const settledClaimOperations = new Map();
   let completionContext = null;
   let lastOriginalSkipReportAt = 0;
   let lastReportedMinTaskBounty = null;
+  let automationPaused = false;
+  let automationPauseEpoch = 0;
+  let automationPauseReady = null;
+
+  function applyAutomationPause(paused) {
+    automationPauseEpoch += 1;
+    automationPaused = Boolean(paused);
+    globalThis[SINGLETON_KEY].paused = automationPaused;
+    if (!automationPaused) return;
+    if (activeRunId) cancelledRunIds.add(activeRunId);
+    if (claimOperation?.runId) cancelledRunIds.add(claimOperation.runId);
+    // Explicit STOP abandons this local slot. The old operation retains its
+    // cancelled run identity, and its finally only releases its own slot.
+    claimOperation = null;
+    activeRunId = "";
+    completionContext = null;
+    settledClaimOperations.clear();
+    lastOriginalSkipReportAt = 0;
+    lastReportedMinTaskBounty = null;
+  }
+
+  async function loadAutomationPause() {
+    const epoch = automationPauseEpoch;
+    try {
+      const status = await chrome.runtime.sendMessage({ type: "GET_CONTENT_SETTINGS" });
+      if (epoch === automationPauseEpoch && status?.ok) applyAutomationPause(status.paused === true);
+    } catch (_) {}
+  }
 
   window.addEventListener("lighthouse-unverified-link-alert-dismissed", () => {
     report("info", "已自动确认未验证链接提示，继续执行任务");
@@ -77,6 +107,22 @@
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!isCurrentInstance()) return false;
+    if (message.type === "AUTOMATION_PAUSE_CHANGED") {
+      applyAutomationPause(message.paused);
+      sendResponse({ ok: true, paused: automationPaused });
+      return true;
+    }
+    if (message.type === "CANCEL_LIGHTHOUSE_RUN") {
+      if (message.paused === true) applyAutomationPause(true);
+      // Mark the run cancelled before yielding, then wait only for its own
+      // operation's terminal receipt. An acknowledgement alone proves nothing.
+      cancelRun(message).then((result) => { if (isCurrentInstance()) sendResponse(result); });
+      return true;
+    }
+    if (automationPaused) {
+      sendResponse({ ok: false, cancelled: true, paused: true });
+      return true;
+    }
 
     const routes = {
       CANCEL_LIGHTHOUSE_RUN: () => cancelRun(message),
@@ -124,12 +170,41 @@
 
     const operation = claimRoute ? {
       key: JSON.stringify([message.runId, message.type, message.selectedTask || null]),
+      runId: message.runId,
+      type: message.type,
+      claimIntentId: message.claimIntentId || "",
       claimActionAttempted: false
     } : null;
     if (operation) claimOperation = operation;
-    const resultPromise = Promise.resolve().then(handler)
-      .then((result) => operation ? { ...result, claimActionAttempted: operation.claimActionAttempted } : result)
+    const resultPromise = Promise.resolve().then(async () => {
+      if (automationPauseReady) await automationPauseReady;
+      assertActiveRun(message.runId || activeRunId);
+      if (operation) assertActiveRun(operation.runId);
+      return handler();
+    })
+      .then((result) => {
+        if (automationPaused || (message.runId && message.runId !== activeRunId)) {
+          return { ok: false, cancelled: true, ...(operation ? { claimActionAttempted: operation.claimActionAttempted } : {}) };
+        }
+        if (!operation) return result;
+        const { detailConfirmed, ...receipt } = result || {};
+        if (detailConfirmed === true && receipt.ok === true && receipt.task?.taskKey
+            && ["DEBUG_OPEN_FIRST_COMMENT_TASK", "OPEN_SELECTED_COUNTDOWN_TASK_DETAIL", "OPEN_SELECTED_COUNTDOWN_TASK_TWEET"].includes(operation.type)) {
+          // This confirms the requested detail transition, not a locked seat.
+          // Bind it here so a handler cannot reuse another operation's receipt.
+          receipt.detailConfirmation = {
+            runId: operation.runId,
+            type: operation.type,
+            claimIntentId: operation.claimIntentId,
+            taskKey: receipt.task.taskKey,
+            phase: "detail_ready",
+            invitationResolved: true
+          };
+        }
+        return { ...receipt, claimActionAttempted: operation.claimActionAttempted };
+      })
       .catch((error) => {
+        if (automationPaused || (message.runId && message.runId !== activeRunId)) return { ok: false, cancelled: true, ...(operation ? { claimActionAttempted: operation.claimActionAttempted } : {}) };
         const messageText = error.message || String(error);
         const transient = Boolean(error.transient) || isTransientLoadError(messageText) || hasDetailRequestTimeout();
         const deferredRelease = Boolean(error.deferredRelease);
@@ -150,7 +225,14 @@
     // Duplicates must receive the same structured receipt, including whether
     // a claim action happened and when an unclaimed task may be rescanned.
     if (operation) {
-      operation.promise = resultPromise.finally(() => { if (claimOperation === operation) claimOperation = null; });
+      operation.promise = resultPromise.then((result) => {
+        operation.result = result;
+        operation.settled = true;
+        const proofKey = JSON.stringify([operation.runId, operation.type, operation.claimIntentId]);
+        if (!automationPaused && !cancelledRunIds.has(operation.runId)) settledClaimOperations.set(proofKey, operation);
+        if (settledClaimOperations.size > 40) settledClaimOperations.delete(settledClaimOperations.keys().next().value);
+        return result;
+      }).finally(() => { if (claimOperation === operation) claimOperation = null; });
     }
     (operation?.promise || resultPromise).then((result) => {
       if (isCurrentInstance()) sendResponse(result);
@@ -163,16 +245,44 @@
     return Boolean(singleton?.active && singleton.version === SCRIPT_VERSION && singleton.instanceId === INSTANCE_ID);
   }
 
-  function cancelRun(message) {
+  async function cancelRun(message) {
     if (message.runId) cancelledRunIds.add(message.runId);
     if (!message.runId || !activeRunId || message.runId === activeRunId) {
       activeRunId = `cancelled-${Date.now()}`;
     }
-    return { ok: true };
+    const matches = (operation) => operation && operation.runId === message.runId
+      && operation.type === message.expectedOperationType
+      && operation.claimIntentId === (message.claimIntentId || "");
+    const proofKey = JSON.stringify([message.runId, message.expectedOperationType, message.claimIntentId || ""]);
+    const operation = matches(claimOperation) ? claimOperation : settledClaimOperations.get(proofKey);
+    if (!matches(operation)) return { ok: true, cancelled: true, cancellationProof: null };
+    if (!operation.settled) {
+      let timer;
+      try {
+        await Promise.race([
+          operation.promise.catch(() => {}),
+          new Promise((resolve) => { timer = setTimeout(resolve, 2000); })
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    if (!operation.settled) return { ok: true, cancelled: true, timedOut: true, cancellationProof: null };
+    const result = operation.result || {};
+    return { ok: true, cancelled: true, cancellationProof: {
+      runId: operation.runId,
+      type: operation.type,
+      claimIntentId: operation.claimIntentId,
+      settled: true,
+      claimActionAttempted: operation.claimActionAttempted,
+      claimed: Boolean(result.claimed || result.task?.claimed || result.task?.seatLocked || result.task?.seatLockedAt)
+    } };
   }
 
   async function runCommentTask(settings, message = {}) {
+    const runId = activeRunId;
     const openResult = await debugOpenFirstCommentTask(settings, message);
+    assertActiveRun(runId);
     let lockResult;
     try {
       lockResult = await debugLockSeatAndExtract(settings);
@@ -200,13 +310,18 @@
   }
 
   async function debugOpenFirstCommentTask(settings, message = {}) {
+    const runId = activeRunId;
     report("info", "准备打开评论或点赞互动任务");
     await ensureCampaignsPage(settings);
+    assertActiveRun(runId);
     await confirmPagePhase(["campaigns"], settings, "打开评论任务前");
+    assertActiveRun(runId);
     await ensureAllTaskFilter(settings);
+    assertActiveRun(runId);
     await confirmPagePhase(["campaigns"], settings, "全部筛选后");
 
     const selection = await selectNextCommentTask(settings, message.attemptedTaskKeys || []);
+    assertActiveRun(runId);
     if (!selection || !selection.target) {
       throw new Error("未找到可执行或可等待的评论或点赞互动任务");
     }
@@ -229,7 +344,7 @@
     try {
       await openTaskDetailOrFail(selection, settings);
       await acceptInvitationIfPresent(settings);
-      await confirmPagePhase(["detail_ready"], settings, "打开任务详情后");
+      await confirmPagePhase(["detail_ready"], settings, "打开任务详情后", { requireInvitationResolved: true });
     } catch (error) {
       error.task = task;
       throw error;
@@ -264,10 +379,11 @@
       cooldownMs: selection.cooldownMs || 0,
       cooldownSniping: selection.cooldownSniping || false
     });
-    chrome.runtime.sendMessage({ type: "DEBUG_TASK_CANDIDATE", runId: activeRunId, task });
+    sendRuntimeMessage({ type: "DEBUG_TASK_CANDIDATE", runId: activeRunId, task });
 
     return {
       ok: true,
+      detailConfirmed: true,
       message: selection.cooldownSniping
         ? "已在任务广场等待到可执行评论或点赞互动任务并打开详情"
         : "已打开第一个可执行评论或点赞互动任务详情",
@@ -286,11 +402,12 @@
     const selection = await findSelectedCountdownCandidate(settings, selectedTask);
     await openTaskDetailOrFail(selection, settings);
     await acceptInvitationIfPresent(settings);
-    await confirmPagePhase(["detail_ready"], settings, "打开选中详情后");
+    await confirmPagePhase(["detail_ready"], settings, "打开选中详情后", { requireInvitationResolved: true });
 
     const detailTask = await waitForSelectedTaskTweetTarget(settings, mergeTaskTypes(selectedTask.taskType, selection.taskType));
     return {
       ok: true,
+      detailConfirmed: true,
       message: detailTask.awaitingXTabAdoption ? "已点击选中任务详情的在 X 打开控件" : "已从选中任务详情提取推文链接",
       task: {
         ...detailTask,
@@ -314,12 +431,13 @@
     const selection = await findSelectedCountdownCandidate(settings, selectedTask);
     await openTaskDetailOrFail(selection, settings);
     await acceptInvitationIfPresent(settings);
-    await confirmPagePhase(["detail_ready"], settings, "打开选中详情后");
+    await confirmPagePhase(["detail_ready"], settings, "打开选中详情后", { requireInvitationResolved: true });
 
     const detailTask = await waitForTaskDetailReady(settings, mergeTaskTypes(selectedTask.taskType, selection.taskType));
     assertSupportedDetailTask(detailTask, settings);
     return {
       ok: true,
+      detailConfirmed: true,
       message: "已打开选中任务详情，等待倒计时窗口锁定",
       task: {
         ...detailTask,
@@ -748,7 +866,7 @@
 
     const taskBeforeClick = buildTask(settings);
     if (taskBeforeClick.tweetUrl) {
-      chrome.runtime.sendMessage({ type: "DEBUG_TASK_CANDIDATE", runId: activeRunId, task: taskBeforeClick });
+      sendRuntimeMessage({ type: "DEBUG_TASK_CANDIDATE", runId: activeRunId, task: taskBeforeClick });
     }
 
     const detailText = normalize(document.body.innerText);
@@ -760,7 +878,7 @@
     const hrefBeforeClick = lockButton.href || lockButton.getAttribute("href") || "";
     const candidateUrl = normalizeTweetUrl(hrefBeforeClick || taskBeforeClick.tweetUrl);
     if (candidateUrl) {
-      chrome.runtime.sendMessage({
+      sendRuntimeMessage({
         type: "DEBUG_TASK_CANDIDATE",
         runId: activeRunId,
         task: {
@@ -821,6 +939,7 @@
   }
 
   async function ensureCampaignsPage(settings = {}) {
+    assertActiveRun(activeRunId);
     const timeoutMs = getPageWaitMs(settings);
     if (!location.pathname.includes("/campaigns")) {
       location.href = "https://app.lhdao.top/campaigns";
@@ -848,6 +967,7 @@
   async function selectNextCommentTask(settings, attemptedTaskKeys) {
     const runId = activeRunId;
     await waitForCampaignsReady(getPageWaitMs(settings));
+    const waitingSince = Date.now();
     let lastReportAt = 0;
     let overlaySince = 0;
     let overlayReported = false;
@@ -875,6 +995,7 @@
       overlaySince = 0;
       overlayReported = false;
       const minTaskBounty = await getLiveAutoMinTaskBounty(settings);
+      assertActiveRun(runId);
       if (minTaskBounty !== lastReportedMinTaskBounty) {
         lastReportedMinTaskBounty = minTaskBounty;
         report("info", `当前全量检测最低赏金：${minTaskBounty.toFixed(3)} LUX`);
@@ -915,6 +1036,14 @@
           report("info", `任务剩余 ${ready.cooldownText || formatDuration(ready.detailPreloadMs)}，提前进入详情准备锁定`);
         }
         return ready;
+      }
+
+      // Finish the pending scan with an explicit no-claim receipt before the
+      // background reloads. Cancelling this request would lose that evidence.
+      if (Date.now() - waitingSince >= CAMPAIGNS_IDLE_REFRESH_MS
+          && claimOperation?.claimActionAttempted === false
+          && isCampaignsListOpen()) {
+        throw buildCampaignsRefreshRequestError("任务广场连续 5 分钟未找到可执行任务，已确认未尝试接单，刷新后继续检测");
       }
 
       // Reloading the plaza cannot change the in-memory dedupe table, so when
@@ -1179,10 +1308,10 @@
     return INVITATION_ACCEPT_BUTTON_TEXTS.some((marker) => value === marker || value.includes(marker));
   }
 
-  function findInvitationAcceptButton() {
+  function findInvitationAcceptButton(options = {}) {
     const selector = "button,a,[role='button'],input[type='button'],input[type='submit']";
     return Array.from(document.querySelectorAll(selector))
-      .filter((node) => isVisible(node) && !isDisabled(node))
+      .filter((node) => isVisible(node) && (options.includeDisabled || !isDisabled(node)))
       .filter((node) => isInvitationAcceptLabel(buttonText(node)))
       .find((node) => {
         let scope = node;
@@ -1556,11 +1685,29 @@
       && text.includes("任务广场")
       && !hasOfficialCompletionEvidence()
       && !isTaskDetailOrRecoverableOverlayOpen()
-      && collectVisibleTaskLikeNodes().length > 0
+      && (collectVisibleTaskLikeNodes().length > 0 || hasLoadedCampaignListShell())
       && !isTaskDetailOpen();
   }
 
+  function hasLoadedCampaignListShell() {
+    // A loaded plaza can contain only unsupported cards, or no cards at all.
+    // Its heading, filters and counted tabs prove readiness without treating
+    // navigation/sidebar text alone as a loaded task list.
+    if (!/^\/campaigns\/?$/.test(location.pathname) || hasPageLoadingState()) return false;
+    const hasHeading = Array.from(document.querySelectorAll("h1,h2,[role='heading']"))
+      .some((node) => isVisible(node) && /^(?:任务广场|Task Hall)$/i.test(normalize(node.innerText || node.textContent || "")));
+    if (!hasHeading) return false;
+    const controls = Array.from(document.querySelectorAll("button,[role='button']"))
+      .filter(isVisible)
+      .map(buttonText);
+    return controls.includes("全部")
+      && controls.some((text) => /^可抢\s*\d+$/.test(text))
+      && controls.some((text) => /^进行中\s*\d+$/.test(text));
+  }
+
   async function closeTaskDetailPanel(settings = {}) {
+    const runId = activeRunId;
+    assertActiveRun(runId);
     const completionReturnButton = findCompletionReturnToCampaignsButton();
     if (completionReturnButton) {
       completionReturnButton.scrollIntoView({ block: "center", inline: "center" });
@@ -1571,6 +1718,7 @@
       }
     }
 
+    assertActiveRun(runId);
     const unavailableReturnButton = findUnavailableReturnToCampaignsButton();
     if (unavailableReturnButton) {
       unavailableReturnButton.scrollIntoView({ block: "center", inline: "center" });
@@ -1581,6 +1729,7 @@
       }
     }
 
+    assertActiveRun(runId);
     if (!isTaskDetailOrRecoverableOverlayOpen()) {
       return { ok: true, message: "未检测到任务详情弹层，保持当前页面继续" };
     }
@@ -1595,6 +1744,7 @@
       }
     }
 
+    assertActiveRun(runId);
     document.dispatchEvent(new KeyboardEvent("keydown", {
       key: "Escape",
       code: "Escape",
@@ -1607,6 +1757,7 @@
       return { ok: true, message: "已通过 Esc 关闭任务详情" };
     }
 
+    assertActiveRun(runId);
     await clickTaskPanelOutside();
     if (await waitForTaskPanelClosed(settings, "左侧空白区域")) {
       return { ok: true, message: "已通过点击左侧空白区域关闭任务详情" };
@@ -1678,6 +1829,16 @@
       }
       if (completionConfirmed && isCampaignsListOpen()) {
         return { ok: true, evidence: completion.evidence, message: "Lighthouse 已确认完成并回到任务广场" };
+      }
+      if (completionConfirmed) {
+        // The result panel can omit its return control. Preserve this order's
+        // confirmed evidence so the background can recover the campaigns page.
+        return {
+          ok: false,
+          completed: true,
+          evidence: completion.evidence,
+          message: "官网已确认任务完成；未找到返回任务广场入口，交由后台恢复广场"
+        };
       }
       await wait(250);
     }
@@ -1807,10 +1968,13 @@
   }
 
   async function clickTaskPanelOutside() {
+    const runId = activeRunId;
+    assertActiveRun(runId);
     const x = Math.max(24, Math.floor(window.innerWidth * 0.12));
     const y = Math.max(120, Math.floor(window.innerHeight * 0.5));
     const target = document.elementFromPoint(x, y) || document.body;
     await randomClickDelay();
+    assertActiveRun(runId);
     for (const type of ["pointerdown", "mousedown", "mouseup", "click"]) {
       target.dispatchEvent(new MouseEvent(type, {
         bubbles: true,
@@ -2044,7 +2208,11 @@
       const hasCampaignShell = location.pathname.includes("/campaigns");
       const hasTaskList = COMMENT_MARKERS.concat(COMMENT_EQUIVALENT_MARKERS).some((marker) => text.includes(marker)) || text.includes("任务广场") || text.includes("Task Hall");
       const hasCards = collectVisibleTaskLikeNodes().length > 0;
-      if (hasCampaignShell && hasTaskList && hasCards) return true;
+      if (hasCampaignShell && hasTaskList && (hasCards || (
+          hasLoadedCampaignListShell()
+          && !hasOfficialCompletionEvidence()
+          && !isTaskDetailOrRecoverableOverlayOpen()
+          && !isTaskDetailOpen()))) return true;
       if (Date.now() - lastReportAt > 5000) {
         lastReportAt = Date.now();
         report("info", `任务广场仍在加载，继续等待，已等待 ${formatDuration(Date.now() - started)}`);
@@ -2397,9 +2565,13 @@
   }
 
   async function clickElement(node, options = {}) {
+    const runId = activeRunId;
+    assertActiveRun(runId);
     if (options.randomDelay !== false) {
       await randomClickDelay();
     }
+    assertActiveRun(runId);
+    if (claimOperation) assertActiveRun(claimOperation.runId);
     // Mark before dispatch: a handler can perform the action and then throw.
     // Invitation/confirmation buttons can claim an order just like a lock.
     if (options.claimAction && claimOperation) claimOperation.claimActionAttempted = true;
@@ -2416,7 +2588,7 @@
 
   async function finish(ok, message) {
     const result = { ok, message };
-    chrome.runtime.sendMessage({ type: "LIGHTHOUSE_TASK_DONE", runId: activeRunId, result });
+    sendRuntimeMessage({ type: "LIGHTHOUSE_TASK_DONE", runId: activeRunId, result });
     return result;
   }
 
@@ -2429,7 +2601,11 @@
 
     while (Date.now() - started < timeoutMs) {
       assertActiveRun(runId);
-      const snapshot = getLighthousePageSnapshot();
+      let snapshot = getLighthousePageSnapshot();
+      if (options.requireInvitationResolved && snapshot.phase === "detail_ready"
+          && findInvitationAcceptButton({ includeDisabled: true })) {
+        snapshot = { ...snapshot, phase: "invitation_pending" };
+      }
       lastSnapshot = snapshot;
       if (allowed.has(snapshot.phase)) {
         report("info", `${label}状态确认：${describePagePhase(snapshot.phase)}`);
@@ -2451,6 +2627,7 @@
       campaigns_loading: "任务广场加载中",
       detail_loading: "任务详情加载中",
       detail_ready: "任务详情页",
+      invitation_pending: "邀请接单仍待确认",
       detail_error: "任务详情报错",
       unknown: "未知页面",
       snapshot_error: "页面快照失败"
@@ -2469,6 +2646,7 @@
   }
 
   function sendRuntimeMessage(message) {
+    if (automationPaused || !activeRunId || cancelledRunIds.has(activeRunId)) return;
     try {
       if (!chrome?.runtime?.sendMessage) return;
       const request = chrome.runtime.sendMessage(message);
@@ -2512,6 +2690,7 @@
   }
 
   function assertActiveRun(runId) {
+    if (globalThis.__lighthouseCommentTaskRunnerLighthouseSingleton__?.paused) throw new Error("运行已停止，页面自动操作已暂停");
     if (runId && (cancelledRunIds.has(runId) || activeRunId !== runId)) {
       throw new Error("运行已停止，旧流程已取消");
     }
@@ -2567,4 +2746,5 @@
       tick();
     });
   }
+  automationPauseReady = loadAutomationPause();
 })();

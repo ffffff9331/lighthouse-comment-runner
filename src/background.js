@@ -72,6 +72,7 @@ let runIdSequence = 0;
 let runtimeState = createInitialState();
 const runtimeStateReady = chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" }).then(restoreAutoRunState);
 const activeAIRequests = new Set();
+const activeTabActions = new Set();
 let monitorCountdowns = { tasks: [], timestamp: 0 };
 let lastXTaskWidgetNotifyAt = 0;
 let lastCampaignsRefreshAt = 0;
@@ -85,6 +86,9 @@ let capturedTargetRecoveryPromise = null;
 let directTweetOpenPromise = null;
 let selectedStartInFlight = false;
 let manualDebugCommandTail = Promise.resolve();
+let manualDebugCommandEpoch = 0;
+let manualStopPromise = null;
+let alertPauseRevision = 0;
 
 async function buildLighthouseMonitorSnapshot(reason = "update") {
   const task = runtimeState.currentTask || {};
@@ -136,8 +140,11 @@ async function buildLighthouseMonitorSnapshot(reason = "update") {
 }
 
 async function writeLighthouseMonitorSnapshot(reason = "update") {
+  const snapshotState = runtimeState;
+  const snapshotRunId = runtimeState.runId;
   try {
     const snapshot = await buildLighthouseMonitorSnapshot(reason);
+    if (runtimeState !== snapshotState || runtimeState.runId !== snapshotRunId) return;
     chrome.storage.local.set({ [LIGHTHOUSE_MONITOR_SNAPSHOT_KEY]: snapshot }, () => {
       void chrome.runtime.lastError;
     });
@@ -166,7 +173,9 @@ function publishLighthouseMonitorSnapshot(reason = "update", options = {}) {
   }, 1000 - elapsed);
 }
 
-publishLighthouseMonitorSnapshot("startup", { force: true });
+void runtimeStateReady.then(() => {
+  if (!runtimeState.manuallyStopped) publishLighthouseMonitorSnapshot("startup", { force: true });
+});
 
 chrome.runtime.onInstalled.addListener(async () => {
   await runtimeStateReady;
@@ -184,7 +193,11 @@ chrome.runtime.onInstalled.addListener(async () => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === AUTO_RUN_KEEPALIVE_ALARM || alarm.name === CAMPAIGNS_IDLE_RELOAD_ALARM) {
-    void handleAutoRunKeepaliveTick();
+    const alarmState = runtimeState;
+    void handleAutoRunKeepaliveTick().catch((error) => {
+      if (runtimeState !== alarmState) return;
+      log("error", `Lighthouse 保活检查失败：${error.message || String(error)}`);
+    });
   }
 });
 
@@ -193,10 +206,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ ok: false, error: "消息来源无权执行此操作" });
     return false;
   }
+  const messageState = runtimeState;
   handleMessage(message, sender)
     .then(sendResponse)
     .catch((error) => {
-      log("error", error.message || String(error));
+      if (runtimeState === messageState) log("error", error.message || String(error));
       sendResponse({ ok: false, error: error.message || String(error), state: runtimeState });
     });
   return true;
@@ -222,8 +236,21 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 async function handleMessage(message, sender) {
   await runtimeStateReady;
   if (!message || !message.type) return { ok: false, error: "Missing message type" };
+  const manualStep = /^DEBUG_(?:OPEN_CAMPAIGNS|OPEN_FIRST_TASK|LOCK_SEAT_OPEN_TWEET|RUN_X_REPLY|FAST_X_CLAIM_REPLY_VERIFY|COMPLETE_X_TASK_WIDGET|WAIT_LIGHTHOUSE_COMPLETION_RETURN|CLOSE_X_RETURN_LIGHTHOUSE|CLICK_DONE|RETURN_CAMPAIGNS)$/.test(message.type);
+  if (runtimeState.manuallyStopped && (message.type === "START_RUN" || manualStep) && !message.expectedRunId && manualStopPromise) {
+    const requestedEpoch = manualDebugCommandEpoch;
+    await manualStopPromise;
+    if (requestedEpoch !== manualDebugCommandEpoch) return { ok: false, cancelled: true, state: runtimeState };
+  }
+  if (runtimeState.manuallyStopped && !["START_RUN", "STOP_RUN", "GET_STATE", "GET_CONTENT_SETTINGS", "GET_REPLY_RECORDS", "SAVE_SETTINGS", "CLEAR_REPLY_RECORDS", "OPEN_DEBUG_PAGE", "MONITOR_GET_COUNTDOWNS", "MONITOR_GET_STATUS", "MONITOR_GET_SETTINGS", "MONITOR_MIGRATE_SETTINGS", "MONITOR_SET_ENABLED", "MONITOR_SET_THRESHOLD", "MONITOR_SET_VOICE"].includes(message.type) && !manualStep) {
+    return { ok: true, ignored: true, paused: true };
+  }
+  if (runtimeState.manuallyStopped && message.type === "MONITOR_GET_COUNTDOWNS") {
+    return { ok: true, paused: true, tasks: [], timestamp: 0 };
+  }
   const messageWindowId = getMessageWindowId(message, sender);
   if (message.type === "RUN_SELECTED_COUNTDOWN_TASK") {
+    if (message.selectedTask && !selectedStartInFlight) manualDebugCommandEpoch += 1;
     return startSelectedCountdownTask(message.selectedTask, messageWindowId);
   }
   if ([
@@ -258,7 +285,7 @@ async function handleMessage(message, sender) {
       if (sender?.tab && !String(sender.url || "").startsWith("chrome-extension://")) return { ok: false, error: "完整设置仅限扩展界面访问" };
       return { ok: true, state: runtimeState, settings: await getSettings() };
     case "GET_CONTENT_SETTINGS":
-      return { ok: true, settings: { autoMinTaskBounty: (await getSettings()).autoMinTaskBounty } };
+      return { ok: true, settings: { autoMinTaskBounty: (await getSettings()).autoMinTaskBounty }, paused: Boolean(runtimeState.manuallyStopped) };
     case "SAVE_SETTINGS":
       await chrome.storage.local.set({ settings: normalizeSettings(message.settings) });
       if (runtimeState.running && runtimeState.mode === "auto" && runtimeState.stage === "auto_waiting_schedule") {
@@ -277,19 +304,14 @@ async function handleMessage(message, sender) {
     case "OPEN_DEBUG_PAGE":
       return openDebugPage(messageWindowId);
     case "START_RUN":
-      return startAutoRun(message.options || {}, messageWindowId);
-    case "STOP_RUN":
-      await cancelCurrentRun();
-      await clearAutoRunResumeSchedule();
-      await clearAutoRunKeepalive();
-      await clearCampaignsIdleReloadAlarm();
-      runtimeState.running = false;
-      runtimeState.scheduledResumeAt = 0;
-      runtimeState.runId = createRunId();
-      clearXOpenWatch();
-      setStage("stopped");
-      log("warn", "已停止运行");
-      return { ok: true, state: runtimeState };
+      manualDebugCommandEpoch += 1;
+      return startAutoRun(message.options || {}, messageWindowId, true);
+    case "STOP_RUN": {
+      const operation = stopAndClearRun();
+      manualStopPromise = operation;
+      try { return await operation; }
+      finally { if (manualStopPromise === operation) manualStopPromise = null; }
+    }
     case "DEBUG_TASK_CANDIDATE":
       if (!isCurrentRunMessage(message)) return { ok: true, state: runtimeState };
       runtimeState.currentTask = message.task || runtimeState.currentTask;
@@ -337,7 +359,8 @@ async function handleMessage(message, sender) {
       return { ok: true, state: runtimeState };
     case "X_TASK_WIDGET_HINT":
       return handleXTaskWidgetHint(message, sender);
-    case "HIGH_BOUNTY_ALERT":
+    case "HIGH_BOUNTY_ALERT": {
+      const isCurrent = captureRunGuard();
       try {
         chrome.notifications.create(`bounty-${message.bounty}-${Date.now()}`, {
           type: "basic",
@@ -348,13 +371,14 @@ async function handleMessage(message, sender) {
           requireInteraction: true
         });
       } catch (_) {}
-      {
-        const monitorSettings = await getMonitorSettings();
-        const speechText = buildMonitorSpeechText(message.speechData || {}, monitorSettings, message.voiceText || message.text || "");
-        await forwardPanelSpeech(speechText, monitorSettings);
-      }
+      const monitorSettings = await getMonitorSettings();
+      if (!isCurrent()) return { ok: true, ignored: true };
+      const speechText = buildMonitorSpeechText(message.speechData || {}, monitorSettings, message.voiceText || message.text || "");
+      await forwardPanelSpeech(speechText, monitorSettings);
+      if (!isCurrent()) return { ok: true, ignored: true };
       log("info", `高赏金警报：${message.bounty} LUX`);
       return { ok: true, state: runtimeState };
+    }
     case "MONITOR_COUNTDOWN_SYNC":
       {
         const incomingTasks = Array.isArray(message.tasks) ? message.tasks : [];
@@ -369,7 +393,7 @@ async function handleMessage(message, sender) {
       return getMonitorCountdowns(messageWindowId);
     case "MONITOR_GET_STATUS": {
       const monitorSettings = await getMonitorSettings();
-      return { ok: true, ...toPublicMonitorSettings(monitorSettings), seenCount: message.seenCount || 0 };
+      return { ok: true, ...toPublicMonitorSettings(monitorSettings), paused: Boolean(runtimeState.manuallyStopped), seenCount: message.seenCount || 0 };
     }
     case "MONITOR_GET_SETTINGS": {
       const monitorSettings = await getMonitorSettings();
@@ -439,7 +463,7 @@ function isAuthorizedMessage(message, sender) {
   if (!Number.isInteger(sender?.tab?.id) || (sender.frameId ?? 0) !== 0) return false;
   const url = String(sender.url || "");
   if (/^https:\/\/(?:x|twitter)\.com\//.test(url)) {
-    return ["GENERATE_AI_REPLY", "QUERY_TWEET_REPLY_HISTORY", "X_TASK_WIDGET_HINT", "X_REPLY_RESULT"].includes(message?.type);
+    return ["GET_CONTENT_SETTINGS", "GENERATE_AI_REPLY", "QUERY_TWEET_REPLY_HISTORY", "X_TASK_WIDGET_HINT", "X_REPLY_RESULT"].includes(message?.type);
   }
   if (/^https:\/\/app\.lhdao\.top\//.test(url)) {
     return ["GET_CONTENT_SETTINGS", "CONTENT_LOG", "DEBUG_TASK_CANDIDATE", "LIGHTHOUSE_TARGET_TWEET_URL", "LIGHTHOUSE_TASK_READY", "LIGHTHOUSE_TASK_DONE", "HIGH_BOUNTY_ALERT", "MONITOR_COUNTDOWN_SYNC", "MONITOR_GET_STATUS", "MONITOR_MIGRATE_SETTINGS"].includes(message?.type);
@@ -473,21 +497,111 @@ function isWindowScopedCommand(type) {
   ].includes(type);
 }
 
-async function prepareDebugRunForCommand(windowId, commandType) {
-  if (runtimeState.running && runtimeState.mode === "debug") {
+async function stopAndClearRun() {
+  const previousRun = runtimeState;
+  const stopEpoch = ++manualDebugCommandEpoch;
+  runtimeState = {
+    ...createInitialState(),
+    // Keep the cancellation target until its acknowledgements settle.
+    runId: previousRun.runId,
+    stopEpoch: Number(previousRun.stopEpoch || 0) + 1,
+    manuallyStopped: true,
+    stage: "stopped",
+    logs: [{ at: new Date().toISOString(), level: "warn", text: "已停止运行", source: "background", pagePhase: "" }]
+  };
+  const stoppingState = runtimeState;
+  const ownsStop = () => runtimeState === stoppingState && manualDebugCommandEpoch === stopEpoch;
+  manualDebugCommandTail = Promise.resolve();
+  monitorCountdowns = { tasks: [], timestamp: 0 };
+  monitorSnapshotPromise = null;
+  capturedTargetRecoveryPromise = null;
+  directTweetOpenPromise = null;
+  selectedStartInFlight = false;
+  lastXTaskWidgetNotifyAt = 0;
+  lastCampaignsRefreshAt = 0;
+  lighthouseAlertBridgeUrls.clear();
+  if (lighthouseMonitorPendingTimer) clearTimeout(lighthouseMonitorPendingTimer);
+  lighthouseMonitorPendingTimer = null;
+  const cancellation = cancelSupersededLighthouseRun(previousRun, true);
+  await persistAutoRunState(true);
+  await cancellation;
+  if (!ownsStop()) return { ok: false, cancelled: true, state: runtimeState };
+  await clearAutoRunResumeSchedule();
+  if (!ownsStop()) return { ok: false, cancelled: true, state: runtimeState };
+  await clearAutoRunKeepalive();
+  if (!ownsStop()) return { ok: false, cancelled: true, state: runtimeState };
+  await clearCampaignsIdleReloadAlarm();
+  if (!ownsStop()) return { ok: false, cancelled: true, state: runtimeState };
+  await broadcastAutomationPause(true, ownsStop, [previousRun.lighthouseTabId, previousRun.xTabId, previousRun.uncertainAction?.tabId]);
+  if (!ownsStop()) return { ok: false, cancelled: true, state: runtimeState };
+  runtimeState.runId = createRunId();
+  await persistAutoRunState(true);
+  if (ownsStop()) publishLighthouseMonitorSnapshot("stopped", { force: true });
+  return { ok: true, state: runtimeState };
+}
+
+async function broadcastAutomationPause(paused, isCurrent, alreadyCancelled = []) {
+  const message = { type: "AUTOMATION_PAUSE_CHANGED", paused };
+  try { if (isCurrent()) await chrome.runtime.sendMessage(message); } catch (_) {}
+  if (!isCurrent()) return;
+  try {
+    let timer;
+    let tabs;
+    try {
+      tabs = await Promise.race([
+        chrome.tabs.query({ url: ["https://app.lhdao.top/*", "https://x.com/*", "https://twitter.com/*"] }),
+        new Promise(resolve => { timer = setTimeout(() => resolve(null), 1000); })
+      ]);
+    } finally { clearTimeout(timer); }
+    if (!isCurrent() || !tabs) return;
+    await Promise.all(tabs.filter(tab => !alreadyCancelled.includes(tab.id)).map(async tab => {
+      if (!isCurrent()) return;
+      if (paused && isLighthouseUrl(tab.url)) pauseLighthouseAlertBridge(tab.id);
+      try { await chrome.tabs.sendMessage(tab.id, message); } catch (_) {}
+    }));
+  } catch (_) {}
+}
+
+async function resumeAfterManualStop(isCurrent) {
+  if (!isCurrent()) return false;
+  if (!runtimeState.manuallyStopped) return true;
+  runtimeState.manuallyStopped = false;
+  await persistAutoRunState(true);
+  if (!isCurrent()) return false;
+  await broadcastAutomationPause(false, isCurrent);
+  return isCurrent();
+}
+
+async function prepareDebugRunForCommand(windowId, commandType, commandEpoch = manualDebugCommandEpoch) {
+  const takeoverState = runtimeState;
+  const previousRunId = runtimeState.runId;
+  const isCurrent = () => runtimeState === takeoverState && runtimeState.runId === previousRunId && manualDebugCommandEpoch === commandEpoch;
+  const cancelled = () => ({ ok: false, cancelled: true, error: "单步接管已取消，旧流程不会继续", state: runtimeState });
+  if (!isCurrent()) return cancelled();
+  if (runtimeState.running && runtimeState.mode === "debug" && !runtimeState.uncertainAction) {
     setRuntimeWindow(windowId);
-    return;
+    return { ok: true, runId: runtimeState.runId, state: runtimeState };
   }
 
   const previousMode = runtimeState.mode || "idle";
-  if (runtimeState.running) {
-    await Promise.all([
-      cancelCurrentRun(),
-      clearAutoRunResumeSchedule(),
-      clearAutoRunKeepalive(),
-      clearCampaignsIdleReloadAlarm()
-    ]);
+  if (runtimeState.running || runtimeState.uncertainAction) {
+    await cancelCurrentRun(isCurrent);
+    if (!isCurrent()) return cancelled();
   }
+  await clearAutoRunResumeSchedule();
+  if (!isCurrent()) return cancelled();
+  await clearAutoRunKeepalive();
+  if (!isCurrent()) return cancelled();
+  await clearCampaignsIdleReloadAlarm();
+  if (!isCurrent()) return cancelled();
+  if (runtimeState.uncertainAction) {
+    runtimeState.running = false;
+    setStage("manual_takeover_blocked");
+    const error = `单步接管未执行：旧动作 ${runtimeState.uncertainAction.type || "未知动作"} 尚未取得未点击/未接单的确认，已保留订单，请先核对本单`;
+    log("warn", error);
+    return { ok: false, uncertain: true, error, state: runtimeState };
+  }
+  if (runtimeState.manuallyStopped && !await resumeAfterManualStop(isCurrent)) return cancelled();
   runtimeState.running = true;
   runtimeState.mode = "debug";
   runtimeState.runId = createRunId();
@@ -495,25 +609,42 @@ async function prepareDebugRunForCommand(windowId, commandType) {
   setRuntimeWindow(windowId);
   setStage("debug_takeover");
   log("info", `单步控制已接管 ${previousMode} 流程：${commandType}`);
+  return { ok: true, runId: runtimeState.runId, state: runtimeState };
 }
 
 function enqueueManualDebugCommand(message, windowId) {
-  const operation = manualDebugCommandTail.then(() => runManualDebugCommand(message, windowId));
+  const commandEpoch = manualDebugCommandEpoch;
+  const operation = manualDebugCommandTail.then(async () => {
+    if (commandEpoch !== manualDebugCommandEpoch
+      || (message.expectedRunId && (message.expectedRunId !== runtimeState.runId || !runtimeState.running || runtimeState.mode !== "debug"))) {
+      return { ok: false, cancelled: true, error: "旧单步队列已失效", state: runtimeState };
+    }
+    const result = await runManualDebugCommand(message, windowId);
+    if (result?.cancelled && commandEpoch === manualDebugCommandEpoch) manualDebugCommandEpoch += 1;
+    return result;
+  });
   manualDebugCommandTail = operation.catch(() => {});
   return operation;
 }
 
 async function runManualDebugCommand(message, windowId) {
+  if (message.expectedRunId && (message.expectedRunId !== runtimeState.runId || !runtimeState.running || runtimeState.mode !== "debug")) {
+    return { ok: false, cancelled: true, error: "旧单步队列已失效", state: runtimeState };
+  }
   if (["DEBUG_OPEN_CAMPAIGNS", "DEBUG_OPEN_FIRST_TASK", "DEBUG_FAST_X_CLAIM_REPLY_VERIFY"].includes(message.type)
-      && (runtimeState.uncertainAction || ((runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed)
-        && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId)))) {
+      && ((runtimeState.currentTask?.invitationAccepted || runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed)
+        && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId))) {
     return { ok: false, error: "旧订单尚未核对，不能接管或打开另一任务", state: runtimeState };
   }
   const lockResult = lockRuntimeWindowForCommand(windowId, message.type);
   if (!lockResult.ok) {
     return { ok: false, error: lockResult.error, state: runtimeState };
   }
-  await prepareDebugRunForCommand(windowId, message.type);
+  const prepared = await prepareDebugRunForCommand(windowId, message.type);
+  if (!prepared?.ok) return prepared || { ok: false, error: "单步接管未完成", state: runtimeState };
+  if (runtimeState !== prepared.state || runtimeState.runId !== prepared.runId || !runtimeState.running) {
+    return { ok: false, cancelled: true, error: "单步接管已取消", state: runtimeState };
+  }
 
   switch (message.type) {
     case "DEBUG_OPEN_CAMPAIGNS":
@@ -579,6 +710,8 @@ function setRuntimeWindow(windowId) {
 }
 
 async function handleXTaskWidgetHint(message, sender) {
+  const isCurrent = captureRunGuard();
+  if (!isCurrent()) return { ok: true, ignored: true };
   const senderTabId = sender?.tab?.id;
   const senderWindowId = sender?.tab?.windowId;
   if (!runtimeState.xTabId || senderTabId !== runtimeState.xTabId || !isWindowIdInRuntime(senderWindowId)) {
@@ -604,19 +737,24 @@ async function handleXTaskWidgetHint(message, sender) {
         requireInteraction: isReady
       });
     } catch (_) {}
+    if (!isCurrent()) return { ok: true, ignored: true };
     log("info", `${title}：${detail || message.tweetUrl || ""}`);
   }
   return { ok: true, state: runtimeState };
 }
 
 async function forwardPanelSpeech(text, existingSettings = null) {
+  const isCurrent = captureRunGuard();
+  if (!isCurrent()) return false;
   const value = String(text || "").trim();
   if (!value) return false;
   const monitorSettings = existingSettings || await getMonitorSettings();
+  if (!isCurrent()) return false;
   if (!monitorSettings.voiceEnabled) return false;
   try {
     await chrome.runtime.sendMessage({
       type: "PANEL_SPEAK_TEXT",
+      runId: runtimeState.runId,
       text: value,
       voiceEngine: monitorSettings.voiceEngine,
       voiceName: monitorSettings.voiceName,
@@ -678,12 +816,16 @@ function toPublicMonitorSettings(settings) {
 }
 
 async function getMonitorCountdowns(preferredWindowId = null) {
+  const isCurrent = captureRunGuard();
+  const paused = () => ({ ok: true, paused: true, tasks: [], timestamp: 0 });
+  if (!isCurrent()) return paused();
   const cacheAge = Date.now() - (monitorCountdowns.timestamp || 0);
   if (monitorCountdowns.tasks.length > 0 && cacheAge < MONITOR_COUNTDOWN_CACHE_TTL_MS) {
     return { ok: true, tasks: monitorCountdowns.tasks, timestamp: monitorCountdowns.timestamp, source: "cache" };
   }
 
   const snapshot = await requestMonitorCountdownSnapshot(preferredWindowId);
+  if (!isCurrent()) return paused();
   if (snapshot?.ok) {
     const snapshotTasks = snapshot.tasks || [];
     if (snapshotTasks.length > 0 || monitorCountdowns.tasks.length === 0) {
@@ -703,16 +845,22 @@ async function getMonitorCountdowns(preferredWindowId = null) {
 }
 
 async function requestMonitorCountdownSnapshot(preferredWindowId = null) {
+  const isCurrent = captureRunGuard();
+  if (!isCurrent()) return { ok: false, paused: true };
   if (monitorSnapshotPromise) return monitorSnapshotPromise;
-  monitorSnapshotPromise = (async () => {
+  const request = (async () => {
     const tabs = await queryLighthouseTabs(preferredWindowId);
+    if (!isCurrent()) return { ok: false, paused: true };
     const activeTabs = tabs.filter((tab) => tab.active);
     const candidates = [...activeTabs, ...tabs].filter((tab, index, arr) => arr.findIndex((item) => item.id === tab.id) === index);
     for (const tab of candidates) {
       try {
         let response = await sendMonitorSnapshotMessage(tab.id);
-        if (!response?.ok && await ensureMonitorContentScriptInjected(tab.id)) {
+        if (!isCurrent()) return { ok: false, paused: true };
+        if (!response?.ok && await ensureMonitorContentScriptInjected(tab.id, isCurrent)) {
+          if (!isCurrent()) return { ok: false, paused: true };
           await delay(500);
+          if (!isCurrent()) return { ok: false, paused: true };
           response = await sendMonitorSnapshotMessage(tab.id);
         }
         if (response?.ok) return response;
@@ -720,10 +868,11 @@ async function requestMonitorCountdownSnapshot(preferredWindowId = null) {
     }
     return { ok: false };
   })();
+  monitorSnapshotPromise = request;
   try {
-    return await monitorSnapshotPromise;
+    return await request;
   } finally {
-    monitorSnapshotPromise = null;
+    if (monitorSnapshotPromise === request) monitorSnapshotPromise = null;
   }
 }
 
@@ -735,17 +884,21 @@ async function sendMonitorSnapshotMessage(tabId) {
   }
 }
 
-async function ensureMonitorContentScriptInjected(tabId) {
+async function ensureMonitorContentScriptInjected(tabId, isCurrent = captureRunGuard()) {
+  if (!isCurrent()) return false;
   try {
     const tab = await chrome.tabs.get(tabId);
+    if (!isCurrent()) return false;
     if (!isLighthouseUrl(tab.url)) return false;
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ["src/content/lighthouse-monitor.js"]
     });
+    if (!isCurrent()) return false;
     log("warn", "已为 Lighthouse 页面补注入倒计时监控脚本");
     return true;
   } catch (error) {
+    if (!isCurrent()) return false;
     if (/No tab with id|Tab not found/i.test(error?.message || "")) return false;
     log("warn", `补注入倒计时监控脚本失败：${error.message}`);
     return false;
@@ -767,20 +920,50 @@ async function openDebugPage(windowId = null) {
   return { ok: true, state: runtimeState };
 }
 
-async function startAutoRun(options, windowId = null) {
+async function startAutoRun(options, windowId = null, manualRestart = false) {
+  if (runtimeState.manuallyStopped && !manualRestart) return { ok: false, cancelled: true, error: "已手动停止，请点击全量检测或单步流程" };
   if (runtimeState.running) return { ok: false, error: "当前流程仍在执行" };
-  if (runtimeState.uncertainAction || ((runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed) && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId))) {
+  if (runtimeState.currentTask?.invitationAccepted && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId)) {
+    return { ok: false, error: "已接受邀请的订单尚未完成，请继续处理本单", state: runtimeState };
+  }
+  if (manualRestart && hasIdentifiedUncertainAction(runtimeState)) {
+    const restartingState = runtimeState;
+    const restartingRunId = runtimeState.runId;
+    const commandEpoch = manualDebugCommandEpoch;
+    const isCurrent = () => runtimeState === restartingState && runtimeState.runId === restartingRunId && manualDebugCommandEpoch === commandEpoch;
+    await cancelCurrentRun(isCurrent);
+    if (!isCurrent()) return { ok: false, cancelled: true, state: runtimeState };
+    if (runtimeState.uncertainAction) {
+      return { ok: false, uncertain: true, error: "旧动作尚未核对，已保留执行记录，不能启动新任务", state: runtimeState };
+    }
+  }
+  if (!manualRestart && (runtimeState.uncertainAction || ((runtimeState.currentTask?.invitationAccepted || runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed) && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId)))) {
     return { ok: false, error: "旧订单尚未核对，请先确认本单结果，不能清空后接新单", state: runtimeState };
   }
+  const previousRun = runtimeState;
   runtimeState = createInitialState();
+  runtimeState.manuallyStopped = Boolean(previousRun.manuallyStopped);
+  runtimeState.stopEpoch = previousRun.stopEpoch;
   setRuntimeWindow(windowId);
   runtimeState.runId = createRunId();
   runtimeState.running = true;
   runtimeState.mode = "auto";
   runtimeState.startOptions = sanitizeAutoRunStartOptions(options);
+  const startingState = runtimeState;
+  const startingRunId = runtimeState.runId;
+  const isCurrent = () => runtimeState === startingState && runtimeState.runId === startingRunId && runtimeState.running;
+  const cancelled = () => ({ ok: false, cancelled: true, state: runtimeState });
+  if (runtimeState.manuallyStopped && !await resumeAfterManualStop(isCurrent)) return cancelled();
   setStage("auto_starting");
   log("info", "全量检测指令已接收，正在准备 Lighthouse 页面");
+  if (manualRestart && (previousRun.currentTask || previousRun.uncertainAction)) {
+    const runId = runtimeState.runId;
+    await cancelSupersededLighthouseRun(previousRun);
+    if (runtimeState.runId !== runId || !runtimeState.running) return { ok: false, cancelled: true, state: runtimeState };
+    log("info", "手动重新检测：已重置上一轮本地状态，是否可领取新任务以 Lighthouse 返回结果为准");
+  }
   const settings = await getSettings();
+  if (!isCurrent()) return cancelled();
   if (settings.replyMode !== "post") {
     runtimeState.running = false;
     setStage("auto_blocked");
@@ -799,18 +982,26 @@ async function startAutoRun(options, windowId = null) {
     return { ok: true, state: runtimeState };
   }
   await clearAutoRunResumeSchedule();
+  if (!isCurrent()) return cancelled();
   // Armed only once every preflight check has passed; a blocked start must
   // not leave a keepalive alarm ticking.
   await ensureAutoRunKeepalive();
+  if (!isCurrent()) return cancelled();
   await armCampaignsIdleReloadAlarm();
-  const tab = await getOrCreateLighthouseTab(runtimeState.startOptions?.lighthouseUrl || LIGHTHOUSE_CAMPAIGNS_URL);
+  if (!isCurrent()) return cancelled();
+  const tab = await getOrCreateLighthouseTab(runtimeState.startOptions?.lighthouseUrl || LIGHTHOUSE_CAMPAIGNS_URL, isCurrent);
+  if (!isCurrent()) return cancelled();
   rememberLighthouseTab(tab);
-  if (!await focusLighthouseTabForAutoScan(tab.id)) {
+  const focused = await focusLighthouseTabForAutoScan(tab.id, isCurrent);
+  if (!isCurrent()) return cancelled();
+  if (!focused) {
     log("warn", "Chrome 正在调整 Lighthouse 标签，稍后继续检测任务广场");
     await delay(Math.max(settings.actionDelayMs, 1000));
+    if (!isCurrent()) return cancelled();
     return startNextAutoTask("retry_after_lighthouse_tab_busy");
   }
   await waitForTabComplete(tab.id);
+  if (!isCurrent()) return cancelled();
   runtimeState.scheduledResumeAt = 0;
   log("info", "全量检测已启动：按旧任务页锁定流程顺序执行");
   setStage("auto_started");
@@ -820,14 +1011,18 @@ async function startAutoRun(options, windowId = null) {
 
 async function startNextAutoTask(reason) {
   const runId = runtimeState.runId;
+  const isCurrent = captureRunGuard();
+  const cancelled = () => ({ ok: false, cancelled: true, state: runtimeState });
   if (!isActiveAutoRun(runId)) return { ok: false, error: "Auto run is not active" };
   const settings = await getSettings();
+  if (!isCurrent()) return cancelled();
   const scheduleState = getAutoRunScheduleState(settings);
   if (!scheduleState.inWindow) {
     await enterAutoRunScheduleWait(scheduleState, "当前不在运行时间，等待下一次自动开始");
     return { ok: true, state: runtimeState };
   }
   await clearAutoRunResumeSchedule();
+  if (!isCurrent()) return cancelled();
   runtimeState.scheduledResumeAt = 0;
   if (isLimitReached(runtimeState.completed, settings.maxTasksPerRun)) {
     runtimeState.running = false;
@@ -842,12 +1037,17 @@ async function startNextAutoTask(reason) {
     return { ok: true, state: runtimeState };
   }
 
-  const tabId = (await getOrCreateLighthouseTab(LIGHTHOUSE_CAMPAIGNS_URL)).id;
-  if (!isActiveAutoRun(runId)) return { ok: true, state: runtimeState };
-  await rememberLighthouseTabById(tabId);
-  if (!await focusLighthouseTabForAutoScan(tabId)) {
+  const tab = await getOrCreateLighthouseTab(LIGHTHOUSE_CAMPAIGNS_URL, isCurrent);
+  if (!isCurrent() || !isActiveAutoRun(runId)) return cancelled();
+  const tabId = tab.id;
+  await rememberLighthouseTabById(tabId, isCurrent);
+  if (!isCurrent()) return cancelled();
+  const focused = await focusLighthouseTabForAutoScan(tabId, isCurrent);
+  if (!isCurrent()) return cancelled();
+  if (!focused) {
     log("warn", "Chrome 正在调整 Lighthouse 标签，稍后继续检测任务广场");
     await delay(Math.max(settings.actionDelayMs, 1000));
+    if (!isCurrent()) return cancelled();
     return startNextAutoTask("retry_after_lighthouse_tab_busy");
   }
   await waitForTabComplete(tabId);
@@ -864,6 +1064,7 @@ async function startNextAutoTask(reason) {
   setStage("selecting_task");
   log("info", `开始寻找下一条评论/点赞互动任务：${reason || "continue"}`);
   await ensurePermanentIgnoredTaskKeysLoaded();
+  if (!isCurrent()) return cancelled();
   pruneAttemptedTasks();
 
   beginXOpenWatch(tabId, "auto");
@@ -878,32 +1079,52 @@ async function startNextAutoTask(reason) {
   if (!result || !result.ok) {
     clearXOpenWatch();
     if (result?.refreshRequested) {
-      const refreshState = await refreshLighthouseCampaignsTab(tabId, result.message || "任务广场陈旧可做列表刷新后继续下一轮");
-      if (refreshState.ok) {
-        setStage("campaigns_refreshed");
-        log("info", result.message || "任务广场陈旧可做列表已刷新，重新寻找下一条评论/点赞互动任务");
-        await delay(Math.max(settings.actionDelayMs || 500, 1200));
-        return startNextAutoTask("retry_after_campaigns_refresh");
+      const refreshingState = runtimeState;
+      const ownsRefresh = () => runtimeState === refreshingState && runtimeState.runId === runId;
+      const isCurrentRefresh = () => ownsRefresh() && isActiveAutoRun(runId);
+      // sendToTab takes this lock before it releases the claim intent, so an
+      // alarm cannot cancel the run between the safe receipt and this branch.
+      refreshingState.marketplaceRefreshInFlight = true;
+      let nextReason;
+      try {
+        const refreshState = await refreshLighthouseCampaignsTab(tabId, result.message || "任务广场陈旧可做列表刷新后继续下一轮", isCurrentRefresh);
+        if (!isCurrentRefresh() || refreshState.cancelled) return { ok: false, cancelled: true, state: runtimeState };
+        if (refreshState.ok) {
+          // A successful plaza reload starts a new idle interval; ordinary
+          // stage transitions must still leave the no-order timer untouched.
+          runtimeState.lastProgressAt = Date.now();
+          setStage("campaigns_refreshed");
+          log("info", result.message || "任务广场陈旧可做列表已刷新，重新寻找下一条评论/点赞互动任务");
+          await delay(Math.max(settings.actionDelayMs || 500, 1200));
+          nextReason = "retry_after_campaigns_refresh";
+        } else if (refreshState.skippedCooldown) {
+          setStage("selecting_task");
+          log("info", refreshState.message || "任务广场刷新冷却中，继续等待列表恢复");
+          await delay(Math.max(15000, settings.actionDelayMs * 2));
+          nextReason = "retry_after_campaigns_refresh_cooldown";
+        } else {
+          runtimeState.running = false;
+          runtimeState.failed += 1;
+          setStage("campaigns_reload_failed");
+          log("error", `任务广场刷新失败，已停止扫描：${refreshState.message || "未确认页面重新加载完成"}`);
+          return { ok: false, error: "任务广场刷新失败，已停止扫描", state: runtimeState };
+        }
+        if (!isCurrentRefresh()) return { ok: false, cancelled: true, state: runtimeState };
+      } finally {
+        if (ownsRefresh()) refreshingState.marketplaceRefreshInFlight = false;
       }
-      if (refreshState.skippedCooldown) {
-        setStage("selecting_task");
-        log("info", refreshState.message || "任务广场刷新冷却中，继续等待列表恢复");
-        await delay(Math.max(15000, settings.actionDelayMs * 2));
-        return startNextAutoTask("retry_after_campaigns_refresh_cooldown");
-      }
-      setStage("task_select_failed");
-      runtimeState.failed += 1;
-      log("warn", "任务广场请求刷新，但刷新失败，按任务选择失败继续恢复");
-      await delay(settings.actionDelayMs * 2);
-      return startNextAutoTask("retry_after_campaigns_refresh_failed");
+      if (!isCurrentRefresh()) return { ok: false, cancelled: true, state: runtimeState };
+      return startNextAutoTask(nextReason);
     }
     if (result?.permanentIgnore) {
       const ignoredTask = result.task || runtimeState.currentTask || {};
       await markPermanentIgnoredTask(ignoredTask, result.ignoredTaskType || ignoredTask.taskType || "非评论");
+      if (!isCurrent()) return cancelled();
       setStage("task_permanently_ignored");
       log("warn", result.message || result.error || "已永久忽略非评论任务，继续寻找下一条评论/点赞互动任务");
       await closeLighthouseTaskDetail(tabId, settings, "永久忽略非评论任务后关闭详情面板");
       await delay(settings.actionDelayMs * 2);
+      if (!isCurrent()) return cancelled();
       return startNextAutoTask("retry_after_permanent_ignore");
     }
     const deferredRelease = result?.deferredRelease === true;
@@ -930,13 +1151,16 @@ async function startNextAutoTask(reason) {
     setStage(deferredRelease ? "task_release_deferred" : "task_select_failed");
     log(transient || deferredRelease ? "info" : "warn", result?.message || result?.error || "任务选择失败，准备尝试下一条");
     await closeLighthouseTaskDetail(tabId, settings, deferredRelease ? "等待下一批放号，关闭详情继续扫描任务广场" : "任务选择失败后关闭详情面板");
-    const reloaded = await reloadLighthouseCampaignsAfterOrder(tabId, deferredRelease ? "已登记放号前重试时间，重新加载任务广场继续检测其他任务" : "接单失败，已重新加载任务广场");
+    if (!isCurrent()) return cancelled();
+    const reloaded = await reloadLighthouseCampaignsAfterOrder(tabId, deferredRelease ? "已登记放号前重试时间，重新加载任务广场继续检测其他任务" : "接单失败，已重新加载任务广场", isCurrent);
+    if (!isCurrent()) return cancelled();
     if (reloaded === false) {
       runtimeState.running = false;
       setStage("campaigns_reload_failed");
       return { ok: false, error: "接单失败后重新加载任务广场失败，已停止扫描", state: runtimeState };
     }
     await delay(settings.actionDelayMs * 2);
+    if (!isCurrent()) return cancelled();
     return startNextAutoTask(deferredRelease ? "retry_after_deferred_release" : "retry_after_task_select_failed");
   }
 
@@ -949,6 +1173,7 @@ async function startNextAutoTask(reason) {
   }
   runtimeState.completionEvidence = null;
   await sendToTab(tabId, { type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId, task: runtimeState.currentTask });
+  if (!isCurrent()) return cancelled();
   // The content script has completed the lock step.  Continue the X handoff
   // in this same background flow so the five-second fallback cannot race an
   // unawaited runtime message from the page.
@@ -956,7 +1181,7 @@ async function startNextAutoTask(reason) {
 }
 
 async function debugOpenCampaigns(windowId = null) {
-  if (runtimeState.uncertainAction || ((runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed) && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId))) {
+  if (runtimeState.uncertainAction || ((runtimeState.currentTask?.invitationAccepted || runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed) && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId))) {
     return { ok: false, error: "旧订单尚未核对，已保留当前订单和页面", state: runtimeState };
   }
   runtimeState = createInitialState();
@@ -964,49 +1189,70 @@ async function debugOpenCampaigns(windowId = null) {
   runtimeState.runId = createRunId();
   runtimeState.running = true;
   runtimeState.mode = "debug";
+  const commandState = runtimeState;
+  const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === commandState && runtimeState.runId === runId && runtimeState.running;
+  const cancelled = () => ({ ok: false, cancelled: true, error: "旧打开广场步骤已取消", state: runtimeState });
 
-  const activeTab = await getActiveLighthouseTab();
+  const activeTab = await getActiveLighthouseTab(isCurrent);
+  if (!isCurrent()) return cancelled();
   if (activeTab) {
     rememberLighthouseTab(activeTab);
     await chrome.tabs.update(activeTab.id, { active: true });
+    if (!isCurrent()) return cancelled();
     await waitForTabComplete(activeTab.id);
+    if (!isCurrent()) return cancelled();
     setStage("lighthouse_page_detected");
     log("info", "已检测到当前 Lighthouse 页面，复用当前页，不重新跳转");
     return { ok: true, state: runtimeState };
   }
 
-  const tab = await getOrCreateLighthouseTab(LIGHTHOUSE_CAMPAIGNS_URL);
+  const tab = await getOrCreateLighthouseTab(LIGHTHOUSE_CAMPAIGNS_URL, isCurrent);
+  if (!isCurrent()) return cancelled();
   rememberLighthouseTab(tab);
   await chrome.tabs.update(tab.id, { url: LIGHTHOUSE_CAMPAIGNS_URL, active: true });
+  if (!isCurrent()) return cancelled();
   await waitForTabComplete(tab.id);
+  if (!isCurrent()) return cancelled();
   setStage("campaigns_opened");
   log("info", "已打开任务广场");
   return { ok: true, state: runtimeState };
 }
 
 async function debugOpenFirstTask() {
-  if (runtimeState.uncertainAction || ((runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed) && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId))) {
+  if (runtimeState.uncertainAction || ((runtimeState.currentTask?.invitationAccepted || runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed) && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId))) {
     return { ok: false, error: "旧订单尚未核对，不能打开另一任务", state: runtimeState };
   }
-  const tabId = await resolveLighthouseTab();
+  const commandState = runtimeState;
+  const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === commandState && runtimeState.runId === runId && runtimeState.running;
+  const cancelled = () => ({ ok: false, cancelled: true, error: "旧打开任务步骤已取消", state: runtimeState });
+  const tabId = await resolveLighthouseTab(isCurrent);
+  if (!isCurrent()) return cancelled();
   const settings = await getSettings();
+  if (!isCurrent()) return cancelled();
   await chrome.tabs.update(tabId, { active: true });
+  if (!isCurrent()) return cancelled();
   await ensurePermanentIgnoredTaskKeysLoaded();
+  if (!isCurrent()) return cancelled();
   let result = await sendToTab(tabId, {
     type: "DEBUG_OPEN_FIRST_COMMENT_TASK",
-    runId: runtimeState.runId,
+    runId,
     settings,
     attemptedTaskKeys: getActiveAttemptedTaskKeys()
   });
+  if (!isCurrent()) return cancelled();
   if (result?.refreshRequested) {
-    const refreshState = await refreshLighthouseCampaignsTab(tabId, result.message || "任务广场陈旧可做列表刷新后重试");
+    const refreshState = await refreshLighthouseCampaignsTab(tabId, result.message || "任务广场陈旧可做列表刷新后重试", isCurrent);
+    if (!isCurrent()) return cancelled();
     if (refreshState.ok) {
       result = await sendToTab(tabId, {
         type: "DEBUG_OPEN_FIRST_COMMENT_TASK",
-        runId: runtimeState.runId,
+        runId,
         settings,
         attemptedTaskKeys: getActiveAttemptedTaskKeys()
       });
+      if (!isCurrent()) return cancelled();
     } else if (refreshState.skippedCooldown) {
       return failStep({ message: refreshState.message }, "任务广场刷新冷却中");
     }
@@ -1014,7 +1260,9 @@ async function debugOpenFirstTask() {
   if (!result || !result.ok) {
     if (result?.permanentIgnore) {
       await markPermanentIgnoredTask(result.task || {}, result.ignoredTaskType || result.task?.taskType || "非评论");
-      await closeLighthouseTaskDetail(tabId, settings, "永久忽略非评论任务后关闭详情");
+      if (!isCurrent()) return cancelled();
+      await closeLighthouseTaskDetail(tabId, settings, "永久忽略非评论任务后关闭详情", isCurrent);
+      if (!isCurrent()) return cancelled();
       setStage("task_permanently_ignored");
       log("warn", result.message || "已永久忽略非评论任务");
       return { ok: true, result, state: runtimeState };
@@ -1030,12 +1278,20 @@ async function debugOpenFirstTask() {
 }
 
 async function debugLockSeatAndOpenTweet() {
-  const tabId = await resolveLighthouseTab();
+  const commandState = runtimeState;
+  const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === commandState && runtimeState.runId === runId && runtimeState.running;
+  const cancelled = () => ({ ok: false, cancelled: true, error: "旧锁定席位步骤已取消", state: runtimeState });
+  const tabId = await resolveLighthouseTab(isCurrent);
+  if (!isCurrent()) return cancelled();
   const settings = await getSettings();
+  if (!isCurrent()) return cancelled();
   await chrome.tabs.update(tabId, { active: true });
+  if (!isCurrent()) return cancelled();
   setStage("locking_seat");
   beginXOpenWatch(tabId, "debug");
-  const result = await sendToTab(tabId, { type: "DEBUG_LOCK_SEAT_AND_EXTRACT", runId: runtimeState.runId, settings });
+  const result = await sendToTab(tabId, { type: "DEBUG_LOCK_SEAT_AND_EXTRACT", runId, settings });
+  if (!isCurrent()) return cancelled();
   if (!result || !result.ok) {
     clearXOpenWatch();
     return failStep(result, "锁定席位或提取推文失败");
@@ -1047,6 +1303,7 @@ async function debugLockSeatAndOpenTweet() {
     waitLogMessage: "锁定席位已点击成功，继续等待平台自动打开 X 推文标签页",
     manualOpenAfterMs: 5000
   });
+  if (!isCurrent()) return cancelled();
   if (!adopted) return failStep(result, runtimeState.lastLockFailureReason || "已点击锁定席位，但未检测到 Lighthouse 自己打开的 X 推文页");
   setStage("tweet_opened");
   log("info", result.message || "已锁定席位并打开 X 推文");
@@ -1076,38 +1333,62 @@ async function debugOpenCurrentDetailTweet() {
 }
 
 async function debugRunXReply() {
-  const tabId = await resolveCurrentXTab({ allowActiveTweetTab: true });
+  const commandState = runtimeState;
+  const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === commandState && runtimeState.runId === runId && runtimeState.running;
+  const cancelled = () => ({ ok: false, cancelled: true, error: "旧回复步骤已取消", state: runtimeState });
+  const tabId = await resolveCurrentXTab({ allowActiveTweetTab: true }, isCurrent);
+  if (!isCurrent()) return cancelled();
   const settings = await getSettings();
+  if (!isCurrent()) return cancelled();
   await chrome.tabs.update(tabId, { active: true });
+  if (!isCurrent()) return cancelled();
   await waitForTabComplete(tabId);
+  if (!isCurrent()) return cancelled();
   await delay(Math.max(settings.actionDelayMs * 2, 2500));
+  if (!isCurrent()) return cancelled();
   const result = await sendToTab(tabId, {
     type: "RUN_X_REPLY",
-    runId: runtimeState.runId,
+    runId,
     task: runtimeState.currentTask,
     settings
   });
+  if (!isCurrent()) return cancelled();
   if (!result || !result.ok) return failStep(result, "X 回复步骤失败");
   runtimeState.lastXResult = result;
   await recordReplyHistory(result);
+  if (!isCurrent()) return cancelled();
   setStage("x_replied");
   log("info", result.message || "X 回复步骤已完成");
   return { ok: true, result, state: runtimeState };
 }
 
 async function debugFastXClaimReplyVerify(selectedTask = null, windowId = null) {
-  if (runtimeState.uncertainAction || ((runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed) && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId))) {
+  const requestedState = runtimeState;
+  const requestedRunId = runtimeState.runId;
+  const ownsRequest = () => runtimeState === requestedState && runtimeState.runId === requestedRunId
+    && runtimeState.running && !runtimeState.manuallyStopped;
+  const cancelled = () => ({ ok: false, cancelled: true, state: runtimeState });
+  if (!ownsRequest()) return cancelled();
+  if (runtimeState.uncertainAction || ((runtimeState.currentTask?.invitationAccepted || runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed) && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId))) {
     return { ok: false, error: "旧订单尚未核对，不能清空后启动快速流程", state: runtimeState };
   }
   const settings = await getSettings();
+  if (!ownsRequest()) return cancelled();
   const selected = selectedTask ? { ...selectedTask } : null;
   runtimeState = createInitialState();
+  runtimeState.stopEpoch = requestedState.stopEpoch;
   setRuntimeWindow(windowId);
   runtimeState.running = true;
   runtimeState.mode = "debug";
+  const fastState = runtimeState;
+  const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === fastState && runtimeState.runId === runId
+    && runtimeState.running && !runtimeState.manuallyStopped;
 
   if (selected && isIgnoredNonCommentTask(selected)) {
     await markPermanentIgnoredTask(selected, selected.taskType || "非评论");
+    if (!isCurrent()) return cancelled();
     runtimeState.running = false;
     setStage("original_tweet_ignored");
     log("warn", `已忽略原创/转发任务，不打开详情：${describeTaskForLog(selected)}`);
@@ -1115,10 +1396,12 @@ async function debugFastXClaimReplyVerify(selectedTask = null, windowId = null) 
   }
 
   const tabId = selected
-    ? await openSelectedTaskTweetTab(selected, settings)
-    : await openNextLighthouseTaskTweetTab(settings);
+    ? await openSelectedTaskTweetTab(selected, settings, isCurrent)
+    : await openNextLighthouseTaskTweetTab(settings, isCurrent);
+  if (!isCurrent()) return cancelled();
   runtimeState.xTabId = tabId;
   await waitForTabComplete(tabId);
+  if (!isCurrent()) return cancelled();
   setStage("fast_claim_waiting");
   log("info", selected
     ? "新流程：已从 Lighthouse 选中任务进入 X，等待任务控件进入抢单窗口"
@@ -1126,10 +1409,11 @@ async function debugFastXClaimReplyVerify(selectedTask = null, windowId = null) 
 
   const claimResult = await sendToTab(tabId, {
     type: "RUN_X_WIDGET_CLAIM",
-    runId: runtimeState.runId,
+    runId,
     task: runtimeState.currentTask,
     settings
   });
+  if (!isCurrent()) return cancelled();
 
   if (!claimResult || !claimResult.ok) {
     runtimeState.failed += 1;
@@ -1144,10 +1428,11 @@ async function debugFastXClaimReplyVerify(selectedTask = null, windowId = null) 
   const replySettings = { ...settings, replyMode: "post" };
   const replyResult = await sendToTab(tabId, {
     type: "RUN_X_REPLY",
-    runId: runtimeState.runId,
+    runId,
     task: runtimeState.currentTask,
     settings: replySettings
   });
+  if (!isCurrent()) return cancelled();
 
   if (!replyResult || !replyResult.ok) {
     runtimeState.failed += 1;
@@ -1157,7 +1442,9 @@ async function debugFastXClaimReplyVerify(selectedTask = null, windowId = null) 
   }
 
   await recordReplyHistory(replyResult);
-  const completionResult = await completeXTaskWidgetLifecycle(tabId, runtimeState.runId, settings);
+  if (!isCurrent()) return cancelled();
+  const completionResult = await completeXTaskWidgetLifecycle(tabId, runId, settings, isCurrent);
+  if (!isCurrent()) return cancelled();
   if (!completionResult?.ok) {
     runtimeState.failed += 1;
     setStage("fast_completion_failed");
@@ -1165,7 +1452,8 @@ async function debugFastXClaimReplyVerify(selectedTask = null, windowId = null) 
     return { ok: false, result: { claimResult, replyResult, completionResult }, state: runtimeState };
   }
 
-  const campaignsResult = await waitForLighthouseTaskCompletionAndReturn(runtimeState.runId, settings);
+  const campaignsResult = await waitForLighthouseTaskCompletionAndReturn(runId, settings, isCurrent);
+  if (!isCurrent()) return cancelled();
   if (!campaignsResult?.ok) {
     runtimeState.failed += 1;
     setStage("fast_completion_failed");
@@ -1179,9 +1467,6 @@ async function debugFastXClaimReplyVerify(selectedTask = null, windowId = null) 
 }
 
 async function startSelectedCountdownTask(selectedTask = null, windowId = null) {
-  if (runtimeState.uncertainAction || ((runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed) && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId))) {
-    return { ok: false, error: "旧订单尚未核对，不能切换到另一订单", state: runtimeState };
-  }
   if (!selectedTask) {
     log("error", "未选中倒计时任务，请先在任务倒计时列表点击一条任务");
     return { ok: false, error: "未选中任务", state: runtimeState };
@@ -1190,35 +1475,53 @@ async function startSelectedCountdownTask(selectedTask = null, windowId = null) 
     log("warn", "选中启动指令正在处理，请勿重复点击");
     return { ok: false, error: "选中启动正在处理", state: runtimeState };
   }
+  if (runtimeState.currentTask?.invitationAccepted && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId)) {
+    return { ok: false, error: "已接受邀请的订单尚未完成，请继续处理本单", state: runtimeState };
+  }
 
-  selectedStartInFlight = true;
+  const selectedStartOwner = {};
+  selectedStartInFlight = selectedStartOwner;
+  const stopEpoch = runtimeState.stopEpoch;
   try {
-    if (runtimeState.running) {
+    if (runtimeState.running || runtimeState.currentTask || runtimeState.uncertainAction) {
+      const previousState = runtimeState;
+      const previousRunId = runtimeState.runId;
+      const isCurrent = () => runtimeState === previousState && runtimeState.runId === previousRunId && runtimeState.stopEpoch === stopEpoch;
       const previousMode = runtimeState.mode || "当前";
       log("info", `选中启动：正在停止 ${previousMode} 流程并接管选中任务`);
       await Promise.all([
-        cancelCurrentRun(),
+        cancelCurrentRun(isCurrent),
         clearAutoRunResumeSchedule()
       ]);
+      if (!isCurrent()) return { ok: false, cancelled: true, state: runtimeState };
+      if (runtimeState.uncertainAction && hasIdentifiedUncertainAction(runtimeState)) {
+        return { ok: false, uncertain: true, error: "旧动作尚未核对，已保留执行记录，不能启动选中任务", state: runtimeState };
+      }
       runtimeState.scheduledResumeAt = 0;
       runtimeState.runId = createRunId();
     }
     return await runSelectedCountdownTask(selectedTask, windowId);
   } finally {
-    selectedStartInFlight = false;
+    if (selectedStartInFlight === selectedStartOwner) selectedStartInFlight = false;
   }
 }
 
 async function runSelectedCountdownTask(selectedTask = null, windowId = null) {
-  if (runtimeState.uncertainAction || ((runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed) && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId))) {
-    return { ok: false, error: "旧订单尚未核对，不能切换到另一订单", state: runtimeState };
-  }
+  const previousStopEpoch = runtimeState.stopEpoch;
   runtimeState = createInitialState();
+  runtimeState.stopEpoch = previousStopEpoch;
   setRuntimeWindow(windowId);
   runtimeState.runId = createRunId();
   runtimeState.running = true;
   runtimeState.mode = "selected_once";
+  const startingState = runtimeState;
+  const runId = runtimeState.runId;
+  const stopEpoch = runtimeState.stopEpoch;
+  const ownsRun = () => runtimeState === startingState && runtimeState.runId === runId && runtimeState.stopEpoch === stopEpoch;
+  const isCurrent = () => ownsRun() && runtimeState.running;
+  const cancelled = () => ({ ok: false, cancelled: true, state: runtimeState });
   await ensureAutoRunKeepalive();
+  if (!isCurrent()) return cancelled();
 
   if (!selectedTask) {
     runtimeState.running = false;
@@ -1228,6 +1531,7 @@ async function runSelectedCountdownTask(selectedTask = null, windowId = null) {
   }
   if (isIgnoredNonCommentTask(selectedTask)) {
     await markPermanentIgnoredTask(selectedTask, selectedTask.taskType || "非评论");
+    if (!isCurrent()) return cancelled();
     runtimeState.running = false;
     setStage("selected_original_tweet_ignored");
     log("warn", `已忽略原创/转发任务，不打开详情：${describeTaskForLog(selectedTask)}`);
@@ -1235,6 +1539,7 @@ async function runSelectedCountdownTask(selectedTask = null, windowId = null) {
   }
 
   const settings = await getSettings();
+  if (!isCurrent()) return cancelled();
   if (settings.replyMode !== "post") {
     runtimeState.running = false;
     setStage("selected_task_blocked");
@@ -1248,41 +1553,49 @@ async function runSelectedCountdownTask(selectedTask = null, windowId = null) {
     return { ok: false, error: "选中启动需要开启自动提交 Lighthouse", state: runtimeState };
   }
 
-  const lighthouseTabId = await resolveLighthouseTab();
-  await rememberLighthouseTabById(lighthouseTabId);
+  const lighthouseTabId = await resolveLighthouseTab(isCurrent);
+  if (!isCurrent()) return cancelled();
+  await rememberLighthouseTabById(lighthouseTabId, isCurrent);
+  if (!isCurrent()) return cancelled();
   await chrome.tabs.update(lighthouseTabId, { active: true });
+  if (!isCurrent()) return cancelled();
   await waitForTabComplete(lighthouseTabId);
+  if (!isCurrent()) return cancelled();
   setStage("selected_task_opening");
   log("info", `选中启动：打开任务详情 ${selectedTask.bounty || "?"}LUX · ${selectedTask.title || selectedTask.taskType || "任务"}`);
 
   const openResult = await sendToTab(lighthouseTabId, {
     type: "OPEN_SELECTED_COUNTDOWN_TASK_DETAIL",
-    runId: runtimeState.runId,
+    runId,
     settings,
     selectedTask
   });
+  if (!ownsRun()) return cancelled();
 
   if (!openResult || !openResult.ok) {
     runtimeState.running = false;
     runtimeState.failed += 1;
     setStage("selected_task_open_failed");
     log("error", openResult?.message || openResult?.error || "选中任务详情打开失败");
-    await closeLighthouseTaskDetail(lighthouseTabId, settings, "选中任务打开失败后关闭详情");
+    await closeLighthouseTaskDetail(lighthouseTabId, settings, "选中任务打开失败后关闭详情", ownsRun);
+    if (!ownsRun()) return cancelled();
     return { ok: false, result: openResult, state: runtimeState };
   }
 
   runtimeState.currentTask = openResult.task || { selectedTask };
   setStage("selected_countdown_waiting");
   log("info", openResult.message || "已打开选中任务详情，等待倒计时窗口");
-  const selectedForLock = await waitForSelectedCountdownWindow(selectedTask, settings);
+  const selectedForLock = await waitForSelectedCountdownWindow(selectedTask, settings, isCurrent);
+  if (!isCurrent() || !selectedForLock) return cancelled();
 
   beginXOpenWatch(lighthouseTabId, "selected_once");
   const lockResult = await sendToTab(lighthouseTabId, {
     type: "WAIT_SELECTED_COUNTDOWN_AND_LOCK",
-    runId: runtimeState.runId,
+    runId,
     settings,
     selectedTask: selectedForLock
   });
+  if (!isCurrent()) return cancelled();
 
   if (!lockResult || !lockResult.ok) {
     clearXOpenWatch();
@@ -1290,7 +1603,8 @@ async function runSelectedCountdownTask(selectedTask = null, windowId = null) {
     runtimeState.failed += 1;
     setStage("selected_lock_failed");
     log("warn", lockResult?.message || lockResult?.error || "10 秒内锁定按钮未可点击，关闭详情并结束本次选中启动");
-    await closeLighthouseTaskDetail(lighthouseTabId, settings, "选中任务锁定失败后关闭详情");
+    await closeLighthouseTaskDetail(lighthouseTabId, settings, "选中任务锁定失败后关闭详情", ownsRun);
+    if (!ownsRun()) return cancelled();
     return { ok: false, result: lockResult, state: runtimeState };
   }
 
@@ -1307,25 +1621,30 @@ async function runSelectedCountdownTask(selectedTask = null, windowId = null) {
     waitLogMessage: "锁定席位已点击成功，继续等待平台自动打开 X 推文标签页",
     manualOpenAfterMs: 5000
   });
+  if (!isCurrent()) return cancelled();
   if (!adopted || !runtimeState.xTabId) {
     runtimeState.running = false;
     runtimeState.failed += 1;
     setStage("selected_x_open_failed");
     const message = runtimeState.lastLockFailureReason || "已点击锁定，但 30 秒内未检测到平台自动打开的 X 推文页";
     log("error", message);
-    await closeLighthouseTaskDetail(lighthouseTabId, settings, "X 未打开后关闭任务详情");
+    await closeLighthouseTaskDetail(lighthouseTabId, settings, "X 未打开后关闭任务详情", ownsRun);
+    if (!ownsRun()) return cancelled();
     return { ok: false, error: message, state: runtimeState };
   }
 
   setStage("tweet_opened");
   log("info", "已接管平台自动打开的 X 推文页，继续旧流程第 4 步回复");
-  await waitForXReadyBeforeReply(runtimeState.xTabId, settings);
-  const replyResult = await sendToTab(runtimeState.xTabId, {
+  const xTabId = runtimeState.xTabId;
+  await waitForXReadyBeforeReply(xTabId, settings, isCurrent);
+  if (!isCurrent()) return cancelled();
+  const replyResult = await sendToTab(xTabId, {
     type: "RUN_X_REPLY",
-    runId: runtimeState.runId,
+    runId,
     task: runtimeState.currentTask,
     settings
   });
+  if (!isCurrent()) return cancelled();
 
   if (!replyResult || !replyResult.ok) {
     runtimeState.running = false;
@@ -1338,7 +1657,9 @@ async function runSelectedCountdownTask(selectedTask = null, windowId = null) {
 
   runtimeState.lastXResult = replyResult;
   await recordReplyHistory(replyResult);
-  const completionResult = await completeXTaskWidgetLifecycle(runtimeState.xTabId, runtimeState.runId, settings);
+  if (!isCurrent()) return cancelled();
+  const completionResult = await completeXTaskWidgetLifecycle(xTabId, runId, settings, isCurrent);
+  if (!isCurrent()) return cancelled();
   if (!completionResult?.ok) {
     runtimeState.failed += 1;
     log("warn", completionResult?.message || completionResult?.error || "X 任务闭环未确认，保留当前页面");
@@ -1347,7 +1668,8 @@ async function runSelectedCountdownTask(selectedTask = null, windowId = null) {
     return { ok: false, result: { openResult, lockResult, replyResult, completionResult }, state: runtimeState };
   }
 
-  const campaignsResult = await waitForLighthouseTaskCompletionAndReturn(runtimeState.runId, settings);
+  const campaignsResult = await waitForLighthouseTaskCompletionAndReturn(runId, settings, isCurrent);
+  if (!isCurrent()) return cancelled();
   if (!campaignsResult?.ok) {
     runtimeState.failed += 1;
     runtimeState.running = false;
@@ -1357,14 +1679,20 @@ async function runSelectedCountdownTask(selectedTask = null, windowId = null) {
   }
   runtimeState.completed += 1;
 
-  await closeLighthouseDetailToCampaigns(lighthouseTabId, settings, "选中启动完成后关闭任务详情回到广场");
+  await closeLighthouseDetailToCampaigns(lighthouseTabId, settings, "选中启动完成后关闭任务详情回到广场", isCurrent);
+  if (!isCurrent()) return cancelled();
   runtimeState.running = false;
   setStage("selected_flow_done");
   log("info", "选中启动流程已结束，已回到任务广场");
   return { ok: true, result: { openResult, lockResult, replyResult, completionResult, campaignsResult }, state: runtimeState };
 }
 
-async function waitForSelectedCountdownWindow(selectedTask, settings) {
+async function waitForSelectedCountdownWindow(selectedTask, settings, stillCurrent = null) {
+  const waitingState = runtimeState;
+  const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === waitingState && runtimeState.runId === runId
+    && runtimeState.running && runtimeState.mode === "selected_once" && (!stillCurrent || stillCurrent());
+  if (!isCurrent()) return null;
   const remainingMs = Math.max(0, Math.ceil(Number(selectedTask?.countdownSec || 0)) * 1000);
   const waitBeforeWindowMs = Math.max(0, remainingMs - 5000);
   if (waitBeforeWindowMs <= 0) {
@@ -1374,46 +1702,60 @@ async function waitForSelectedCountdownWindow(selectedTask, settings) {
   const started = Date.now();
   let lastLogAt = 0;
   while (Date.now() - started < waitBeforeWindowMs) {
-    if (!runtimeState.running || runtimeState.mode !== "selected_once") {
-      throw new Error("选中启动已停止");
-    }
+    if (!isCurrent()) return null;
     const leftMs = waitBeforeWindowMs - (Date.now() - started);
     if (Date.now() - lastLogAt > 5000) {
       lastLogAt = Date.now();
       log("info", `选中任务倒计时等待中，约 ${formatDuration(leftMs + 5000)} 后进入锁定窗口`);
     }
     await delay(Math.min(1000, Math.max(250, leftMs)));
+    if (!isCurrent()) return null;
   }
   await delay(randomBetween(0, Math.min(500, Math.max(0, settings.cooldownPollMs || 500))));
+  if (!isCurrent()) return null;
   return { ...(selectedTask || {}), countdownSec: 5 };
 }
 
-async function openNextLighthouseTaskTweetTab(settings) {
+async function openNextLighthouseTaskTweetTab(settings, stillCurrent = null) {
+  const openingState = runtimeState;
+  const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === openingState && runtimeState.runId === runId
+    && runtimeState.running && !runtimeState.manuallyStopped && (!stillCurrent || stillCurrent());
+  if (!isCurrent()) return null;
   setStage("lighthouse_opening_for_fast_flow");
-  const tab = await getOrCreateLighthouseTab(LIGHTHOUSE_CAMPAIGNS_URL);
+  const tab = await getOrCreateLighthouseTab(LIGHTHOUSE_CAMPAIGNS_URL, isCurrent);
+  if (!isCurrent()) return null;
   const lighthouseTabId = tab.id;
-  await rememberLighthouseTabById(lighthouseTabId);
+  await rememberLighthouseTabById(lighthouseTabId, isCurrent);
+  if (!isCurrent()) return null;
   await chrome.tabs.update(lighthouseTabId, { url: LIGHTHOUSE_CAMPAIGNS_URL, active: true });
+  if (!isCurrent()) return null;
   await waitForTabComplete(lighthouseTabId);
+  if (!isCurrent()) return null;
   await delay(Math.max(settings.actionDelayMs || 500, 1200));
+  if (!isCurrent()) return null;
   log("info", "未选择倒计时任务，已回到 Lighthouse 任务广场准备打开评论/点赞互动任务");
   await ensurePermanentIgnoredTaskKeysLoaded();
+  if (!isCurrent()) return null;
 
   let openResult = await sendToTab(lighthouseTabId, {
     type: "DEBUG_OPEN_FIRST_COMMENT_TASK",
-    runId: runtimeState.runId,
+    runId,
     settings,
     attemptedTaskKeys: getActiveAttemptedTaskKeys()
   });
+  if (!isCurrent()) return null;
   if (openResult?.refreshRequested) {
-    const refreshState = await refreshLighthouseCampaignsTab(lighthouseTabId, openResult.message || "任务广场陈旧可做列表刷新后重试快抢入口");
+    const refreshState = await refreshLighthouseCampaignsTab(lighthouseTabId, openResult.message || "任务广场陈旧可做列表刷新后重试快抢入口", isCurrent);
+    if (!isCurrent()) return null;
     if (refreshState.ok) {
       openResult = await sendToTab(lighthouseTabId, {
         type: "DEBUG_OPEN_FIRST_COMMENT_TASK",
-        runId: runtimeState.runId,
+        runId,
         settings,
         attemptedTaskKeys: getActiveAttemptedTaskKeys()
       });
+      if (!isCurrent()) return null;
     } else if (refreshState.skippedCooldown) {
       throw new Error(refreshState.message || "任务广场刷新冷却中，请稍后再试");
     }
@@ -1421,7 +1763,9 @@ async function openNextLighthouseTaskTweetTab(settings) {
   if (!openResult || !openResult.ok) {
     if (openResult?.permanentIgnore) {
       await markPermanentIgnoredTask(openResult.task || {}, openResult.ignoredTaskType || openResult.task?.taskType || "非评论");
-      await closeLighthouseTaskDetail(lighthouseTabId, settings, "永久忽略非评论任务后关闭详情");
+      if (!isCurrent()) return null;
+      await closeLighthouseTaskDetail(lighthouseTabId, settings, "永久忽略非评论任务后关闭详情", isCurrent);
+      if (!isCurrent()) return null;
     }
     throw new Error(openResult?.message || openResult?.error || "未能从 Lighthouse 任务广场打开评论/点赞互动任务详情");
   }
@@ -1435,9 +1779,10 @@ async function openNextLighthouseTaskTweetTab(settings) {
   beginXOpenWatch(lighthouseTabId, "debug");
   const targetResult = await sendToTab(lighthouseTabId, {
     type: "OPEN_CURRENT_DETAIL_TWEET_TARGET",
-    runId: runtimeState.runId,
+    runId,
     settings
   });
+  if (!isCurrent()) return null;
   if (!targetResult || !targetResult.ok) {
     clearXOpenWatch();
     throw new Error(targetResult?.message || targetResult?.error || "已打开任务详情，但未能点击在 X 打开/前往目标");
@@ -1446,51 +1791,70 @@ async function openNextLighthouseTaskTweetTab(settings) {
   runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, targetResult.task);
   markAttemptedTask(runtimeState.currentTask);
 
-  const tweetTabId = await ensureTweetTabAfterTargetClick(lighthouseTabId, settings, runtimeState.currentTask, "debug");
+  const tweetTabId = await ensureTweetTabAfterTargetClick(lighthouseTabId, settings, runtimeState.currentTask, "debug", isCurrent);
+  if (!isCurrent()) return null;
   if (tweetTabId) return tweetTabId;
   throw new Error("已点击在 X 打开/前往目标，但多次复核仍未检测到 Lighthouse 打开的 X 推文页");
 }
 
-async function openSelectedTaskTweetTab(selectedTask, settings) {
+async function openSelectedTaskTweetTab(selectedTask, settings, stillCurrent = null) {
+  const openingState = runtimeState;
+  const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === openingState && runtimeState.runId === runId
+    && runtimeState.running && !runtimeState.manuallyStopped && (!stillCurrent || stillCurrent());
+  if (!isCurrent()) return null;
   if (isIgnoredNonCommentTask(selectedTask)) {
     throw new Error("已忽略原创/转发任务，不打开详情");
   }
   setStage("selected_task_opening");
-  const lighthouseTabId = await resolveLighthouseTab();
-  await rememberLighthouseTabById(lighthouseTabId);
+  const lighthouseTabId = await resolveLighthouseTab(isCurrent);
+  if (!isCurrent()) return null;
+  await rememberLighthouseTabById(lighthouseTabId, isCurrent);
+  if (!isCurrent()) return null;
   await chrome.tabs.update(lighthouseTabId, { active: true });
+  if (!isCurrent()) return null;
   await waitForTabComplete(lighthouseTabId);
+  if (!isCurrent()) return null;
   log("info", `已选择倒计时任务，打开详情提取推文链接：${selectedTask.bounty || "?"}LUX · ${selectedTask.title || selectedTask.taskType || "任务"}`);
   beginXOpenWatch(lighthouseTabId, "debug");
 
   const result = await sendToTab(lighthouseTabId, {
     type: "OPEN_SELECTED_COUNTDOWN_TASK_TWEET",
-    runId: runtimeState.runId,
+    runId,
     settings,
     selectedTask
   });
+  if (!isCurrent()) return null;
   if (!result || !result.ok) {
     clearXOpenWatch();
     throw new Error(result?.message || result?.error || "选中任务详情未找到可点击的在 X 打开/前往目标控件");
   }
 
   runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, result.task);
-  const tweetTabId = await ensureTweetTabAfterTargetClick(lighthouseTabId, settings, result.task, "debug");
+  const tweetTabId = await ensureTweetTabAfterTargetClick(lighthouseTabId, settings, result.task, "debug", isCurrent);
+  if (!isCurrent()) return null;
   if (tweetTabId) return tweetTabId;
   throw new Error("已点击在 X 打开控件，但多次复核仍未检测到 Lighthouse 打开的 X 推文页");
 }
 
-async function ensureTweetTabAfterTargetClick(lighthouseTabId, settings, task, mode) {
+async function ensureTweetTabAfterTargetClick(lighthouseTabId, settings, task, mode, stillCurrent = null) {
+  const openingState = runtimeState;
+  const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === openingState && runtimeState.runId === runId
+    && runtimeState.running && !runtimeState.manuallyStopped && (!stillCurrent || stillCurrent());
+  if (!isCurrent()) return null;
   runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, task);
   const maxAttempts = 4;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const directTabId = await openDirectTweetTabIfAvailable(runtimeState.currentTask, lighthouseTabId);
+    const directTabId = await openDirectTweetTabIfAvailable(runtimeState.currentTask, lighthouseTabId, { isCurrent });
+    if (!isCurrent()) return null;
     if (directTabId) return directTabId;
 
     const adopted = await waitForLighthouseOpenedTweet(runtimeState.currentTask, lighthouseTabId, mode, {
       timeoutMs: attempt === maxAttempts ? 10000 : 5000,
       logEveryMs: 2500
     });
+    if (!isCurrent()) return null;
     if (adopted && runtimeState.xTabId) {
       log("info", `已接管 Lighthouse 打开的 X 推文：${runtimeState.currentTask?.tweetUrl || ""}`);
       return runtimeState.xTabId;
@@ -1501,14 +1865,18 @@ async function ensureTweetTabAfterTargetClick(lighthouseTabId, settings, task, m
 
     log("warn", `X 推文标签未出现，第 ${attempt + 1}/${maxAttempts} 次重新点击在 X 打开/前往目标`);
     await chrome.tabs.update(lighthouseTabId, { active: true });
+    if (!isCurrent()) return null;
     await waitForTabComplete(lighthouseTabId);
+    if (!isCurrent()) return null;
     await delay(Math.max(settings.actionDelayMs || 500, 800));
+    if (!isCurrent()) return null;
     beginXOpenWatch(lighthouseTabId, mode);
     const retryResult = await sendToTab(lighthouseTabId, {
       type: "OPEN_CURRENT_DETAIL_TWEET_TARGET",
-      runId: runtimeState.runId,
+      runId,
       settings
     });
+    if (!isCurrent()) return null;
     if (!retryResult || !retryResult.ok) {
       throw new Error(retryResult?.message || retryResult?.error || "重新点击在 X 打开/前往目标失败");
     }
@@ -1518,15 +1886,22 @@ async function ensureTweetTabAfterTargetClick(lighthouseTabId, settings, task, m
 }
 
 async function openDirectTweetTabIfAvailable(task, lighthouseTabId, options = {}) {
+  const openingState = runtimeState;
+  const openingRunId = runtimeState.runId;
+  const isCurrent = () => runtimeState === openingState && runtimeState.runId === openingRunId
+    && !runtimeState.manuallyStopped && (!options.isCurrent || options.isCurrent());
+  if (!isCurrent()) return null;
   const tweetUrl = normalizeTweetUrl(task?.tweetUrl);
   if (!tweetUrl || (task?.awaitingXTabAdoption && !options.allowAwaitingXTabAdoption)) return null;
-  const existing = await getBoundMatchingTaskXTab(tweetUrl);
+  const existing = await getBoundMatchingTaskXTab(tweetUrl, isCurrent);
+  if (!isCurrent()) return null;
   if (existing) return existing.id;
   if (directTweetOpenPromise) return directTweetOpenPromise;
 
   const runId = runtimeState.runId;
   const opening = (async () => {
-    const rebound = await getBoundMatchingTaskXTab(tweetUrl);
+    const rebound = await getBoundMatchingTaskXTab(tweetUrl, isCurrent);
+    if (!isCurrent()) return null;
     if (rebound) return rebound.id;
     if (runtimeState.runId !== runId || !runtimeState.running) return null;
 
@@ -1539,6 +1914,7 @@ async function openDirectTweetTabIfAvailable(task, lighthouseTabId, options = {}
           pending.windowId,
           tweetUrl
         );
+      if (!isCurrent()) return null;
       if (siteCandidate) {
         adoptCurrentXTab(siteCandidate, task, "site");
         return siteCandidate.id;
@@ -1550,7 +1926,9 @@ async function openDirectTweetTabIfAvailable(task, lighthouseTabId, options = {}
     const targetWindowId = getRuntimeWindowId();
     if (Number.isInteger(targetWindowId)) createProperties.windowId = targetWindowId;
     const tweetTab = await chrome.tabs.create(createProperties);
+    if (!isCurrent()) return null;
     await focusTaskXTab(tweetTab.id, tweetTab.windowId);
+    if (!isCurrent()) return null;
     runtimeState.xTabId = tweetTab.id;
     runtimeState.xTabWindowId = tweetTab.windowId;
     runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, task, {
@@ -1637,9 +2015,15 @@ function formatReplyDiagnosticLogLine(item) {
 }
 
 async function debugCloseXReturnLighthouse() {
-  const tabId = await resolveLighthouseTab();
+  const commandState = runtimeState;
+  const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === commandState && runtimeState.runId === runId && runtimeState.running;
+  const cancelled = () => ({ ok: false, cancelled: true, error: "旧关闭 X 步骤已取消", state: runtimeState });
+  const tabId = await resolveLighthouseTab(isCurrent);
+  if (!isCurrent()) return cancelled();
   if (!runtimeState.xTabId) {
     const activeTweetTab = await getActiveTweetTab({ windowId: getRuntimeWindowId() });
+    if (!isCurrent()) return cancelled();
     if (activeTweetTab) {
       runtimeState.xTabId = activeTweetTab.id;
       runtimeState.xTabWindowId = activeTweetTab.windowId;
@@ -1647,20 +2031,29 @@ async function debugCloseXReturnLighthouse() {
   }
 
   if (runtimeState.xTabId) {
-    const closed = await closeRecordedXTab("调试流程：已关闭 X 标签页");
+    const closed = await closeRecordedXTab("调试流程：已关闭 X 标签页", isCurrent);
+    if (!isCurrent()) return cancelled();
     if (!closed) return failStep(null, "关闭 X 标签页失败，停止后续流程");
   }
 
   await chrome.tabs.update(tabId, { active: true });
+  if (!isCurrent()) return cancelled();
   setStage("returned_lighthouse");
   log("info", "已关闭 X 并回到 Lighthouse");
   return { ok: true, state: runtimeState };
 }
 
 async function debugCompleteXTaskWidget() {
-  const tabId = runtimeState.xTabId || (await resolveCurrentXTab({ allowActiveTweetTab: true }));
+  const commandState = runtimeState;
+  const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === commandState && runtimeState.runId === runId && runtimeState.running;
+  const cancelled = () => ({ ok: false, cancelled: true, error: "旧提交步骤已取消", state: runtimeState });
+  const tabId = runtimeState.xTabId || (await resolveCurrentXTab({ allowActiveTweetTab: true }, isCurrent));
+  if (!isCurrent()) return cancelled();
   const settings = await getSettings();
-  const result = await completeXTaskWidgetLifecycle(tabId, runtimeState.runId, settings);
+  if (!isCurrent()) return cancelled();
+  const result = await completeXTaskWidgetLifecycle(tabId, runId, settings);
+  if (!isCurrent()) return cancelled();
   if (!result?.ok) {
     setStage("x_task_completion_failed");
     log("warn", result?.message || "X 任务提交未确认，保留当前页面");
@@ -1671,8 +2064,14 @@ async function debugCompleteXTaskWidget() {
 }
 
 async function debugWaitLighthouseCompletionReturn() {
+  const commandState = runtimeState;
+  const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === commandState && runtimeState.runId === runId && runtimeState.running;
+  const cancelled = () => ({ ok: false, cancelled: true, error: "旧核对步骤已取消", state: runtimeState });
   const settings = await getSettings();
-  const result = await waitForLighthouseTaskCompletionAndReturn(runtimeState.runId, settings);
+  if (!isCurrent()) return cancelled();
+  const result = await waitForLighthouseTaskCompletionAndReturn(runId, settings, isCurrent);
+  if (!isCurrent()) return cancelled();
   if (!result?.ok) {
     setStage("lighthouse_completion_failed");
     log("warn", result?.message || "Lighthouse 未确认任务完成，保留 X 页面");
@@ -1683,10 +2082,18 @@ async function debugWaitLighthouseCompletionReturn() {
 }
 
 async function debugClickDone() {
-  const tabId = await resolveLighthouseTab();
+  const commandState = runtimeState;
+  const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === commandState && runtimeState.runId === runId && runtimeState.running;
+  const cancelled = () => ({ ok: false, cancelled: true, error: "旧完成步骤已取消", state: runtimeState });
+  const tabId = await resolveLighthouseTab(isCurrent);
+  if (!isCurrent()) return cancelled();
   const settings = await getSettings();
+  if (!isCurrent()) return cancelled();
   await chrome.tabs.update(tabId, { active: true });
-  const result = await sendToTab(tabId, { type: "DEBUG_CLICK_I_DONE", runId: runtimeState.runId, settings });
+  if (!isCurrent()) return cancelled();
+  const result = await sendToTab(tabId, { type: "DEBUG_CLICK_I_DONE", runId, settings });
+  if (!isCurrent()) return cancelled();
   if (!result || !result.ok) return failStep(result, "点击我已完成失败");
   runtimeState.completed += 1;
   setStage("done_clicked");
@@ -1695,9 +2102,17 @@ async function debugClickDone() {
 }
 
 async function debugReturnCampaigns() {
-  const tabId = await resolveLighthouseTab();
+  const commandState = runtimeState;
+  const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === commandState && runtimeState.runId === runId && runtimeState.running;
+  const cancelled = () => ({ ok: false, cancelled: true, error: "旧返回广场步骤已取消", state: runtimeState });
+  const tabId = await resolveLighthouseTab(isCurrent);
+  if (!isCurrent()) return cancelled();
   const settings = await getSettings();
-  await closeLighthouseDetailToCampaigns(tabId, settings, "调试流程：关闭任务详情回到广场");
+  if (!isCurrent()) return cancelled();
+  const closed = await closeLighthouseDetailToCampaigns(tabId, settings, "调试流程：关闭任务详情回到广场", isCurrent);
+  if (!isCurrent()) return cancelled();
+  if (!closed) return failStep({ message: "未确认任务详情已关闭，已保留当前页面" }, "返回任务广场失败");
   setStage("campaigns_returned");
   log("info", "已回到任务广场");
   return { ok: true, state: runtimeState };
@@ -1705,11 +2120,16 @@ async function debugReturnCampaigns() {
 
 async function adoptTargetOpenedTweet(task, lighthouseTabId, mode) {
   if (!runtimeState.running) return { ok: false, error: "Run is not active", state: runtimeState };
+  const adoptingState = runtimeState;
   const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === adoptingState && runtimeState.runId === runId && runtimeState.running;
+  const cancelled = () => ({ ok: false, cancelled: true, state: runtimeState });
   runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, task);
   runtimeState.mode = mode || runtimeState.mode;
-  if (lighthouseTabId) await rememberLighthouseTabById(lighthouseTabId);
+  if (lighthouseTabId) await rememberLighthouseTabById(lighthouseTabId, isCurrent);
+  if (!isCurrent()) return cancelled();
   const settings = await getSettings();
+  if (!isCurrent()) return cancelled();
   // Lighthouse commonly opens the target tweet asynchronously after a seat is
   // locked. Waiting for that tab first avoids opening the same tweet twice.
   let adopted = await waitForLighthouseOpenedTweet(runtimeState.currentTask, runtimeState.lighthouseTabId, runtimeState.mode, {
@@ -1718,11 +2138,13 @@ async function adoptTargetOpenedTweet(task, lighthouseTabId, mode) {
     waitLogMessage: "锁定席位已点击成功，继续等待平台自动打开 X 推文标签页",
     manualOpenAfterMs: SITE_X_OPEN_WAIT_MS
   });
+  if (!isCurrent()) return cancelled();
   if (!adopted) {
     const directTweetTabId = await openDirectTweetTabIfAvailable(
       runtimeState.currentTask,
       runtimeState.lighthouseTabId
     );
+    if (!isCurrent()) return cancelled();
     if (directTweetTabId) {
       runtimeState.xTabId = directTweetTabId;
       adopted = true;
@@ -1755,14 +2177,19 @@ async function adoptTargetOpenedTweet(task, lighthouseTabId, mode) {
     : "已检测到 Lighthouse 官网打开的目标 X 推文页");
   if (runtimeState.mode !== "auto") return { ok: true, state: runtimeState };
 
-  runtimeState.incomeAtTaskStart = await readPlazaTodayIncome(runtimeState.lighthouseTabId, runId);
-  await waitForXReadyBeforeReply(runtimeState.xTabId, settings);
-  const replyResult = await sendToTab(runtimeState.xTabId, {
+  const incomeAtTaskStart = await readPlazaTodayIncome(runtimeState.lighthouseTabId, runId);
+  if (!isCurrent()) return cancelled();
+  runtimeState.incomeAtTaskStart = incomeAtTaskStart;
+  const xTabId = runtimeState.xTabId;
+  await waitForXReadyBeforeReply(xTabId, settings, isCurrent);
+  if (!isCurrent()) return cancelled();
+  const replyResult = await sendToTab(xTabId, {
     type: "RUN_X_REPLY",
     runId,
     task: runtimeState.currentTask,
     settings
   });
+  if (!isCurrent()) return cancelled();
   if (!replyResult || !replyResult.ok) {
     return recoverAndContinue(replyResult?.message || replyResult?.error || "接管当前 X 标签页后回复失败，退回任务广场继续下一单", {
       runId,
@@ -1773,25 +2200,45 @@ async function adoptTargetOpenedTweet(task, lighthouseTabId, mode) {
   return handleXReplyResult(replyResult, { runId });
 }
 
-async function waitForXReadyBeforeReply(tabId, settings) {
+async function waitForXReadyBeforeReply(tabId, settings, stillCurrent = null) {
+  const waitingState = runtimeState;
+  const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === waitingState && runtimeState.runId === runId
+    && runtimeState.running && (!stillCurrent || stillCurrent());
+  if (!isCurrent()) return false;
   setStage("waiting_x_ready");
   await focusTaskXTab(tabId);
+  if (!isCurrent()) return false;
   log("info", "X 推文页已打开并切到前台，等待页面加载和前端水合后再回复");
   await waitForTabComplete(tabId);
+  if (!isCurrent()) return false;
   await delay(Math.max(settings.actionDelayMs * 2, 2500));
+  return isCurrent();
 }
 
-async function focusTaskXTab(tabId, knownWindowId = null) {
+async function focusTaskXTab(tabId, knownWindowId = null, stillCurrent = null) {
+  const focusingState = runtimeState;
+  const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === focusingState && runtimeState.runId === runId
+    && runtimeState.running && (!stillCurrent || stillCurrent());
+  if (!isCurrent()) return null;
   if (!Number.isInteger(tabId)) throw new Error("缺少当前 X 标签页，无法切到前台");
   const tab = await chrome.tabs.update(tabId, { active: true });
+  if (!isCurrent()) return null;
   const windowId = Number.isInteger(knownWindowId) ? knownWindowId : tab.windowId;
   if (Number.isInteger(windowId)) await chrome.windows.update(windowId, { focused: true });
+  if (!isCurrent()) return null;
   runtimeState.xTabId = tab.id;
   runtimeState.xTabWindowId = tab.windowId;
   return tab;
 }
 
-async function completeXTaskWidgetLifecycle(tabId, runId, settings) {
+async function completeXTaskWidgetLifecycle(tabId, runId, settings, stillCurrent = null) {
+  const completingState = runtimeState;
+  const isCurrent = () => runtimeState === completingState && runtimeState.runId === runId
+    && runtimeState.running && (!stillCurrent || stillCurrent());
+  const cancelled = () => ({ ok: false, cancelled: true });
+  if (!isCurrent()) return cancelled();
   if (!tabId) return { ok: false, message: "未记录当前 X 标签页，无法提交任务" };
   setStage("x_task_completion_waiting");
   log("info", "X 动作已完成，按任务实际停留进度等待控件解锁提交");
@@ -1805,12 +2252,13 @@ async function completeXTaskWidgetLifecycle(tabId, runId, settings) {
     .then((result) => result ? { source: "lighthouse", result } : new Promise(() => {}));
   const outcome = await Promise.race([xSubmission, officialCompletion]);
   completionWatch.cancelled = true;
-  if (runId !== runtimeState.runId || !runtimeState.running) return { ok: false, cancelled: true };
+  if (!isCurrent()) return cancelled();
 
   if (outcome.source === "lighthouse") {
     // The platform's own verified-and-paid result is stronger evidence than a
     // still-pending X companion widget. Stop that stale wait and finish here.
     await sendToTab(tabId, { type: "CANCEL_X_RUN", runId });
+    if (!isCurrent()) return cancelled();
     setStage("lighthouse_official_completion_detected");
     log("info", "Lighthouse 已显示验证通过/奖励到账，不再等待 X 控件，准备返回任务广场");
     return {
@@ -1823,6 +2271,7 @@ async function completeXTaskWidgetLifecycle(tabId, runId, settings) {
   const result = outcome.result;
   if (!result?.ok) {
     const official = await sendToTab(runtimeState.lighthouseTabId, { type: "CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION", runId });
+    if (!isCurrent()) return cancelled();
     if (official?.completed && latchLighthouseCompletion(official.evidence, runId)) {
       return { ok: true, officialCompletion: true, message: "X 控件不可读，但本单官网已确认完成" };
     }
@@ -1850,12 +2299,17 @@ async function waitForOfficialLighthouseCompletionDuringXSubmission(runId, setti
   return null;
 }
 
-async function waitForLighthouseTaskCompletionAndReturn(runId, settings) {
-  if (runId !== runtimeState.runId || !runtimeState.running) return { ok: false, cancelled: true };
-  const tabId = (await getOrCreateLighthouseTab(LIGHTHOUSE_CAMPAIGNS_URL)).id;
-  await rememberLighthouseTabById(tabId);
+async function waitForLighthouseTaskCompletionAndReturn(runId, settings, isCurrent = () => runId === runtimeState.runId && runtimeState.running) {
+  const cancelled = () => ({ ok: false, cancelled: true });
+  if (!isCurrent()) return cancelled();
+  const tab = await getOrCreateLighthouseTab(LIGHTHOUSE_CAMPAIGNS_URL, isCurrent);
+  if (!isCurrent()) return cancelled();
+  const tabId = tab.id;
+  await rememberLighthouseTabById(tabId, isCurrent);
+  if (!isCurrent()) return cancelled();
   if (hasLatchedLighthouseCompletion(runId)) {
-    const closed = await closeLighthouseDetailToCampaigns(tabId, settings, "本单官方完成证据已保存，返回广场");
+    const closed = await closeLighthouseDetailToCampaigns(tabId, settings, "本单官方完成证据已保存，返回广场", isCurrent);
+    if (!isCurrent()) return cancelled();
     return { ok: Boolean(closed), evidence: runtimeState.completionEvidence, message: closed ? "本单已确认完成并返回广场" : "本单已完成，但回广场尚未确认" };
   }
   setStage("lighthouse_completion_waiting");
@@ -1865,6 +2319,7 @@ async function waitForLighthouseTaskCompletionAndReturn(runId, settings) {
     runId,
     settings
   });
+  if (!isCurrent()) return cancelled();
   const evidenceLatched = Boolean(result?.evidence && latchLighthouseCompletion(result.evidence, runId));
   if (result?.ok) {
     setStage("campaigns_returned");
@@ -1873,7 +2328,8 @@ async function waitForLighthouseTaskCompletionAndReturn(runId, settings) {
   }
   if ((result?.completed || evidenceLatched) && hasLatchedLighthouseCompletion(runId)) {
     log("warn", result?.message || "官网已确认本单完成，但任务广场尚未恢复，正在强制回到任务广场");
-    const returned = await closeLighthouseDetailToCampaigns(tabId, settings, "官网完成证据已保存，强制回到任务广场");
+    const returned = await closeLighthouseDetailToCampaigns(tabId, settings, "官网完成证据已保存，强制回到任务广场", isCurrent);
+    if (!isCurrent()) return cancelled();
     if (returned) {
       setStage("campaigns_returned");
       log("info", "本单官方完成证据已保存，已恢复任务广场并准备继续扫描");
@@ -1886,7 +2342,8 @@ async function waitForLighthouseTaskCompletionAndReturn(runId, settings) {
     }
   }
   if (result && !result.ok && result.timedOut) {
-    const incomeResult = await verifyCompletionByPlazaIncome(tabId, runId, settings);
+    const incomeResult = await verifyCompletionByPlazaIncome(tabId, runId, settings, isCurrent);
+    if (!isCurrent()) return cancelled();
     if (incomeResult) return incomeResult;
   }
   return result;
@@ -1894,7 +2351,8 @@ async function waitForLighthouseTaskCompletionAndReturn(runId, settings) {
 
 // Aggregate income is supplementary only: delayed payment for another order
 // must never manufacture completion evidence for the current task.
-async function verifyCompletionByPlazaIncome(tabId, runId, settings) {
+async function verifyCompletionByPlazaIncome(tabId, runId, settings, isCurrent = () => runId === runtimeState.runId && runtimeState.running) {
+  if (!isCurrent()) return null;
   const evidence = runtimeState.completionEvidence;
   if (!evidence || evidence.runId !== runId
       || evidence.taskKey !== runtimeState.currentTask?.taskKey
@@ -1903,14 +2361,17 @@ async function verifyCompletionByPlazaIncome(tabId, runId, settings) {
   const baseline = Number(runtimeState.incomeAtTaskStart);
   if (runId !== runtimeState.runId || !runtimeState.running) return null;
   if (!(bounty > 0) || !Number.isFinite(baseline)) return null;
-  await closeLighthouseDetailToCampaigns(tabId, settings, "完成弹窗未出现，先回广场核账");
+  await closeLighthouseDetailToCampaigns(tabId, settings, "完成弹窗未出现，先回广场核账", isCurrent);
+  if (!isCurrent()) return null;
   const incomeNow = await readPlazaTodayIncome(tabId, runId);
+  if (!isCurrent()) return null;
   if (!Number.isFinite(incomeNow) || incomeNow + 1e-9 - baseline < bounty) {
     log("warn", `完成弹窗未出现，且今日收入未见本单赏金（开始 ${baseline}，当前 ${Number.isFinite(incomeNow) ? incomeNow : "不可读"}），仍按未完成处理`);
     return null;
   }
   if (!latchIncomeVerifiedCompletion(runId)) return null;
-  const returned = await closeLighthouseDetailToCampaigns(tabId, settings, "收入核验通过，返回广场");
+  const returned = await closeLighthouseDetailToCampaigns(tabId, settings, "收入核验通过，返回广场", isCurrent);
+  if (!isCurrent()) return null;
   setStage("campaigns_returned");
   log("warn", `官网完成弹窗未出现，但任务广场今日收入已入账本单赏金（+${bounty} LUX），按已到账处理并返回广场`);
   return {
@@ -1964,9 +2425,12 @@ async function handleXReplyResult(result, message = {}) {
   if (!isCurrentRunMessage(message)) return { ok: true, state: runtimeState };
   if (!runtimeState.running) return { ok: false, error: "Run is not active" };
   const runId = runtimeState.runId;
+  const replyState = runtimeState;
+  const isCurrent = () => runtimeState === replyState && runtimeState.runId === runId && runtimeState.running;
   runtimeState.lastXResult = result || null;
   log(result && result.ok ? "info" : "error", result && result.message ? result.message : "X 回复步骤结束");
   if (result?.ok) await recordReplyHistory(result);
+  if (!isCurrent()) return { ok: false, cancelled: true };
 
   if (runtimeState.mode === "debug") {
     setStage(result && result.ok ? "x_replied" : "x_reply_failed");
@@ -1983,7 +2447,9 @@ async function handleXReplyResult(result, message = {}) {
   }
 
   const settings = await getSettings();
+  if (!isCurrent()) return { ok: false, cancelled: true };
   const completionResult = await completeXTaskWidgetLifecycle(runtimeState.xTabId, runId, settings);
+  if (!isCurrent()) return { ok: false, cancelled: true };
   if (!completionResult?.ok) {
     return recoverAndContinue(
       completionResult?.message || completionResult?.error || "X 任务闭环未确认",
@@ -2022,6 +2488,9 @@ function markPendingVerification(task) {
 
 async function handleLighthouseDone(result) {
   const runId = runtimeState.runId;
+  const doneState = runtimeState;
+  const isCurrent = () => runtimeState === doneState && runtimeState.runId === runId && !runtimeState.manuallyStopped;
+  if (!isCurrent()) return { ok: false, cancelled: true };
   if (runtimeState.mode === "auto" && result?.ok && !hasLatchedLighthouseCompletion(runId)) {
     return recoverAndContinue("缺少本单官方完成证据，不计为完成", { runId, task: runtimeState.currentTask, closeX: false });
   }
@@ -2045,14 +2514,18 @@ async function handleLighthouseDone(result) {
   }
 
   const settings = await getSettings();
+  if (!isCurrent()) return { ok: false, cancelled: true };
   const orderReloadReason = result?.ok ? "接单完成，已重新加载任务广场" : "接单失败，已重新加载任务广场";
   if (result?.ok || !hasLockedTask) {
     await closeLighthouseDetailToCampaigns(
       runtimeState.lighthouseTabId,
       settings,
-      "正式模式订单结束后关闭任务详情回到广场"
+      "正式模式订单结束后关闭任务详情回到广场",
+      isCurrent
     );
-    const reloaded = await reloadLighthouseCampaignsAfterOrder(runtimeState.lighthouseTabId, orderReloadReason);
+    if (!isCurrent()) return { ok: false, cancelled: true };
+    const reloaded = await reloadLighthouseCampaignsAfterOrder(runtimeState.lighthouseTabId, orderReloadReason, isCurrent);
+    if (!isCurrent()) return { ok: false, cancelled: true };
     if (reloaded === false) {
       runtimeState.running = false;
       setStage("campaigns_reload_failed");
@@ -2084,6 +2557,8 @@ async function handleLighthouseDone(result) {
 
 async function recoverAndContinue(message, options = {}) {
   const runId = options.runId || runtimeState.runId;
+  const isCurrent = captureRunGuard();
+  const cancelled = () => ({ ok: false, cancelled: true, state: runtimeState });
   if (!isActiveAutoRun(runId)) return { ok: true, state: runtimeState };
 
   runtimeState.failed += 1;
@@ -2099,31 +2574,37 @@ async function recoverAndContinue(message, options = {}) {
       ...(options.task || {})
     };
     clearXOpenWatch();
+    runtimeState.running = false;
     setStage("locked_task_recovery_blocked");
     log("error", `${message || "已锁定订单后续步骤异常"}；平台订单仍可能有效，已停止扫描新任务以避免串单`);
-    runtimeState.running = false;
     return { ok: false, error: message || "已锁定订单后续步骤异常", state: runtimeState };
   }
 
   setStage("recovering");
   log("warn", message || "当前任务异常，退回任务广场继续下一单");
   const settings = await getSettings();
+  if (!isCurrent()) return cancelled();
 
   if (options.closeX !== false) {
-    await closeRecordedXTab("异常恢复：已关闭本次 X 标签页");
+    await closeRecordedXTab("异常恢复：已关闭本次 X 标签页", isCurrent);
+    if (!isCurrent()) return cancelled();
   }
 
   try {
-    const tab = await getOrCreateLighthouseTab(LIGHTHOUSE_CAMPAIGNS_URL);
+    const tab = await getOrCreateLighthouseTab(LIGHTHOUSE_CAMPAIGNS_URL, isCurrent);
+    if (!isCurrent()) return cancelled();
     rememberLighthouseTab(tab);
-    await closeLighthouseTaskDetail(tab.id, settings, "异常恢复时关闭任务详情");
-    const reloaded = await reloadLighthouseCampaignsAfterOrder(tab.id, "接单失败，已重新加载任务广场");
+    await closeLighthouseTaskDetail(tab.id, settings, "异常恢复时关闭任务详情", isCurrent);
+    if (!isCurrent()) return cancelled();
+    const reloaded = await reloadLighthouseCampaignsAfterOrder(tab.id, "接单失败，已重新加载任务广场", isCurrent);
+    if (!isCurrent()) return cancelled();
     if (reloaded === false) {
       runtimeState.running = false;
       setStage("campaigns_reload_failed");
       return { ok: false, error: "接单失败后重新加载任务广场失败，已停止扫描", state: runtimeState };
     }
   } catch (error) {
+    if (!isCurrent()) return cancelled();
     log("warn", `关闭任务详情失败，稍后重试：${error.message}`);
   }
 
@@ -2132,7 +2613,8 @@ async function recoverAndContinue(message, options = {}) {
   return startNextAutoTask("recover_after_failure");
 }
 
-async function closeRecordedXTab(message) {
+async function closeRecordedXTab(message, isCurrent = captureRunGuard()) {
+  if (!isCurrent()) return false;
   if (!runtimeState.xTabId) return false;
   const xTabId = runtimeState.xTabId;
   const expectedWindowId = runtimeState.xTabWindowId;
@@ -2141,6 +2623,7 @@ async function closeRecordedXTab(message) {
 
   try {
     const tab = await chrome.tabs.get(xTabId);
+    if (!isCurrent()) return false;
     if (!Number.isInteger(expectedWindowId) && !Number.isInteger(runtimeState.lighthouseWindowId)) {
       log("warn", `拒绝关闭窗口归属不明的 X 标签页：tab=${xTabId}`);
       return false;
@@ -2152,36 +2635,44 @@ async function closeRecordedXTab(message) {
       return false;
     }
     await chrome.tabs.remove(xTabId);
+    if (!isCurrent()) return false;
     const closed = await waitForTabClosed(xTabId, 5000);
+    if (!isCurrent()) return false;
     if (!closed) {
       throw new Error("关闭后仍能检测到 X 标签页");
     }
     log("info", message || "已关闭本次 X 标签页");
     return true;
   } catch (error) {
+    if (!isCurrent()) return false;
     log("warn", `关闭 X 标签页失败：${error.message}`);
     return false;
   }
 }
 
-async function getOrCreateLighthouseTab(url) {
+async function getOrCreateLighthouseTab(url, isCurrent = () => true) {
+  if (!isCurrent()) return null;
   const safeUrl = isLighthouseUrl(url) ? url : LIGHTHOUSE_CAMPAIGNS_URL;
   if (Number.isInteger(runtimeState.lighthouseTabId)) {
     try {
       const remembered = await chrome.tabs.get(runtimeState.lighthouseTabId);
+      if (!isCurrent()) return null;
       if (isLighthouseUrl(remembered.url)) return remembered;
       log("warn", `丢弃非灯塔的残留任务标签：tab=${remembered.id} · ${remembered.url || "about:blank"}`);
     } catch (_) {
       // The remembered tab can disappear while the service worker is asleep.
     }
+    if (!isCurrent()) return null;
     runtimeState.lighthouseTabId = null;
   }
-  const activeTab = await getActiveLighthouseTab();
+  const activeTab = await getActiveLighthouseTab(isCurrent);
+  if (!isCurrent()) return null;
   if (activeTab) {
     rememberLighthouseTab(activeTab);
     return activeTab;
   }
   const tabs = await queryLighthouseTabsInRuntimeWindow();
+  if (!isCurrent()) return null;
   const campaignsTab = tabs.find((tab) => tab.url && tab.url.includes("/campaigns"));
   if (campaignsTab) {
     rememberLighthouseTab(campaignsTab);
@@ -2191,17 +2682,21 @@ async function getOrCreateLighthouseTab(url) {
   const targetWindowId = getRuntimeWindowId();
   if (Number.isInteger(targetWindowId)) createProperties.windowId = targetWindowId;
   const created = await chrome.tabs.create(createProperties);
+  if (!isCurrent()) return null;
   rememberLighthouseTab(created);
   return created;
 }
 
-async function focusLighthouseTabForAutoScan(tabId) {
+async function focusLighthouseTabForAutoScan(tabId, isCurrent = () => true) {
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (!isCurrent()) return false;
     try {
       await chrome.tabs.update(tabId, { active: true });
+      if (!isCurrent()) return false;
       return true;
     } catch (error) {
+      if (!isCurrent()) return false;
       if (!isTabEditTemporarilyBlocked(error)) throw error;
       if (attempt >= maxAttempts) {
         log("warn", `Lighthouse 标签暂时无法激活（Chrome 正在调整标签）：${error.message || String(error)}`);
@@ -2218,7 +2713,8 @@ function isTabEditTemporarilyBlocked(error) {
   return /Tabs cannot be edited right now|user may be dragging a tab/i.test(String(error?.message || error || ""));
 }
 
-async function getActiveLighthouseTab() {
+async function getActiveLighthouseTab(isCurrent = () => true) {
+  if (!isCurrent()) return null;
   const query = { active: true };
   const targetWindowId = getRuntimeWindowId();
   if (Number.isInteger(targetWindowId)) {
@@ -2227,6 +2723,7 @@ async function getActiveLighthouseTab() {
     query.currentWindow = true;
   }
   const tabs = await chrome.tabs.query(query);
+  if (!isCurrent()) return null;
   const tab = tabs[0];
   if (tab && isLighthouseUrl(tab.url)) {
     rememberLighthouseTab(tab);
@@ -2265,7 +2762,9 @@ async function returnLighthouseToCampaigns(tabId) {
   return true;
 }
 
-async function refreshLighthouseCampaignsTab(tabId, reason = "") {
+async function refreshLighthouseCampaignsTab(tabId, reason = "", isCurrent = () => true) {
+  const cancelled = () => ({ ok: false, cancelled: true, skippedCooldown: false, message: "流程已变化，取消旧任务广场刷新" });
+  if (!isCurrent()) return cancelled();
   if (!tabId) {
     return { ok: false, skippedCooldown: false, message: "缺少 Lighthouse 标签页，无法刷新任务广场" };
   }
@@ -2280,30 +2779,41 @@ async function refreshLighthouseCampaignsTab(tabId, reason = "") {
       };
     }
     await chrome.tabs.update(tabId, { active: true });
-    await waitForTabComplete(tabId);
+    if (!isCurrent()) return cancelled();
+    const readyBeforeReload = await waitForTabComplete(tabId);
+    if (!isCurrent()) return cancelled();
+    if (readyBeforeReload === false) throw new Error("刷新前 Lighthouse 页面加载超时");
     log("info", reason || "准备刷新 Lighthouse 任务广场");
     await chrome.tabs.reload(tabId);
-    await waitForTabComplete(tabId);
+    if (!isCurrent()) return cancelled();
+    const readyAfterReload = await waitForTabComplete(tabId);
+    if (!isCurrent()) return cancelled();
+    if (readyAfterReload === false) throw new Error("刷新后 Lighthouse 页面加载超时");
     lastCampaignsRefreshAt = Date.now();
     return { ok: true, skippedCooldown: false, message: "" };
   } catch (error) {
+    if (!isCurrent()) return cancelled();
     log("warn", `刷新任务广场失败：${error.message}`);
     return { ok: false, skippedCooldown: false, message: error.message || "刷新任务广场失败" };
   }
 }
 
-async function reloadLighthouseCampaignsAfterOrder(tabId, reason = "") {
+async function reloadLighthouseCampaignsAfterOrder(tabId, reason = "", isCurrent = () => true) {
+  if (!isCurrent()) return false;
   if (!Number.isInteger(tabId)) {
     log("warn", "订单结束后缺少 Lighthouse 任务广场标签页，无法重新加载");
     return false;
   }
   try {
     await chrome.tabs.reload(tabId);
+    if (!isCurrent()) return false;
     await waitForTabComplete(tabId);
+    if (!isCurrent()) return false;
     lastCampaignsRefreshAt = Date.now();
     log("info", reason || "订单结束，已重新加载 Lighthouse 任务广场");
     return true;
   } catch (error) {
+    if (!isCurrent()) return false;
     log("warn", `订单结束后重新加载任务广场失败：${error.message || String(error)}`);
     return false;
   }
@@ -2330,24 +2840,29 @@ async function safeReturnLighthouseToCampaigns(tabId) {
   }
 }
 
-async function closeLighthouseDetailToCampaigns(tabId, settings, reason) {
-  if (!tabId) return false;
-  const closed = await closeLighthouseTaskDetail(tabId, settings, reason);
+async function closeLighthouseDetailToCampaigns(tabId, settings, reason, isCurrent = () => true) {
+  if (!tabId || !isCurrent()) return false;
+  const closed = await closeLighthouseTaskDetail(tabId, settings, reason, isCurrent);
+  if (!isCurrent()) return false;
   if (closed) return true;
   log("warn", "页面内回广场未确认，本次不刷新页面，交给后续任务选择复核当前状态");
   return false;
 }
 
-async function closeLighthouseTaskDetail(tabId, settings, reason) {
-  if (!tabId) return false;
+async function closeLighthouseTaskDetail(tabId, settings, reason, isCurrent = () => true) {
+  if (!tabId || !isCurrent()) return false;
+  const runId = runtimeState.runId;
   try {
     await chrome.tabs.update(tabId, { active: true });
+    if (!isCurrent()) return false;
     await waitForTabComplete(tabId);
+    if (!isCurrent()) return false;
     const result = await sendToTab(tabId, {
       type: "CLOSE_LIGHTHOUSE_TASK_DETAIL",
-      runId: runtimeState.runId,
+      runId,
       settings
     });
+    if (!isCurrent() || result?.cancelled) return false;
     if (result && result.ok) {
       log("info", result.message || reason || "已关闭任务详情");
       return true;
@@ -2356,10 +2871,13 @@ async function closeLighthouseTaskDetail(tabId, settings, reason) {
     // A stuck Lighthouse drawer can remain in the DOM after every close
     // gesture. Reloading the campaigns tab is the reliable recovery path.
     await chrome.tabs.reload(tabId);
+    if (!isCurrent()) return false;
     await waitForTabComplete(tabId);
+    if (!isCurrent()) return false;
     log("info", "任务详情关闭未确认，已刷新任务广场并继续下一条");
     return true;
   } catch (error) {
+    if (!isCurrent()) return false;
     log("warn", `页面内关闭任务详情失败：${error.message}`);
     return false;
   }
@@ -2622,9 +3140,11 @@ function isLimitReached(count, limit) {
 }
 
 async function sendToTab(tabId, payload) {
+  if (runtimeState.manuallyStopped && !payload.type.startsWith("CANCEL_")) return { ok: false, cancelled: true, message: "已手动停止" };
   payload = { ...payload, platform: "lighthouse", task: payload.task || runtimeState.currentTask };
-  const claimsOrder = ["START_LIGHTHOUSE_COMMENT_TASK", "DEBUG_LOCK_SEAT_AND_EXTRACT", "WAIT_SELECTED_COUNTDOWN_AND_LOCK", "RUN_X_WIDGET_CLAIM"].includes(payload.type);
+  const claimsOrder = ["START_LIGHTHOUSE_COMMENT_TASK", "DEBUG_OPEN_FIRST_COMMENT_TASK", "OPEN_SELECTED_COUNTDOWN_TASK_DETAIL", "OPEN_SELECTED_COUNTDOWN_TASK_TWEET", "DEBUG_LOCK_SEAT_AND_EXTRACT", "WAIT_SELECTED_COUNTDOWN_AND_LOCK", "RUN_X_WIDGET_CLAIM"].includes(payload.type);
   let claimIntent = null;
+  let ownsMarketplaceRefresh = false;
   const sentState = runtimeState;
   const sentRunId = runtimeState.runId;
   const stale = () => runtimeState !== sentState || runtimeState.runId !== sentRunId;
@@ -2643,7 +3163,9 @@ async function sendToTab(tabId, payload) {
       return { ok: false, cancelled: true, message: "流程已停止，不再重试旧消息" };
     }
     try {
-      await ensureLighthouseAlertBridge(tabId);
+      if (!payload.type.startsWith("CANCEL_")) {
+        await ensureLighthouseAlertBridge(tabId, () => !stale() && !runtimeState.manuallyStopped);
+      }
       if (!payload.type.startsWith("CANCEL_") && (stale() || (payload.runId && !runtimeState.running))) {
         return { ok: false, cancelled: true, message: "流程已变化，未发送旧消息" };
       }
@@ -2651,7 +3173,8 @@ async function sendToTab(tabId, payload) {
         return { ok: false, uncertain: true, message: "旧动作结果未知，禁止重复执行，请先核对本单" };
       }
       if (claimsOrder && !claimIntent) {
-        claimIntent = { type: payload.type, taskKey: payload.task?.taskKey || "", runId: payload.runId, tabId };
+        claimIntent = { type: payload.type, taskKey: payload.task?.taskKey || "", runId: payload.runId, tabId, intentId: createRunId() };
+        payload.claimIntentId = claimIntent.intentId;
         runtimeState.uncertainAction = claimIntent;
         // A terminated worker must retain an unanswered claim, even before its task is known.
         await persistAutoRunState(true);
@@ -2663,34 +3186,66 @@ async function sendToTab(tabId, payload) {
           return { ok: false, cancelled: true, message: "流程已停止，未发送接单动作" };
         }
       }
-      const result = await chrome.tabs.sendMessage(tabId, payload);
+      const irreversible = ["RUN_X_REPLY", "RUN_X_WIDGET_CLAIM", "COMPLETE_X_TASK_WIDGET", "CLICK_X_TASK_VERIFY", "DEBUG_CLICK_I_DONE", "COMPLETE_LIGHTHOUSE_COMMENT_TASK"].includes(payload.type);
+      const activeAction = irreversible ? { state: sentState, type: payload.type, runId: payload.runId, tabId, taskKey: payload.task?.taskKey || "" } : null;
+      let result;
+      if (activeAction) activeTabActions.add(activeAction);
+      try {
+        result = await chrome.tabs.sendMessage(tabId, payload);
+      } finally {
+        if (activeAction) activeTabActions.delete(activeAction);
+      }
       if (!payload.type.startsWith("CANCEL_") && (stale() || (payload.runId && !runtimeState.running))) {
         return { ok: false, cancelled: true, message: "流程已变化，未采用旧回执" };
       }
       if (claimIntent && runtimeState.uncertainAction === claimIntent) {
         const claimedTask = result?.task?.seatLocked || result?.task?.claimed || result?.task?.seatLockedAt;
+        const detailProof = result?.detailConfirmation;
+        const confirmedDetail = ["DEBUG_OPEN_FIRST_COMMENT_TASK", "OPEN_SELECTED_COUNTDOWN_TASK_DETAIL", "OPEN_SELECTED_COUNTDOWN_TASK_TWEET"].includes(payload.type)
+          && result?.ok === true && detailProof?.phase === "detail_ready" && detailProof.invitationResolved === true
+          && detailProof.runId === claimIntent.runId && detailProof.type === claimIntent.type
+          && detailProof.claimIntentId === claimIntent.intentId
+          && Boolean(detailProof.taskKey) && detailProof.taskKey === result.task?.taskKey;
         // New receipts explicitly distinguish rejection before any claim
         // action. Older content scripts retain their narrower retry rules.
-        const safelyUnclaimed = result?.ok === false && result.claimActionAttempted !== true
-          && (result.claimActionAttempted === false || result.transient || result.permanentIgnore || result.refreshRequested || (result.claimed === false && result.clicks === 0));
+        const safelyUnclaimed = result?.claimActionAttempted === false
+          || (result?.ok === false && result.claimActionAttempted !== true
+            && (result.transient || result.permanentIgnore || result.refreshRequested || (result.claimed === false && result.clicks === 0)));
+        if (confirmedDetail && result.claimActionAttempted === true) {
+          // A confirmed invitation may continue on this task, but does not
+          // prove a seat lock or authorize abandoning it for another order.
+          result.task = { ...result.task, invitationAccepted: { ...claimIntent, taskKey: result.task.taskKey } };
+          runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, result.task);
+        }
         if (claimedTask || result?.claimed === true) {
           runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, result.task || payload.task,
             result.claimed === true ? { claimed: true, seatLocked: true } : {});
-        } else if (!safelyUnclaimed) {
+        } else if (!safelyUnclaimed && !confirmedDetail) {
           runtimeState.running = false;
           setStage("action_result_unknown");
           log("error", `接单动作 ${payload.type} 未确认订单状态，已停止并保留执行意图；不会自动重试，请先核对本单${result?.message ? `。页面回执：${result.message}` : ""}`);
-          return { ok: false, uncertain: true, message: "接单回执未确认订单状态，已保留执行意图，请先核对本单" };
+          return { ok: false, uncertain: true, message: result?.message || "接单回执未确认订单状态，已保留执行意图，请先核对本单" };
+        }
+        if (safelyUnclaimed && !claimedTask && result?.claimed !== true
+          && result.refreshRequested && payload.type === "START_LIGHTHOUSE_COMMENT_TASK"
+          && runtimeState.mode === "auto") {
+          runtimeState.marketplaceRefreshInFlight = true;
+          ownsMarketplaceRefresh = true;
         }
         delete runtimeState.uncertainAction;
         await persistAutoRunState(true);
         if (stale() || (payload.runId && !runtimeState.running)) {
+          if (ownsMarketplaceRefresh && !stale()) sentState.marketplaceRefreshInFlight = false;
           return { ok: false, cancelled: true, message: "流程已变化，订单已保存但不再继续旧流程" };
         }
       }
       return result;
     } catch (error) {
-      if (!payload.type.startsWith("CANCEL_") && stale()) {
+      if (ownsMarketplaceRefresh && !stale()) {
+        sentState.marketplaceRefreshInFlight = false;
+        ownsMarketplaceRefresh = false;
+      }
+      if (!payload.type.startsWith("CANCEL_") && (stale() || (payload.runId && !runtimeState.running))) {
         return { ok: false, cancelled: true, message: "流程已变化，未将旧错误写入当前任务" };
       }
       if (isReceivingEndMissingError(error)) {
@@ -2699,7 +3254,7 @@ async function sendToTab(tabId, payload) {
           await persistAutoRunState(true);
           claimIntent = null;
         }
-        const injected = await ensureContentScriptInjected(tabId);
+        const injected = await ensureContentScriptInjected(tabId, () => !stale() && !runtimeState.manuallyStopped);
         if (injected) {
           await delay(300);
           continue;
@@ -2721,31 +3276,96 @@ async function sendToTab(tabId, payload) {
   return null;
 }
 
-async function cancelCurrentRun() {
+async function cancelSupersededLighthouseRun(previousRun, paused = false) {
+  // Cancel only the captured old run; the new run already owns runtimeState.
+  for (const controller of activeAIRequests) controller.abort(new Error("已手动启动新一轮任务"));
+  const targets = [[previousRun.lighthouseTabId, "CANCEL_LIGHTHOUSE_RUN"], [previousRun.xTabId, "CANCEL_X_RUN"]];
+  if (paused && Number.isInteger(previousRun.uncertainAction?.tabId) && !targets.some(([id]) => id === previousRun.uncertainAction.tabId)) {
+    targets.push([previousRun.uncertainAction.tabId, /^(?:RUN_X_|COMPLETE_X_|CLICK_X_)/.test(previousRun.uncertainAction.type) ? "CANCEL_X_RUN" : "CANCEL_LIGHTHOUSE_RUN"]);
+  }
+  await Promise.all(targets.filter(([tabId]) => Number.isInteger(tabId)).map(async ([tabId, type]) => {
+    let timer;
+    try {
+      const runId = previousRun.uncertainAction?.tabId === tabId ? previousRun.uncertainAction.runId : previousRun.runId;
+      if (paused && type === "CANCEL_LIGHTHOUSE_RUN") pauseLighthouseAlertBridge(tabId);
+      await Promise.race([
+        chrome.tabs.sendMessage(tabId, { type, platform: "lighthouse", runId, ...(paused ? { paused: true } : {}) }),
+        new Promise(resolve => { timer = setTimeout(resolve, 2250); })
+      ]);
+    } catch (_) {
+      // Old tabs may have closed since this snapshot was saved.
+    } finally { clearTimeout(timer); }
+  }));
+}
+
+function hasIdentifiedUncertainAction(state) {
+  const action = state.uncertainAction;
+  return Boolean(action?.type && action.runId && Number.isInteger(action.tabId));
+}
+
+async function cancelCurrentRun(isCurrent = () => true) {
+  if (!isCurrent()) return false;
+  const cancellingState = runtimeState;
+  const runId = runtimeState.runId;
+  const ownsCancellation = () => isCurrent() && runtimeState === cancellingState && runtimeState.runId === runId;
   runtimeState.running = false;
   for (const controller of activeAIRequests) controller.abort(new Error("任务已停止"));
-  const runId = runtimeState.runId;
   clearXOpenWatch();
-  if (runtimeState.lighthouseTabId) {
+  // X cancellation cannot prove that a post/submission did not happen. Keep
+  // any still-pending irreversible action before its old response is ignored.
+  const pendingAction = Array.from(activeTabActions).find((action) => action.state === cancellingState && action.runId === runId);
+  if (!cancellingState.uncertainAction && pendingAction) {
+    cancellingState.uncertainAction = { type: pendingAction.type, runId: pendingAction.runId, tabId: pendingAction.tabId, taskKey: pendingAction.taskKey };
+    await persistAutoRunState(true);
+    if (!ownsCancellation()) return false;
+  }
+  const intent = cancellingState.uncertainAction;
+  const identifiedIntent = hasIdentifiedUncertainAction(cancellingState);
+  const xIntent = identifiedIntent && /^(?:RUN_X_|COMPLETE_X_|CLICK_X_)/.test(intent.type);
+  const lighthouseTabId = identifiedIntent && !xIntent ? intent.tabId : cancellingState.lighthouseTabId;
+  const xTabId = xIntent ? intent.tabId : cancellingState.xTabId;
+  const cancellableClaim = intent && ["START_LIGHTHOUSE_COMMENT_TASK", "DEBUG_OPEN_FIRST_COMMENT_TASK", "OPEN_SELECTED_COUNTDOWN_TASK_DETAIL", "OPEN_SELECTED_COUNTDOWN_TASK_TWEET", "DEBUG_LOCK_SEAT_AND_EXTRACT", "WAIT_SELECTED_COUNTDOWN_AND_LOCK"].includes(intent.type)
+    && intent.tabId === cancellingState.lighthouseTabId;
+  const cancelTab = async (tabId, type, targetRunId, extra = {}) => {
+    let timer;
     try {
-      await sendToTab(runtimeState.lighthouseTabId, {
-        type: "CANCEL_LIGHTHOUSE_RUN",
-        runId
-      });
+      return await Promise.race([
+        chrome.tabs.sendMessage(tabId, { type, platform: "lighthouse", runId: targetRunId, ...extra }),
+        new Promise((resolve) => { timer = setTimeout(() => resolve({ ok: false, timedOut: true }), 2250); })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const lighthouseCancellation = lighthouseTabId
+    ? cancelTab(lighthouseTabId, "CANCEL_LIGHTHOUSE_RUN", identifiedIntent && !xIntent ? intent.runId : runId,
+      cancellableClaim ? { expectedOperationType: intent.type, claimIntentId: intent.intentId || "" } : {})
+    : Promise.resolve(null);
+  const xRunId = intent?.tabId === xTabId ? intent.runId : runId;
+  const xCancellation = xTabId
+    ? cancelTab(xTabId, "CANCEL_X_RUN", xRunId).catch((error) => {
+      if (ownsCancellation()) log("warn", `通知 X 停止旧流程失败：${error.message}`);
+    }) : Promise.resolve();
+  if (lighthouseTabId) {
+    try {
+      const reply = await lighthouseCancellation;
+      if (!ownsCancellation()) return false;
+      const proof = reply?.cancellationProof;
+      if (cancellableClaim && cancellingState.uncertainAction === intent && reply?.ok === true
+        && proof?.settled === true && proof.runId === intent.runId && proof.type === intent.type
+        && proof.claimIntentId === (intent.intentId || "") && proof.claimActionAttempted === false && proof.claimed === false) {
+        delete cancellingState.uncertainAction;
+        await persistAutoRunState(true);
+        if (!ownsCancellation()) return false;
+        log("info", "已确认旧接单流程在点击前结束，可安全停止或接管");
+      }
     } catch (error) {
-      log("warn", `通知 Lighthouse 停止旧流程失败：${error.message}`);
+      if (ownsCancellation()) log("warn", `通知 Lighthouse 停止旧流程失败：${error.message}`);
     }
   }
-  if (runtimeState.xTabId) {
-    try {
-      await sendToTab(runtimeState.xTabId, {
-        type: "CANCEL_X_RUN",
-        runId
-      });
-    } catch (error) {
-      log("warn", `通知 X 停止旧流程失败：${error.message}`);
-    }
-  }
+  if (!ownsCancellation()) return false;
+  await xCancellation;
+  return ownsCancellation();
 }
 
 async function reconcileWaitingAutoRunSchedule() {
@@ -2863,21 +3483,31 @@ function isActiveAutoRun(runId) {
 }
 
 function isCurrentRunMessage(message) {
-  return !message?.runId || !runtimeState.runId || message.runId === runtimeState.runId;
+  return !runtimeState.manuallyStopped && (!message?.runId || !runtimeState.runId || message.runId === runtimeState.runId);
 }
 
-async function ensureContentScriptInjected(tabId) {
+function captureRunGuard() {
+  const state = runtimeState;
+  const runId = state.runId;
+  return () => runtimeState === state && runtimeState.runId === runId && !runtimeState.manuallyStopped;
+}
+
+async function ensureContentScriptInjected(tabId, isCurrent = () => true) {
+  if (!isCurrent()) return false;
   try {
     const tab = await chrome.tabs.get(tabId);
+    if (!isCurrent()) return false;
     const file = getContentScriptFileForUrl(tab.url);
     if (!file) return false;
     await chrome.scripting.executeScript({
       target: { tabId },
       files: [file]
     });
+    if (!isCurrent()) return false;
     log("warn", `已为当前标签页补注入脚本：${file}`);
     return true;
   } catch (error) {
+    if (!isCurrent()) return false;
     log("error", `补注入 content script 失败：${error.message}`);
     return false;
   }
@@ -2893,22 +3523,42 @@ function getContentScriptFileForUrl(url) {
 // Installs the page-world alert bridge. Risk acceptance (reviewed 2026-09-11):
 // it dismisses only the unverified-link warning for accepted orders; all other
 // alerts stay visible to the user.
-async function ensureLighthouseAlertBridge(tabId) {
+function pauseLighthouseAlertBridge(tabId) {
+  const revision = alertPauseRevision = Math.max(Date.now(), alertPauseRevision + 1);
+  try {
+    void chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", args: [revision],
+      func: revision => {
+        if (Number(window.__lighthouseAlertPauseRevision__ || 0) > revision) return;
+        window.__lighthouseAlertPauseRevision__ = revision;
+        window.__lighthouseAutomationPaused__ = true;
+      }
+    }).catch(() => {});
+  } catch (_) {}
+}
+
+async function ensureLighthouseAlertBridge(tabId, isCurrent = () => true) {
+  if (!isCurrent()) return false;
   try {
     const tab = await chrome.tabs.get(tabId);
+    if (!isCurrent()) return false;
     if (!isLighthouseUrl(tab.url)) return false;
     if (lighthouseAlertBridgeUrls.get(tabId) === tab.url) return true;
+    const revision = alertPauseRevision = Math.max(Date.now(), alertPauseRevision + 1);
     await chrome.scripting.executeScript({
       target: { tabId },
       world: "MAIN",
-      func: () => {
+      args: [revision],
+      func: revision => {
+        if (Number(window.__lighthouseAlertPauseRevision__ || 0) > revision) return;
+        window.__lighthouseAlertPauseRevision__ = revision;
+        window.__lighthouseAutomationPaused__ = false;
         const bridgeKey = "__lighthouseUnverifiedLinkAlertBridge__";
         if (window[bridgeKey]) return;
         window[bridgeKey] = true;
         const nativeAlert = window.alert.bind(window);
         window.alert = (message) => {
           const text = String(message || "");
-          if (/此推文含有未经验证的链接[\s\S]*KOL\s*接单时仔细分辨/.test(text)) {
+          if (!window.__lighthouseAutomationPaused__ && /此推文含有未经验证的链接[\s\S]*KOL\s*接单时仔细分辨/.test(text)) {
             window.dispatchEvent(new CustomEvent("lighthouse-unverified-link-alert-dismissed"));
             return;
           }
@@ -2916,9 +3566,11 @@ async function ensureLighthouseAlertBridge(tabId) {
         };
       }
     });
+    if (!isCurrent()) return false;
     lighthouseAlertBridgeUrls.set(tabId, tab.url);
     return true;
   } catch (error) {
+    if (!isCurrent()) return false;
     log("warn", `安装 Lighthouse 链接提示自动确认失败：${error.message}`);
     return false;
   }
@@ -2980,22 +3632,26 @@ function createInitialState() {
   };
 }
 
-async function resolveLighthouseTab() {
+async function resolveLighthouseTab(isCurrent = () => true) {
+  if (!isCurrent()) return null;
   if (runtimeState.lighthouseTabId) {
     try {
       const recorded = await chrome.tabs.get(runtimeState.lighthouseTabId);
+      if (!isCurrent()) return null;
       if (isLighthouseUrl(recorded.url)) {
         rememberLighthouseTab(recorded);
         return recorded.id;
       }
     } catch (error) {
+      if (!isCurrent()) return null;
       log("warn", `已记录 Lighthouse 标签页不可用：${error.message}`);
     }
     runtimeState.lighthouseTabId = null;
     runtimeState.lighthouseWindowId = null;
   }
 
-  const activeTab = await getActiveLighthouseTab();
+  const activeTab = await getActiveLighthouseTab(isCurrent);
+  if (!isCurrent()) return null;
   if (activeTab) {
     rememberLighthouseTab(activeTab);
     log("info", "已接管当前 Lighthouse 标签页");
@@ -3003,10 +3659,12 @@ async function resolveLighthouseTab() {
   }
 
   const tabs = await queryLighthouseTabsInRuntimeWindow();
+  if (!isCurrent()) return null;
   const lighthouseTab = tabs.find((tab) => isLighthouseUrl(tab.url));
   if (lighthouseTab) {
     rememberLighthouseTab(lighthouseTab);
     await chrome.tabs.update(lighthouseTab.id, { active: true });
+    if (!isCurrent()) return null;
     log("info", "已接管已有 Lighthouse 标签页");
     return lighthouseTab.id;
   }
@@ -3014,15 +3672,19 @@ async function resolveLighthouseTab() {
   throw new Error("缺少 Lighthouse 标签页：当前窗口没有 app.lhdao.top 页面");
 }
 
-async function resolveCurrentXTab(options = {}) {
-  if (runtimeState.xTabId) {
+async function resolveCurrentXTab(options = {}, isCurrent = () => true) {
+  if (!isCurrent()) return null;
+  const recordedTabId = runtimeState.xTabId;
+  if (recordedTabId) {
     try {
-      const tab = await chrome.tabs.get(runtimeState.xTabId);
+      const tab = await chrome.tabs.get(recordedTabId);
+      if (!isCurrent()) return null;
       if (isTweetTab(tab) && isTabInRuntimeWindow(tab)) {
         runtimeState.xTabWindowId = tab.windowId;
-        return runtimeState.xTabId;
+        return recordedTabId;
       }
     } catch (error) {
+      if (!isCurrent()) return null;
       log("warn", `Recorded X tab is unavailable: ${error.message}`);
     }
     runtimeState.xTabId = null;
@@ -3030,6 +3692,7 @@ async function resolveCurrentXTab(options = {}) {
   }
   if (options.allowActiveTweetTab) {
     const activeTab = await getActiveTweetTab({ windowId: getRuntimeWindowId() });
+    if (!isCurrent()) return null;
     if (activeTab) {
       const taskTweetUrl = normalizeTweetUrl(runtimeState.currentTask?.tweetUrl || "");
       const activeTweetUrl = normalizeTweetUrl(activeTab.url || "");
@@ -3066,10 +3729,14 @@ async function getActiveTweetTab(options = {}) {
 }
 
 async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options = {}) {
+  const waitingState = runtimeState;
   const runId = runtimeState.runId;
+  const isCurrent = () => runtimeState === waitingState && runtimeState.runId === runId && runtimeState.running;
   await sendToTab(lighthouseTabId, { type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId, task });
+  if (!isCurrent()) return false;
   const startedAt = Date.now();
-  const lighthouseWindowId = await getLighthouseWindowId(lighthouseTabId);
+  const lighthouseWindowId = await getLighthouseWindowId(lighthouseTabId, isCurrent);
+  if (!isCurrent()) return false;
   const expectedTweetUrl = normalizeTweetUrl(task?.tweetUrl || runtimeState.currentTask?.tweetUrl || "");
   const timeoutMs = Number(options.timeoutMs || 30000);
   const logEveryMs = Number(options.logEveryMs || 3000);
@@ -3079,16 +3746,19 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
   let fallbackOpened = false;
   let detailFallbackClicked = false;
   while (Date.now() - startedAt < timeoutMs) {
-    if (!runtimeState.running || runtimeState.runId !== runId) return false;
+    if (!isCurrent()) return false;
     const currentExpectedUrl = normalizeTweetUrl(runtimeState.currentTask?.tweetUrl || expectedTweetUrl);
-    const boundTab = await getBoundMatchingTaskXTab(currentExpectedUrl);
+    const boundTab = await getBoundMatchingTaskXTab(currentExpectedUrl, isCurrent);
+    if (!isCurrent()) return false;
     if (boundTab) {
       runtimeState.mode = mode || runtimeState.mode;
-      if (lighthouseTabId) await rememberLighthouseTabById(lighthouseTabId);
+      if (lighthouseTabId) await rememberLighthouseTabById(lighthouseTabId, isCurrent);
+      if (!isCurrent()) return false;
       return true;
     }
     const candidate = consumeXOpenCandidate(lighthouseTabId, currentExpectedUrl)
       || await findRecentTweetTab(startedAt, lighthouseTabId, lighthouseWindowId, currentExpectedUrl);
+    if (!isCurrent()) return false;
     if (candidate && candidate.id === lighthouseTabId) {
       await delay(500);
       continue;
@@ -3101,10 +3771,12 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
     if (candidate) {
       adoptCurrentXTab(candidate, task, "site");
       runtimeState.mode = mode || runtimeState.mode;
-      if (lighthouseTabId) await rememberLighthouseTabById(lighthouseTabId);
+      if (lighthouseTabId) await rememberLighthouseTabById(lighthouseTabId, isCurrent);
+      if (!isCurrent()) return false;
       return true;
     }
     const lockFailure = await checkLighthouseLockFailure(lighthouseTabId);
+    if (!isCurrent()) return false;
     if (lockFailure) {
       clearXOpenWatch();
       const message = lockFailure.message || lockFailure.reason || "锁定失败：任务不可做";
@@ -3127,8 +3799,9 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
       const directTabId = await openDirectTweetTabIfAvailable(
         runtimeState.currentTask || task,
         lighthouseTabId,
-        { allowAwaitingXTabAdoption: true, source: "extension_fallback" }
+        { allowAwaitingXTabAdoption: true, source: "extension_fallback", isCurrent }
       );
+      if (!isCurrent()) return false;
       if (directTabId) {
         clearXOpenWatch();
         log("warn", "官网未跳转，插件已兜底打开精确目标 X 推文");
@@ -3136,7 +3809,8 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
       }
       if (!detailFallbackClicked) {
         detailFallbackClicked = true;
-        const clickFallback = await clickCurrentDetailTweetTargetFallback(lighthouseTabId, mode);
+        const clickFallback = await clickCurrentDetailTweetTargetFallback(lighthouseTabId, mode, isCurrent);
+        if (!isCurrent()) return false;
         if (clickFallback.ok) {
           runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, clickFallback.task, {
             taskKey: task?.taskKey || runtimeState.currentTask?.taskKey,
@@ -3144,11 +3818,14 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
           });
           log("warn", "当前详情未暴露直链，已单次点击“去 X 完成动作”并仅等待匹配目标页出现");
           await delay(1000);
+          if (!isCurrent()) return false;
           const clickedExpectedUrl = normalizeTweetUrl(runtimeState.currentTask?.tweetUrl || expectedTweetUrl);
-          const clickedBoundTab = await getBoundMatchingTaskXTab(clickedExpectedUrl);
+          const clickedBoundTab = await getBoundMatchingTaskXTab(clickedExpectedUrl, isCurrent);
+          if (!isCurrent()) return false;
           if (clickedBoundTab) return true;
           const clickedCandidate = consumeXOpenCandidate(lighthouseTabId, clickedExpectedUrl)
             || await findRecentTweetTab(Date.now() - 1500, lighthouseTabId, lighthouseWindowId, clickedExpectedUrl);
+          if (!isCurrent()) return false;
           if (clickedCandidate) {
             adoptCurrentXTab(clickedCandidate, runtimeState.currentTask, "site");
             return true;
@@ -3156,8 +3833,9 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
           const directAfterClick = await openDirectTweetTabIfAvailable(
             runtimeState.currentTask || task,
             lighthouseTabId,
-            { allowAwaitingXTabAdoption: true, source: "extension_fallback" }
+            { allowAwaitingXTabAdoption: true, source: "extension_fallback", isCurrent }
           );
+          if (!isCurrent()) return false;
           if (directAfterClick) {
             clearXOpenWatch();
             log("warn", "单次详情按钮未产生匹配页面，插件已使用新提取的任务直链兜底打开 X");
@@ -3174,18 +3852,21 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
     }
     await delay(500);
   }
+  if (!isCurrent()) return false;
   clearXOpenWatch();
   return false;
 }
 
-async function clickCurrentDetailTweetTargetFallback(lighthouseTabId, mode) {
+async function clickCurrentDetailTweetTargetFallback(lighthouseTabId, mode, isCurrent = () => true) {
   if (!lighthouseTabId) return { ok: false, message: "缺少 Lighthouse 任务页" };
+  const runId = runtimeState.runId;
   try {
     const settings = await getSettings();
+    if (!isCurrent()) return { ok: false, cancelled: true };
     beginXOpenWatch(lighthouseTabId, mode);
     const result = await sendToTab(lighthouseTabId, {
       type: "OPEN_CURRENT_DETAIL_TWEET_TARGET",
-      runId: runtimeState.runId,
+      runId,
       settings,
       taskTypeHint: runtimeState.currentTask?.taskType || "",
       task: runtimeState.currentTask || null
@@ -3260,12 +3941,16 @@ function consumeXOpenCandidate(lighthouseTabId, expectedTweetUrl = "") {
 }
 
 async function recoverPendingXOpenFromCapturedUrl(tweetUrl) {
+  const recoveryState = runtimeState;
+  const recoveryRunId = runtimeState.runId;
+  const isCurrent = () => runtimeState === recoveryState && runtimeState.runId === recoveryRunId && runtimeState.running;
   const normalizedUrl = normalizeTweetUrl(tweetUrl);
   const pending = runtimeState.pendingXOpen;
   const task = runtimeState.currentTask || {};
   if (!normalizedUrl || !pending) return null;
   if (!runtimeState.running || (task.seatLocked !== true && !task.seatLockedAt)) return null;
-  const alreadyBound = await getBoundMatchingTaskXTab(normalizedUrl);
+  const alreadyBound = await getBoundMatchingTaskXTab(normalizedUrl, isCurrent);
+  if (!isCurrent()) return null;
   if (alreadyBound) return alreadyBound.id;
   if (capturedTargetRecoveryPromise) return capturedTargetRecoveryPromise;
 
@@ -3275,11 +3960,13 @@ async function recoverPendingXOpenFromCapturedUrl(tweetUrl) {
   const startedAt = pending.startedAt || Date.now();
   const recovery = (async () => {
     for (let attempt = 0; attempt < 5; attempt += 1) {
-      if (!runtimeState.running || runtimeState.runId !== runId) return null;
-      const boundTab = await getBoundMatchingTaskXTab(normalizedUrl);
+      if (!isCurrent()) return null;
+      const boundTab = await getBoundMatchingTaskXTab(normalizedUrl, isCurrent);
+      if (!isCurrent()) return null;
       if (boundTab) return boundTab.id;
       const candidate = consumeXOpenCandidate(lighthouseTabId, normalizedUrl)
         || await findRecentTweetTab(startedAt, lighthouseTabId, lighthouseWindowId, normalizedUrl);
+      if (!isCurrent()) return null;
       if (candidate) {
         adoptCurrentXTab(candidate, runtimeState.currentTask, "site");
         log("info", "已根据官网回传的精确地址接管 Lighthouse 打开的 X 标签页");
@@ -3294,8 +3981,9 @@ async function recoverPendingXOpenFromCapturedUrl(tweetUrl) {
         awaitingXTabAdoption: false
       }),
       lighthouseTabId,
-      { allowAwaitingXTabAdoption: true, source: "extension_fallback" }
+      { allowAwaitingXTabAdoption: true, source: "extension_fallback", isCurrent }
     );
+    if (!isCurrent()) return null;
     if (directTabId) log("warn", "官网已回传目标地址但未创建可接管标签，插件已只创建一次精确兜底页");
     return directTabId;
   })();
@@ -3348,11 +4036,13 @@ function adoptCurrentXTab(tab, task = null, source = "lighthouse") {
   return tab.id;
 }
 
-async function getLighthouseWindowId(lighthouseTabId) {
+async function getLighthouseWindowId(lighthouseTabId, isCurrent = () => true) {
+  if (!isCurrent()) return null;
   if (Number.isInteger(runtimeState.lighthouseWindowId)) return runtimeState.lighthouseWindowId;
   if (!lighthouseTabId) return null;
   try {
     const tab = await chrome.tabs.get(lighthouseTabId);
+    if (!isCurrent()) return null;
     if (isLighthouseUrl(tab.url)) {
       rememberLighthouseTab(tab);
       return tab.windowId;
@@ -3368,15 +4058,17 @@ function rememberLighthouseTab(tab) {
   runtimeState.runtimeWindowId = tab.windowId;
 }
 
-async function rememberLighthouseTabById(tabId) {
-  if (!tabId) return null;
+async function rememberLighthouseTabById(tabId, isCurrent = () => true) {
+  if (!tabId || !isCurrent()) return null;
   try {
     const tab = await chrome.tabs.get(tabId);
+    if (!isCurrent()) return null;
     if (isLighthouseUrl(tab.url)) {
       rememberLighthouseTab(tab);
       return tab;
     }
   } catch (_) {}
+  if (!isCurrent()) return null;
   if (runtimeState.lighthouseTabId === tabId) {
     runtimeState.lighthouseTabId = null;
     runtimeState.lighthouseWindowId = null;
@@ -3440,10 +4132,12 @@ function getTaskMergeIdentity(task) {
   };
 }
 
-async function getBoundMatchingTaskXTab(expectedTweetUrl = "") {
+async function getBoundMatchingTaskXTab(expectedTweetUrl = "", isCurrent = () => true) {
+  if (!isCurrent()) return null;
   if (!Number.isInteger(runtimeState.xTabId)) return null;
   try {
     const tab = await chrome.tabs.get(runtimeState.xTabId);
+    if (!isCurrent()) return null;
     const actualUrl = normalizeTweetUrl(tab?.url);
     const expectedUrl = normalizeTweetUrl(expectedTweetUrl || runtimeState.currentTask?.tweetUrl);
     if (!actualUrl || !isTabInRuntimeWindow(tab) || (expectedUrl && actualUrl !== expectedUrl)) {
@@ -3454,6 +4148,7 @@ async function getBoundMatchingTaskXTab(expectedTweetUrl = "") {
     runtimeState.xTabWindowId = tab.windowId;
     return tab;
   } catch (_) {
+    if (!isCurrent()) return null;
     runtimeState.xTabId = null;
     runtimeState.xTabWindowId = null;
     return null;
@@ -3461,6 +4156,7 @@ async function getBoundMatchingTaskXTab(expectedTweetUrl = "") {
 }
 
 function releaseAttemptedTask(task) {
+  if (!task) return;
   const keys = getTaskDedupeKeys(task);
   if (!keys.length) return;
   const released = new Set(keys);
@@ -3515,7 +4211,10 @@ async function ensurePermanentIgnoredTaskKeysLoaded() {
 }
 
 async function markPermanentIgnoredTask(task, taskType = "") {
+  const isCurrent = captureRunGuard();
+  if (!isCurrent()) return false;
   await ensurePermanentIgnoredTaskKeysLoaded();
+  if (!isCurrent()) return false;
   const inputTask = task || {};
   const normalizedTask = { ...inputTask, taskType: inputTask.taskType || taskType || "非评论" };
   const keys = getTaskDedupeKeys(normalizedTask);
@@ -3532,6 +4231,7 @@ async function markPermanentIgnoredTask(task, taskType = "") {
   const values = Array.from(permanentIgnoredTaskKeysCache).slice(-1000);
   permanentIgnoredTaskKeysCache = new Set(values);
   await chrome.storage.local.set({ [PERMANENT_IGNORED_TASK_KEYS_KEY]: values });
+  if (!isCurrent()) return false;
   log("warn", `已永久忽略${taskType || normalizedTask.taskType || "非评论"}任务：${describeTaskForLog(normalizedTask)}`);
   return true;
 }
@@ -3564,6 +4264,7 @@ async function queryTweetReplyHistory(tweet = {}, task = {}) {
 }
 
 async function recordReplyHistory(result = {}) {
+  const isCurrent = captureRunGuard();
   const replyText = String(result.replyText || "").trim();
   if (!replyText) return false;
 
@@ -3587,7 +4288,7 @@ async function recordReplyHistory(result = {}) {
   const filtered = records.filter((item) => buildReplyHistoryDedupeKey(item) !== dedupeKey);
   const next = [record, ...filtered].slice(0, MAX_REPLY_HISTORY_RECORDS);
   await chrome.storage.local.set({ [REPLY_HISTORY_RECORDS_KEY]: next });
-  log("info", `已记录回复：${record.replyText}`);
+  if (isCurrent()) log("info", `已记录回复：${record.replyText}`);
   return true;
 }
 
@@ -3761,12 +4462,14 @@ function normalizeForLogFilter(text) {
 }
 
 function setStage(stage) {
+  if (runtimeState.manuallyStopped) return;
   runtimeState.stage = stage;
   persistAutoRunState();
   publishLighthouseMonitorSnapshot("stage");
 }
 
 function log(level, text, meta = null) {
+  if (runtimeState.manuallyStopped) return;
   runtimeState.logs = runtimeState.logs || [];
   runtimeState.logs.unshift({
     at: new Date().toISOString(),
@@ -3785,6 +4488,10 @@ async function restoreAutoRunState() {
     const stored = await chrome.storage.local.get([AUTO_RUN_STATE_KEY]);
     const saved = stored[AUTO_RUN_STATE_KEY];
     if (!saved || typeof saved !== "object") return;
+    if (saved.manuallyStopped) {
+      runtimeState = { ...createInitialState(), manuallyStopped: true, stage: "stopped", runId: saved.runId || createRunId(), stopEpoch: saved.stopEpoch, logs: Array.isArray(saved.logs) ? saved.logs.filter(entry => entry.text === "已停止运行").slice(0, 1) : [] };
+      return;
+    }
     const mayResume = saved.running === true && saved.mode === "auto" && !saved.uncertainAction;
     runtimeState = {
       ...createInitialState(),
@@ -3794,6 +4501,9 @@ async function restoreAutoRunState() {
       stage: mayResume ? "interrupted_not_resumed" : "stopped",
       logs: Array.isArray(saved.logs) ? saved.logs.slice(0, 120) : [],
       pendingXOpen: null,
+      // Only the live worker owns a refresh; no in-flight operation survives
+      // a service-worker restart, even if its snapshot was persisted mid-way.
+      marketplaceRefreshInFlight: false,
       completionEvidence: saved.completionEvidence?.incomeVerified && !saved.completionEvidence.officialCompletion ? null : (saved.completionEvidence || null),
       runId: saved.runId || createRunId()
     };
@@ -3847,93 +4557,163 @@ async function clearCampaignsIdleReloadAlarm() {
 
 async function handleAutoRunKeepaliveTick() {
   await runtimeStateReady;
+  if (runtimeState.manuallyStopped) {
+    const stoppedState = runtimeState;
+    await clearAutoRunKeepalive();
+    if (runtimeState === stoppedState && runtimeState.manuallyStopped) await clearCampaignsIdleReloadAlarm();
+    return;
+  }
+  const tickState = runtimeState;
+  const tickRunId = runtimeState.runId;
+  const tickStopEpoch = runtimeState.stopEpoch;
+  const isCurrentTick = () => runtimeState === tickState && runtimeState.runId === tickRunId && runtimeState.stopEpoch === tickStopEpoch;
   if (runtimeState.running && (runtimeState.mode === "auto" || runtimeState.mode === "selected_once")) {
     // Any extension API call resets the MV3 idle timer; the alarm wake itself
     // already restarted the 30s window, this touch makes it deterministic.
     try { await chrome.runtime.getPlatformInfo(); } catch (_) {}
+    if (!isCurrentTick() || !runtimeState.running) return;
     const currentTask = runtimeState.currentTask || {};
     const noCurrentTask = !runtimeState.currentTask;
     const hasLockedTask = Boolean(
       runtimeState.currentTask
-      && (currentTask.seatLocked === true || currentTask.seatLockedAt)
+      && (currentTask.invitationAccepted || currentTask.seatLocked === true || currentTask.seatLockedAt || currentTask.claimed === true)
     );
     const hasUnclaimedTask = Boolean(runtimeState.currentTask && !hasLockedTask);
     const noActiveOrder = noCurrentTask || hasUnclaimedTask;
     const isSelectingTaskStage = runtimeState.stage === "selecting_task";
     if (runtimeState.mode === "auto"
       && noActiveOrder
+      // An unanswered scan can already have clicked a claim. Only the page's
+      // structured receipt may release its intent and request a safe reload.
+      && !runtimeState.uncertainAction
       && Date.now() - Number(runtimeState.lastProgressAt || 0) >= CAMPAIGNS_IDLE_REFRESH_MS
       && !runtimeState.marketplaceRefreshInFlight
       && Number.isInteger(runtimeState.lighthouseTabId)) {
-      runtimeState.marketplaceRefreshInFlight = true;
+      const recoveringState = runtimeState;
+      let recoveringRunId = runtimeState.runId;
+      const ownsRecovery = () => runtimeState === recoveringState && runtimeState.runId === recoveringRunId && runtimeState.stopEpoch === tickStopEpoch;
+      recoveringState.marketplaceRefreshInFlight = true;
       try {
         const options = runtimeState.startOptions || {};
         const windowId = getRuntimeWindowId();
         log("info", `Lighthouse 任务广场连续 5 分钟无活动（${isSelectingTaskStage ? "任务选择阶段" : "流程空闲阶段"}），停止当前运行并重新执行全量检测`);
         const marketplaceTabId = runtimeState.lighthouseTabId;
-        await cancelCurrentRun();
+        await cancelCurrentRun(ownsRecovery);
+        if (!ownsRecovery()) return;
         await clearAutoRunResumeSchedule();
+        if (!ownsRecovery()) return;
         await clearAutoRunKeepalive();
+        if (!ownsRecovery()) return;
         await clearCampaignsIdleReloadAlarm();
+        if (!ownsRecovery()) return;
         runtimeState.running = false;
         runtimeState.scheduledResumeAt = 0;
-        runtimeState.runId = createRunId();
+        recoveringRunId = runtimeState.runId = createRunId();
         clearXOpenWatch();
         setStage("stopped");
         if (Number.isInteger(marketplaceTabId)) {
           await chrome.tabs.reload(marketplaceTabId);
-          await waitForTabComplete(marketplaceTabId);
+          if (!ownsRecovery()) return;
+          const reloaded = await waitForTabComplete(marketplaceTabId);
+          if (!ownsRecovery()) return;
+          if (reloaded === false) throw new Error("重新检测前 Lighthouse 页面加载超时");
         }
-        void startAutoRun(options, windowId).catch((error) => {
+        if (!ownsRecovery()) return;
+        // startAutoRun can keep scanning for hours. Observe its refusal/error
+        // without holding the old recovery lock for that entire run.
+        const restartPromise = startAutoRun(options, windowId);
+        const restartedState = runtimeState;
+        const restartedRunId = runtimeState.runId;
+        const restartStopEpoch = runtimeState.stopEpoch;
+        const ownsRestart = () => runtimeState === restartedState && runtimeState.runId === restartedRunId && runtimeState.stopEpoch === restartStopEpoch;
+        void restartPromise.then((result) => {
+          if (ownsRestart() && result?.ok === false && !result.cancelled) {
+            log("error", `Lighthouse 重新执行全量检测被拒绝：${result.error || result.message || "启动条件未满足"}`);
+          }
+        }).catch((error) => {
+          if (!ownsRestart()) return;
+          runtimeState.running = false;
+          setStage("auto_restart_failed");
           log("error", `Lighthouse 重新执行全量检测失败：${error.message || String(error)}`);
         });
       } catch (error) {
-        log("warn", `Lighthouse 停止并重新检测失败：${error.message || String(error)}`);
+        if (!ownsRecovery()) return;
+        runtimeState.running = false;
+        setStage("campaigns_reload_failed");
+        log("error", `Lighthouse 停止并重新检测失败，已保持停止：${error.message || String(error)}`);
       } finally {
-        runtimeState.marketplaceRefreshInFlight = false;
+        if (ownsRecovery()) recoveringState.marketplaceRefreshInFlight = false;
       }
     }
     return;
   }
   if (await tryResumeAutoRunAfterInterruption()) return;
+  if (runtimeState !== tickState || runtimeState.running) return;
+  // Recovery may rotate this same state's runId before failing safely. Its
+  // stopped alarms still need cleanup, without clearing a later run's alarms.
+  const idleRunId = runtimeState.runId;
+  const isCurrentIdle = () => runtimeState === tickState && runtimeState.runId === idleRunId && !runtimeState.running && runtimeState.stopEpoch === tickStopEpoch;
   // No active run and nothing safe to resume: stop keeping the worker awake.
   await clearAutoRunKeepalive();
+  if (!isCurrentIdle()) return;
   await clearCampaignsIdleReloadAlarm();
 }
 
 async function tryResumeAutoRunAfterInterruption() {
+  if (runtimeState.manuallyStopped) return false;
   if (runtimeState.running) return true;
   if (runtimeState.uncertainAction) return false;
   if (runtimeState.mode !== "idle" || runtimeState.stage !== "interrupted_not_resumed") return false;
   const savedTask = runtimeState.currentTask || {};
   const hasLockedIncompleteSeat = Boolean(
-    (savedTask.seatLocked === true || savedTask.seatLockedAt) && !runtimeState.completionEvidence
+    (savedTask.invitationAccepted || savedTask.seatLocked === true || savedTask.seatLockedAt) && !runtimeState.completionEvidence
   );
   if (hasLockedIncompleteSeat) {
     log("error", `service worker 重启后仍有已锁定未完成的订单（${describeTaskForLog(savedTask)}），不自动续跑，请人工处理该订单后重新启动`);
     return false;
   }
-  // The old content-script run may still hold its claim with the previous
-  // runId; cancel it so the resumed scan is not answered with a conflict.
-  if (Number.isInteger(runtimeState.lighthouseTabId)) {
-    try {
-      await chrome.tabs.sendMessage(runtimeState.lighthouseTabId, {
-        type: "CANCEL_LIGHTHOUSE_RUN",
-        runId: runtimeState.runId
-      });
-    } catch (_) {}
+  const recoveringState = runtimeState;
+  let recoveringRunId = runtimeState.runId;
+  const isCurrentRecovery = () => runtimeState === recoveringState && runtimeState.runId === recoveringRunId;
+  try {
+    // Persisted window IDs may no longer exist after Chrome closes or restarts.
+    const windowId = Number.isInteger(runtimeState.lighthouseWindowId)
+      ? runtimeState.lighthouseWindowId : runtimeState.runtimeWindowId;
+    if (Number.isInteger(windowId)) await chrome.windows.get(windowId);
+    if (!isCurrentRecovery() || runtimeState.running || runtimeState.stage !== "interrupted_not_resumed") return runtimeState.running;
+
+    // Cancel the old content-script run before resuming in the same window.
+    if (Number.isInteger(runtimeState.lighthouseTabId)) {
+      try {
+        await chrome.tabs.sendMessage(runtimeState.lighthouseTabId, {
+          type: "CANCEL_LIGHTHOUSE_RUN",
+          runId: runtimeState.runId
+        });
+      } catch (_) {}
+    }
+    if (!isCurrentRecovery() || runtimeState.running || runtimeState.stage !== "interrupted_not_resumed") return runtimeState.running;
+    recoveringRunId = runtimeState.runId = createRunId();
+    runtimeState.running = true;
+    runtimeState.mode = "auto";
+    await armCampaignsIdleReloadAlarm();
+    if (!isCurrentRecovery() || !runtimeState.running) return runtimeState.running;
+    runtimeState.xTabId = null;
+    runtimeState.xTabWindowId = null;
+    runtimeState.lastXResult = null;
+    setStage("auto_resumed_after_restart");
+    log("warn", "service worker 重启，已自动恢复正式模式继续扫描任务广场");
+    await startNextAutoTask("resume_after_service_worker_restart");
+    return runtimeState.running;
+  } catch (error) {
+    if (!isCurrentRecovery()) return runtimeState.running;
+    runtimeState.running = false;
+    const windowMissing = /No window with id|Window not found/i.test(error?.message || String(error));
+    setStage(windowMissing ? "runtime_window_missing" : "auto_resume_failed");
+    log("warn", windowMissing
+      ? "原运行窗口已关闭，已停止自动恢复并保留订单；请在目标窗口核对后重新启动"
+      : `Lighthouse 自动恢复失败，已停止并保留订单：${error.message || String(error)}`);
+    return false;
   }
-  runtimeState.runId = createRunId();
-  runtimeState.running = true;
-  runtimeState.mode = "auto";
-  await armCampaignsIdleReloadAlarm();
-  runtimeState.xTabId = null;
-  runtimeState.xTabWindowId = null;
-  runtimeState.lastXResult = null;
-  setStage("auto_resumed_after_restart");
-  log("warn", "service worker 重启，已自动恢复正式模式继续扫描任务广场");
-  await startNextAutoTask("resume_after_service_worker_restart");
-  return runtimeState.running;
 }
 
 function touchAutoRunState() {

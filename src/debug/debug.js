@@ -72,6 +72,7 @@ let settingsDirty = false;
 let saveStatusTimer = null;
 let commandStatusTimer = null;
 let commandQueueRunning = false;
+let activeStepQueue = null;
 const COUNTDOWN_TICK_MS = 1000;
 const COUNTDOWN_CALIBRATION_MS = 1000;
 const COUNTDOWN_BOOTSTRAP_RETRY_MS = 1000;
@@ -88,6 +89,15 @@ let selectedCountdownKey = "";
 let renderedCountdownTasks = [];
 let panelSpeechQueue = [];
 let panelSpeaking = false;
+let panelPaused = true;
+let panelPauseKnown = false;
+let panelEpoch = 0;
+let panelStopEpoch = 0;
+let panelStopPending = false;
+let panelRunId = "";
+let countdownTickTimer = null;
+let countdownCalibrationTimer = null;
+let activePanelSpeech = null;
 
 const STEP_COMPLETION_STAGES = {
   DEBUG_OPEN_CAMPAIGNS: ["campaigns_opened", "lighthouse_page_detected"],
@@ -102,13 +112,26 @@ const STEP_COMPLETION_STAGES = {
 };
 
 saveBtn.addEventListener("click", () => runPanelTask(saveSettings));
-document.getElementById("stopBtn").addEventListener("click", () => runPanelTask(async () => {
-  await chrome.runtime.sendMessage({ type: "STOP_RUN" });
-  await loadState();
-}));
+document.getElementById("stopBtn").addEventListener("click", () => {
+  cancelStepQueue();
+  const stopEpoch = typeof pausePanelActivity === "function" ? pausePanelActivity() : null;
+  return runPanelTask(async () => {
+    await chrome.runtime.sendMessage({ type: "STOP_RUN" });
+    if (typeof finishPanelStop === "function") finishPanelStop(stopEpoch);
+    await loadState();
+  });
+});
 document.getElementById("clearReplyRecordsBtn").addEventListener("click", () => runPanelTask(clearReplyRecords));
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === "AUTOMATION_PAUSE_CHANGED") {
+    if (message.paused === true || !panelStopPending) {
+      applyPanelPause(message.paused === true);
+      if (message.paused === false) runPanelTask(loadState);
+    }
+    sendResponse({ ok: true });
+    return true;
+  }
   if (message?.type === "PANEL_SPEAK_TEXT") {
     speakFromPanel(message);
     sendResponse({ ok: true });
@@ -153,9 +176,59 @@ if ("speechSynthesis" in window) {
   speechSynthesis.getVoices();
   speechSynthesis.onvoiceschanged = () => populateVoiceOptions(fields.monitorVoiceName.value);
 }
-setInterval(tickCountdowns, COUNTDOWN_TICK_MS);
-setInterval(() => syncCountdowns("calibration"), COUNTDOWN_CALIBRATION_MS);
-startCountdownBootstrapSync();
+
+function pausePanelActivity() {
+  panelStopPending = true;
+  applyPanelPause(true, true);
+  return panelEpoch;
+}
+
+function finishPanelStop(epoch) {
+  if (epoch === panelEpoch) panelStopPending = false;
+}
+
+function applyPanelPause(paused, force = false) {
+  if (panelPauseKnown && panelPaused === paused && !force) return;
+  panelPauseKnown = true;
+  panelPaused = paused;
+  panelEpoch += 1;
+  countdownSyncInFlight = false;
+  if (!paused) {
+    countdownTickTimer = setInterval(tickCountdowns, COUNTDOWN_TICK_MS);
+    countdownCalibrationTimer = setInterval(() => syncCountdowns("calibration"), COUNTDOWN_CALIBRATION_MS);
+    startCountdownBootstrapSync();
+    return;
+  }
+  panelStopEpoch += 1;
+  panelRunId = "";
+  cancelStepQueue();
+  document.querySelectorAll("[data-command]").forEach((button) => setButtonRunning(button, false));
+  clearInterval(countdownTickTimer);
+  clearInterval(countdownCalibrationTimer);
+  countdownTickTimer = null;
+  countdownCalibrationTimer = null;
+  stopCountdownBootstrapSync();
+  countdownTasks = [];
+  renderedCountdownTasks = [];
+  countdownSyncedAt = 0;
+  selectedCountdownTask = null;
+  selectedCountdownKey = "";
+  panelSpeechQueue = [];
+  const speech = activePanelSpeech;
+  activePanelSpeech = null;
+  panelSpeaking = false;
+  speech?.controller.abort();
+  speech?.cancel?.();
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
+  countdownList.innerHTML = '<p class="countdownEmpty">已停止，等待手动启动</p>';
+  countdownSyncTime.textContent = "已停止";
+  document.getElementById("monitorStatus").textContent = "已停止，等待手动启动";
+  logList.replaceChildren();
+  modeBadge.textContent = "idle";
+  stageBadge.textContent = "stopped";
+  document.body.dataset.mode = "idle";
+  document.body.dataset.stage = "stopped";
+}
 
 function runPanelTask(action) {
   return Promise.resolve()
@@ -168,8 +241,12 @@ function runPanelTask(action) {
 }
 
 async function loadState() {
+  const epoch = panelEpoch;
   const response = await chrome.runtime.sendMessage({ type: "GET_STATE" });
+  if (epoch !== panelEpoch || panelStopPending) return;
   if (!response || !response.ok) return;
+  applyPanelPause(response.state?.manuallyStopped === true);
+  panelRunId = panelPaused ? "" : (response.state?.runId || "");
   if (!settingsDirty) {
     renderSettings(response.settings);
   }
@@ -236,21 +313,27 @@ async function saveMonitorSettings() {
 
 async function runSingleCommand(button) {
   if (commandQueueRunning) return;
+  const commandEpoch = panelStopEpoch;
+  const isCurrent = () => commandEpoch === panelStopEpoch;
   await saveSettings();
+  if (!isCurrent()) return;
   setButtonRunning(button, true);
   if (button.dataset.command === "RUN_SELECTED_COUNTDOWN_TASK") {
     showCommandStatus("正在停止当前流程并启动选中任务", "info", 0);
   }
   try {
-    const response = await sendCommandAndWaitForStage(button.dataset.command);
+    const response = await sendCommandAndWaitForStage(button.dataset.command, { isCurrent });
+    if (!isCurrent()) return;
     if (!response?.ok) {
       showCommandStatus(response?.error || response?.result?.message || "指令未执行", "error");
     } else if (button.dataset.command === "RUN_SELECTED_COUNTDOWN_TASK") {
       showCommandStatus("选中任务流程已完成", "success");
     }
   } finally {
-    setButtonRunning(button, false);
-    await loadState();
+    if (isCurrent()) {
+      setButtonRunning(button, false);
+      await loadState();
+    }
   }
 }
 
@@ -272,53 +355,102 @@ function showCommandStatus(text, kind = "info", timeoutMs = 5000) {
 
 async function runStepQueue(startIndex) {
   if (commandQueueRunning) return;
+  const queueRun = { cancelled: false, runId: "" };
+  activeStepQueue = queueRun;
+  const ownsQueue = () => activeStepQueue === queueRun;
+  const isCurrent = () => ownsQueue() && !queueRun.cancelled;
   commandQueueRunning = true;
-  await saveSettings();
-  setStepButtonsDisabled(true);
-  showCommandStatus(`从第 ${startIndex + 1} 步开始连续执行`, "info", 0);
   let completed = true;
   try {
+    setStepButtonsDisabled(true);
+    await saveSettings();
+    if (!isCurrent()) return;
+    showCommandStatus(`从第 ${startIndex + 1} 步开始连续执行`, "info", 0);
     const queue = stepButtons.slice(startIndex);
     for (const button of queue) {
+      if (!isCurrent()) return;
       setButtonRunning(button, true);
       const label = button.querySelector("strong")?.textContent || "步骤";
       try {
-        const response = await sendCommandAndWaitForStage(button.dataset.command);
+        const response = await sendCommandAndWaitForStage(button.dataset.command, { queueRun, isCurrent });
+        if (!isCurrent()) return;
         if (!response?.ok) {
           completed = false;
           showCommandStatus(response?.error || response?.result?.message || `${label}未完成`, "error");
           break;
         }
       } finally {
-        setButtonRunning(button, false);
-        await loadState();
+        if (ownsQueue()) {
+          setButtonRunning(button, false);
+          await loadState();
+        }
       }
     }
+  } catch (error) {
+    completed = false;
+    if (isCurrent()) showCommandStatus(error?.message || "步骤执行失败", "error");
   } finally {
-    commandQueueRunning = false;
-    setStepButtonsDisabled(false);
-    await loadState();
+    if (ownsQueue()) {
+      commandQueueRunning = false;
+      setStepButtonsDisabled(false);
+      try {
+        await loadState();
+      } catch (error) {
+        completed = false;
+        if (isCurrent()) showCommandStatus(error?.message || "读取流程状态失败", "error");
+      } finally {
+        if (ownsQueue()) {
+          activeStepQueue = null;
+          if (completed && !queueRun.cancelled) showCommandStatus("后续流程已连续执行完成", "success");
+        }
+      }
+    }
   }
-  if (completed) showCommandStatus("后续流程已连续执行完成", "success");
 }
 
-async function sendCommandAndWaitForStage(command) {
+function cancelStepQueue() {
+  if (!activeStepQueue) return;
+  activeStepQueue.cancelled = true;
+  activeStepQueue = null;
+  commandQueueRunning = false;
+  setStepButtonsDisabled(false);
+  stepButtons.forEach((button) => setButtonRunning(button, false));
+  showCommandStatus("步骤队列已停止", "info");
+}
+
+async function sendCommandAndWaitForStage(command, control = {}) {
+  const isCurrent = control.isCurrent || (() => true);
+  const cancelled = () => ({ ok: false, cancelled: true, error: "单步流程已停止或被新流程接管" });
+  if (!isCurrent()) return cancelled();
   const payload = await withClientWindowId({ type: command });
+  if (!isCurrent()) return cancelled();
+  if (control.queueRun?.runId) payload.expectedRunId = control.queueRun.runId;
   if (command === "DEBUG_FAST_X_CLAIM_REPLY_VERIFY" || command === "RUN_SELECTED_COUNTDOWN_TASK") {
     const task = resolveSelectedCountdownTask();
     if (task) payload.selectedTask = task;
   }
   const response = await chrome.runtime.sendMessage(payload);
+  if (!isCurrent()) return cancelled();
   if (!response || response.ok === false) return response || { ok: false };
 
-  const expectedStages = STEP_COMPLETION_STAGES[command];
-  if (!expectedStages || expectedStages.length === 0) return response;
-
   const state = response.state || {};
-  if (expectedStages.includes(state.stage)) return response;
+  if (control.queueRun?.runId && state.runId !== control.queueRun.runId) return cancelled();
+  if (control.queueRun && !state.runId) return { ok: false, error: `无法确认步骤所属流程：${command}` };
+  if (control.queueRun && state.runId) control.queueRun.runId = state.runId;
 
-  const completed = await waitForStateStage(expectedStages, getStepWaitTimeoutMs(command));
-  return completed ? response : { ok: false, error: `步骤未完成：${command}` };
+  const expectedStages = STEP_COMPLETION_STAGES[command];
+  if (!expectedStages || expectedStages.length === 0) {
+    const completedAutoRun = command === "START_RUN" && state.mode === "auto" && state.stage === "finished";
+    return state.running === false && !completedAutoRun ? cancelled() : response;
+  }
+
+  if (expectedStages.includes(state.stage)) return response;
+  if (state.running === false) return cancelled();
+  if (!state.runId) return { ok: false, error: `无法确认步骤所属流程：${command}` };
+
+  const completion = await waitForStateStage(expectedStages, getStepWaitTimeoutMs(command), state.runId, isCurrent);
+  if (!isCurrent()) return cancelled();
+  return completion.ok ? { ...response, state: completion.state } : completion;
 }
 
 async function withClientWindowId(payload) {
@@ -331,14 +463,19 @@ async function withClientWindowId(payload) {
   return payload;
 }
 
-async function waitForStateStage(expectedStages, timeoutMs) {
+async function waitForStateStage(expectedStages, timeoutMs, runId, isCurrent = () => true) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
+    if (!isCurrent()) return { ok: false, cancelled: true, error: "单步流程已停止" };
     const response = await chrome.runtime.sendMessage({ type: "GET_STATE" });
-    if (response?.ok && expectedStages.includes(response.state?.stage)) return true;
+    if (!isCurrent()) return { ok: false, cancelled: true, error: "单步流程已停止" };
+    const state = response?.state;
+    if (response?.ok && state?.runId !== runId) return { ok: false, cancelled: true, error: "流程已变化，停止旧步骤队列" };
+    if (response?.ok && expectedStages.includes(state?.stage)) return { ok: true, state };
+    if (response?.ok && state?.running === false) return { ok: false, cancelled: true, error: "运行已停止，停止步骤等待" };
     await wait(250);
   }
-  return false;
+  return { ok: false, error: "等待步骤完成超时" };
 }
 
 function getStepWaitTimeoutMs(command) {
@@ -605,6 +742,7 @@ function getActiveView() {
 }
 
 async function loadMonitorStatus() {
+  const epoch = panelEpoch;
   try {
     const response = await chrome.runtime.sendMessage({ type: "MONITOR_GET_SETTINGS" });
     if (response && response.ok) {
@@ -623,11 +761,11 @@ async function loadMonitorStatus() {
       renderMonitorTemplatePreviews();
       document.getElementById("monitorVoiceRateValue").textContent = response.voiceRate;
       document.getElementById("monitorVoicePitchValue").textContent = response.voicePitch;
-      document.getElementById("monitorStatus").textContent = `已通知 ${response.seenCount || 0} 条`;
+      if (!panelPaused && epoch === panelEpoch) document.getElementById("monitorStatus").textContent = `已通知 ${response.seenCount || 0} 条`;
       return;
     }
   } catch (_) {}
-  document.getElementById("monitorStatus").textContent = "未连接（请先打开灯塔页面）";
+  if (!panelPaused && epoch === panelEpoch) document.getElementById("monitorStatus").textContent = "未连接（请先打开灯塔页面）";
 }
 
 function initMonitorButtons() {
@@ -648,12 +786,15 @@ function initMonitorButtons() {
   pitchSlider.addEventListener("input", () => { pitchValue.textContent = pitchSlider.value; markSettingsDirty(); });
 
   document.getElementById("monitorTestVoiceBtn").addEventListener("click", async () => {
+    if (panelPaused) return;
+    const epoch = panelEpoch;
     try {
       await saveMonitorSettings();
+      if (panelPaused || epoch !== panelEpoch) return;
       document.getElementById("monitorStatus").textContent = "语音测试中...";
       await chrome.runtime.sendMessage({ type: "MONITOR_TEST_VOICE" });
     } catch (e) {
-      document.getElementById("monitorStatus").textContent = `语音失败: ${e?.message || "unknown"}`;
+      if (!panelPaused && epoch === panelEpoch) document.getElementById("monitorStatus").textContent = `语音失败: ${e?.message || "unknown"}`;
     }
   });
 
@@ -754,6 +895,7 @@ function chooseVoice(preferredName = "") {
 }
 
 function speakFromPanel(message) {
+  if (panelPaused || !panelRunId || message.runId !== panelRunId) return;
   const text = String(message.text || "").trim();
   if (!text) return;
 
@@ -774,28 +916,37 @@ function speakFromPanel(message) {
 }
 
 async function processPanelSpeechQueue() {
-  if (panelSpeaking || panelSpeechQueue.length === 0) return;
+  if (panelPaused || panelSpeaking || panelSpeechQueue.length === 0) return;
   panelSpeaking = true;
   const item = panelSpeechQueue.shift();
+  const speech = { epoch: panelEpoch, controller: new AbortController(), cancel: null };
+  activePanelSpeech = speech;
 
   try {
     if (item.voiceEngine === "mimo") {
       const voiceLabel = item.voiceName || "冰糖";
       document.getElementById("monitorStatus").textContent = `播报中 · MiMo ${voiceLabel}`;
-      await playMimoSpeech(item);
-      document.getElementById("monitorStatus").textContent = `播报完成 · MiMo ${voiceLabel}`;
+      await playMimoSpeech(item, speech);
+      if (isCurrentPanelSpeech(speech)) document.getElementById("monitorStatus").textContent = `播报完成 · MiMo ${voiceLabel}`;
     } else {
-      await playBrowserSpeech(item);
+      await playBrowserSpeech(item, speech);
     }
   } catch (error) {
-    document.getElementById("monitorStatus").textContent = `播报失败: ${error?.message || "unknown"}`;
+    if (isCurrentPanelSpeech(speech)) document.getElementById("monitorStatus").textContent = `播报失败: ${error?.message || "unknown"}`;
   } finally {
-    panelSpeaking = false;
-    processPanelSpeechQueue();
+    if (activePanelSpeech === speech) {
+      activePanelSpeech = null;
+      panelSpeaking = false;
+      processPanelSpeechQueue();
+    }
   }
 }
 
-function playBrowserSpeech(item) {
+function isCurrentPanelSpeech(speech) {
+  return !panelPaused && activePanelSpeech === speech && speech.epoch === panelEpoch;
+}
+
+function playBrowserSpeech(item, speech) {
   return new Promise((resolve, reject) => {
     if (!("speechSynthesis" in window)) {
       reject(new Error("浏览器不支持本机语音"));
@@ -812,8 +963,13 @@ function playBrowserSpeech(item) {
     const chosen = chooseVoice(item.voiceName);
     if (chosen) utterance.voice = chosen;
     document.getElementById("monitorStatus").textContent = `播报中 · ${chosen?.name || "默认音色"}`;
+    speech.cancel = () => {
+      utterance.onend = null;
+      utterance.onerror = null;
+      resolve();
+    };
     utterance.onend = () => {
-      document.getElementById("monitorStatus").textContent = `播报完成 · ${chosen?.name || "默认音色"}`;
+      if (isCurrentPanelSpeech(speech)) document.getElementById("monitorStatus").textContent = `播报完成 · ${chosen?.name || "默认音色"}`;
       resolve();
     };
     utterance.onerror = (event) => reject(new Error(event.error || "browser_tts_failed"));
@@ -821,13 +977,14 @@ function playBrowserSpeech(item) {
   });
 }
 
-async function playMimoSpeech(item) {
+async function playMimoSpeech(item, speech) {
   const apiKey = String(item.mimoApiKey || "").trim();
   const baseUrl = normalizeMimoBaseUrl(item.mimoBaseUrl || "");
   if (!apiKey) throw new Error("缺少 MiMo API Key");
 
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
+    signal: speech.controller.signal,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`
@@ -844,7 +1001,9 @@ async function playMimoSpeech(item) {
     })
   });
 
+  if (!isCurrentPanelSpeech(speech)) return;
   const payload = await response.json().catch(() => ({}));
+  if (!isCurrentPanelSpeech(speech)) return;
   if (!response.ok) {
     const detail = payload?.error?.message || payload?.detail || response.statusText || "mimo_request_failed";
     throw new Error(detail);
@@ -855,7 +1014,7 @@ async function playMimoSpeech(item) {
 
   const url = createObjectUrlFromBase64(audioData, "audio/mpeg");
   try {
-    await playAudioUrl(url);
+    await playAudioUrl(url, speech);
   } finally {
     URL.revokeObjectURL(url);
   }
@@ -875,9 +1034,18 @@ function createObjectUrlFromBase64(base64, mimeType) {
   return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
 }
 
-function playAudioUrl(url) {
+function playAudioUrl(url, speech) {
   return new Promise((resolve, reject) => {
+    if (!isCurrentPanelSpeech(speech)) { resolve(); return; }
     const audio = new Audio(url);
+    speech.cancel = () => {
+      audio.onended = null;
+      audio.onerror = null;
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+      resolve();
+    };
     audio.onended = () => resolve();
     audio.onerror = () => reject(new Error("audio_play_failed"));
     audio.play().catch((error) => reject(new Error(error?.message || "audio_play_failed")));
@@ -885,10 +1053,15 @@ function playAudioUrl(url) {
 }
 
 async function syncCountdowns(reason = "manual") {
-  if (countdownSyncInFlight) return;
+  if (panelPaused || countdownSyncInFlight) return;
+  const epoch = panelEpoch;
   countdownSyncInFlight = true;
   try {
-    const response = await chrome.runtime.sendMessage(await withClientWindowId({ type: "MONITOR_GET_COUNTDOWNS" }));
+    const payload = await withClientWindowId({ type: "MONITOR_GET_COUNTDOWNS" });
+    if (panelPaused || epoch !== panelEpoch) return;
+    const response = await chrome.runtime.sendMessage(payload);
+    if (panelPaused || epoch !== panelEpoch) return;
+    if (response?.paused) { applyPanelPause(true); return; }
     if (response && response.ok) {
       countdownSyncedAt = Number(response.timestamp) || Date.now();
       countdownTasks = normalizeCountdownTasks(response.tasks || [], countdownSyncedAt);
@@ -898,28 +1071,32 @@ async function syncCountdowns(reason = "manual") {
       countdownSyncTime.textContent = "无数据";
     }
   } catch (e) {
-    countdownSyncTime.textContent = "错误";
+    if (!panelPaused && epoch === panelEpoch) countdownSyncTime.textContent = "错误";
   } finally {
-    countdownSyncInFlight = false;
+    if (epoch === panelEpoch) countdownSyncInFlight = false;
   }
 }
 
 function startCountdownBootstrapSync() {
-  if (countdownBootstrapTimer) return;
+  if (panelPaused || countdownBootstrapTimer) return;
   countdownBootstrapAttempts = 0;
   syncCountdowns("bootstrap");
   scheduleCountdownBootstrapRetry(COUNTDOWN_BOOTSTRAP_RETRY_MS);
 }
 
 function scheduleCountdownBootstrapRetry(delayMs) {
+  if (panelPaused) return;
+  const epoch = panelEpoch;
   if (countdownBootstrapTimer) clearInterval(countdownBootstrapTimer);
   countdownBootstrapTimer = setInterval(async () => {
+    if (panelPaused || epoch !== panelEpoch) return;
     if (countdownTasks.length > 0) {
       stopCountdownBootstrapSync();
       return;
     }
     countdownBootstrapAttempts += 1;
     await syncCountdowns("bootstrap");
+    if (panelPaused || epoch !== panelEpoch) return;
     if (countdownBootstrapAttempts === COUNTDOWN_BOOTSTRAP_MAX_ATTEMPTS) {
       scheduleCountdownBootstrapRetry(COUNTDOWN_EMPTY_RETRY_MS);
     }
@@ -933,7 +1110,7 @@ function stopCountdownBootstrapSync() {
 }
 
 function tickCountdowns() {
-  if (!countdownTasks.length) return;
+  if (panelPaused || !countdownTasks.length) return;
   renderCountdowns(countdownTasks, countdownSyncedAt, "local");
 }
 
@@ -1019,6 +1196,7 @@ function renderCountdowns(tasks, timestamp, reason = "local") {
 }
 
 function selectCountdownTask(task) {
+  if (panelPaused) return;
   selectedCountdownTask = { ...task };
   selectedCountdownKey = buildCountdownSelectionKey(task);
   renderCountdowns(countdownTasks, countdownSyncedAt, "local");
