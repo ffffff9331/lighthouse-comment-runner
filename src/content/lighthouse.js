@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.90";
+  const SCRIPT_VERSION = "0.7.91";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -136,7 +136,7 @@
         message.taskTypeHint || message.task?.taskType || ""
       ),
       WAIT_SELECTED_COUNTDOWN_AND_LOCK: () => waitSelectedCountdownAndLock(message.settings, message.selectedTask),
-      CHECK_LIGHTHOUSE_LOCK_FAILURE: () => checkLighthouseLockFailure(),
+      CHECK_LIGHTHOUSE_LOCK_FAILURE: () => checkLighthouseLockFailure(message),
       BEGIN_LIGHTHOUSE_COMPLETION_WATCH: () => beginCompletionWatch(message),
       CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION: () => checkOfficialCompletion(message),
       DEBUG_LOCK_SEAT_AND_EXTRACT: () => debugLockSeatAndExtract(message.settings),
@@ -188,6 +188,19 @@
         }
         if (!operation) return result;
         const { detailConfirmed, ...receipt } = result || {};
+        if (receipt.ok === true && operation.claimActionAttempted && receipt.task?.seatLocked
+            && receipt.task.taskKey && receipt.task.seatLockedAt) {
+          const root = findTaskDetailRoot();
+          const text = normalize(root?.innerText || "");
+          operation.lockObservation = {
+            root,
+            taskKey: receipt.task.taskKey,
+            seatLockedAt: receipt.task.seatLockedAt,
+            detailSignature: claimDetailSignature(root),
+            rejectionAbsent: !hasHardFailure(text),
+            positiveStateAbsent: !hasPositiveClaimState(text)
+          };
+        }
         if (detailConfirmed === true && receipt.ok === true && receipt.task?.taskKey
             && ["DEBUG_OPEN_FIRST_COMMENT_TASK", "OPEN_SELECTED_COUNTDOWN_TASK_DETAIL", "OPEN_SELECTED_COUNTDOWN_TASK_TWEET"].includes(operation.type)) {
           // This confirms the requested detail transition, not a locked seat.
@@ -320,7 +333,7 @@
     assertActiveRun(runId);
     await confirmPagePhase(["campaigns"], settings, "全部筛选后");
 
-    const selection = await selectNextCommentTask(settings, message.attemptedTaskKeys || []);
+    const selection = await selectNextCommentTask(settings, message.attemptedTaskKeys || [], message.attemptedTaskRecords || []);
     assertActiveRun(runId);
     if (!selection || !selection.target) {
       throw new Error("未找到可执行或可等待的评论或点赞互动任务");
@@ -613,15 +626,51 @@
     throw new Error("选中任务详情加载超时");
   }
 
-  function checkLighthouseLockFailure() {
-    const text = normalize(document.body?.innerText || "");
-    if (!hasHardFailure(text)) return { ok: true, failed: false };
+  function hasPositiveClaimState(text) {
+    return /已锁定|已领取|进行中|已完成|已提交|验证通过|验证成功|奖励到账|任务完成/.test(text);
+  }
+
+  function claimDetailSignature(root) {
+    if (!root || root === document.body) return "";
+    let text = normalize(root.innerText || "").replace(/锁定(?:点击后)?失败[:：]?\s*/g, " ");
+    for (const marker of [...HARD_FAIL_MARKERS, ...LOCK_BUTTON_TEXTS, "目标推文"].sort((a, b) => b.length - a.length)) {
+      text = text.split(marker).join(" ");
+    }
+    text = normalize(text);
+    return text ? JSON.stringify([normalizeTweetUrl(extractTweetUrl(root)), text]) : "";
+  }
+
+  function checkLighthouseLockFailure(message = {}) {
+    const root = findTaskDetailRoot();
+    const task = message.task;
+    const operation = Array.from(settledClaimOperations.values()).reverse().find(value =>
+      value.runId === message.runId && value.claimActionAttempted && value.result?.ok === true
+      && value.lockObservation?.taskKey === task?.taskKey
+      && value.lockObservation?.seatLockedAt === task?.seatLockedAt);
+    const observation = operation?.lockObservation;
+    // Only a new refusal from this exact visible detail and lock attempt can
+    // revoke the provisional lock. Other cards, old pages and success evidence
+    // never authorize abandoning an order.
+    if (!observation || !task?.taskKey || !task.seatLockedAt
+        || !root || root === document.body || root !== observation.root
+        || root.isConnected === false || !isVisible(root) || !isTaskDetailOpen()
+        || !observation.rejectionAbsent || !observation.positiveStateAbsent
+        || !observation.detailSignature || observation.detailSignature !== claimDetailSignature(root))
+      return { ok: true, failed: false };
+    const text = normalize(root.innerText || "");
+    if (!hasHardFailure(text) || hasPositiveClaimState(text)) return { ok: true, failed: false };
     return {
       ok: true,
       failed: true,
       reason: extractHardFailureReason(text),
       message: `锁定失败：${extractHardFailureReason(text)}`,
-      task: buildTask({}, "")
+      task: { ...task, detailText: text.slice(0, 1800) },
+      claimRejection: {
+        runId: operation.runId,
+        taskKey: observation.taskKey,
+        seatLockedAt: observation.seatLockedAt,
+        claimIntentId: operation.claimIntentId
+      }
     };
   }
 
@@ -964,7 +1013,7 @@
     await verifyAllFilterAccepted(settings);
   }
 
-  async function selectNextCommentTask(settings, attemptedTaskKeys) {
+  async function selectNextCommentTask(settings, attemptedTaskKeys, attemptedTaskRecords = []) {
     const runId = activeRunId;
     await waitForCampaignsReady(getPageWaitMs(settings));
     const waitingSince = Date.now();
@@ -1000,7 +1049,12 @@
         lastReportedMinTaskBounty = minTaskBounty;
         report("info", `当前全量检测最低赏金：${minTaskBounty.toFixed(3)} LUX`);
       }
-      const candidates = collectTaskCandidates(attemptedTaskKeys, settings);
+      // Temporary exclusions expire during this scan, not only after a reload.
+      // Keys without a timed record are permanent or legacy exclusions.
+      const expiryByKey = new Map(attemptedTaskRecords.map(record => [record.key, Number(record.expiresAt)]));
+      const activeAttemptedKeys = attemptedTaskKeys.filter(key => !expiryByKey.has(key)
+        || !Number.isFinite(expiryByKey.get(key)) || expiryByKey.get(key) > Date.now());
+      const candidates = collectTaskCandidates(activeAttemptedKeys, settings);
       const lowBountyCandidates = candidates.filter((candidate) => candidate.isAutomatable && isBelowMinTaskBounty(candidate.bounty, minTaskBounty));
       const ignoredNonCommentCandidates = candidates.filter((candidate) => (candidate.isOriginalTweet || candidate.isRetweet) && !candidate.isBlocked);
       if (ignoredNonCommentCandidates.length && Date.now() - lastOriginalSkipReportAt > 15000) {

@@ -241,7 +241,7 @@ test("a delayed unclaimed receipt past its deadline continues with only a 250ms 
   assert.ok(!w.state().logs.some((entry) => entry.text.includes("不会自动重试")));
 });
 
-test("a real preclaim refusal excludes the selected list task and continues without uncertainty", async () => {
+test("a real preclaim refusal keeps the selected list task eligible after refresh without uncertainty", async () => {
   let w;
   const page = content("hard_refusal", (message) => w.c.handleMessage(message, {tab: {id: 11, windowId: 1}}));
   w = await worker((message) => {
@@ -262,7 +262,7 @@ test("a real preclaim refusal excludes the selected list task and continues with
   assert.equal(page.replies[0].deferredRelease, false);
   assert.equal(w.sent.length, 2, "a refused task must not halt the scan");
   for (const key of [task.taskKey, task.selectionId, task.stableTaskKey]) {
-    assert.ok(w.sent[1].attemptedTaskKeys.includes(key), "must exclude the original list identity: " + key);
+    assert.ok(!w.sent[1].attemptedTaskKeys.includes(key), "an unclaimed refusal must not exclude the original list identity: " + key);
   }
   assert.equal(w.state().failed, 1);
   assert.ok(w.effects.includes("closeDetail"));

@@ -1072,11 +1072,21 @@ async function startNextAutoTask(reason) {
     type: "START_LIGHTHOUSE_COMMENT_TASK",
     runId,
     settings,
-    attemptedTaskKeys: getActiveAttemptedTaskKeys()
+    attemptedTaskKeys: getActiveAttemptedTaskKeys(),
+    attemptedTaskRecords: (runtimeState.attemptedTaskRecords || [])
+      .filter(record => !permanentIgnoredTaskKeysCache.has(record.key)).map(record => ({ ...record }))
   });
   if (!isActiveAutoRun(runId)) return { ok: true, state: runtimeState };
 
   if (!result || !result.ok) {
+    // A late no-click receipt cannot negate an order established meanwhile.
+    if (runtimeState.uncertainAction || runtimeState.completionEvidence || runtimeState.lastXResult
+        || [runtimeState.currentTask, result?.task].some(task => task && (
+          task.invitationAccepted || task.claimed || task.seatLocked || task.seatLockedAt))) {
+      return recoverAndContinue(result?.message || result?.error || "接单结果与当前订单状态冲突", {
+        runId, task: runtimeState.currentTask || result?.task, closeX: false, preserveOrder: true
+      });
+    }
     clearXOpenWatch();
     if (result?.refreshRequested) {
       const refreshingState = runtimeState;
@@ -1144,7 +1154,18 @@ async function startNextAutoTask(reason) {
       if (deferredRelease && Number(failedTask.deferUntil) <= retryNow) {
         failedTask.deferUntil = retryNow + 250;
       }
-      markAttemptedTask(failedTask);
+      if (!deferredRelease && result?.claimActionAttempted === false
+          && !runtimeState.uncertainAction && !runtimeState.completionEvidence
+          && !failedTask.invitationAccepted && !failedTask.claimed
+          && !failedTask.seatLocked && !failedTask.seatLockedAt) {
+        runtimeState.attempts += 1;
+        releaseAttemptedTask(runtimeState.currentTask);
+        releaseAttemptedTask(failedTask);
+        runtimeState.currentTask = null;
+        log("info", "已确认未接到单，不加入去重；刷新任务广场后重新检测");
+      } else {
+        markAttemptedTask(failedTask);
+      }
     } else if (!transient) {
       runtimeState.attempts += 1;
     }
@@ -1239,7 +1260,9 @@ async function debugOpenFirstTask() {
     type: "DEBUG_OPEN_FIRST_COMMENT_TASK",
     runId,
     settings,
-    attemptedTaskKeys: getActiveAttemptedTaskKeys()
+    attemptedTaskKeys: getActiveAttemptedTaskKeys(),
+    attemptedTaskRecords: (runtimeState.attemptedTaskRecords || [])
+      .filter(record => !permanentIgnoredTaskKeysCache.has(record.key)).map(record => ({ ...record }))
   });
   if (!isCurrent()) return cancelled();
   if (result?.refreshRequested) {
@@ -1250,7 +1273,9 @@ async function debugOpenFirstTask() {
         type: "DEBUG_OPEN_FIRST_COMMENT_TASK",
         runId,
         settings,
-        attemptedTaskKeys: getActiveAttemptedTaskKeys()
+        attemptedTaskKeys: getActiveAttemptedTaskKeys(),
+        attemptedTaskRecords: (runtimeState.attemptedTaskRecords || [])
+          .filter(record => !permanentIgnoredTaskKeysCache.has(record.key)).map(record => ({ ...record }))
       });
       if (!isCurrent()) return cancelled();
     } else if (refreshState.skippedCooldown) {
@@ -1742,7 +1767,9 @@ async function openNextLighthouseTaskTweetTab(settings, stillCurrent = null) {
     type: "DEBUG_OPEN_FIRST_COMMENT_TASK",
     runId,
     settings,
-    attemptedTaskKeys: getActiveAttemptedTaskKeys()
+    attemptedTaskKeys: getActiveAttemptedTaskKeys(),
+    attemptedTaskRecords: (runtimeState.attemptedTaskRecords || [])
+      .filter(record => !permanentIgnoredTaskKeysCache.has(record.key)).map(record => ({ ...record }))
   });
   if (!isCurrent()) return null;
   if (openResult?.refreshRequested) {
@@ -1753,7 +1780,9 @@ async function openNextLighthouseTaskTweetTab(settings, stillCurrent = null) {
         type: "DEBUG_OPEN_FIRST_COMMENT_TASK",
         runId,
         settings,
-        attemptedTaskKeys: getActiveAttemptedTaskKeys()
+        attemptedTaskKeys: getActiveAttemptedTaskKeys(),
+        attemptedTaskRecords: (runtimeState.attemptedTaskRecords || [])
+          .filter(record => !permanentIgnoredTaskKeysCache.has(record.key)).map(record => ({ ...record }))
       });
       if (!isCurrent()) return null;
     } else if (refreshState.skippedCooldown) {
@@ -1888,9 +1917,13 @@ async function ensureTweetTabAfterTargetClick(lighthouseTabId, settings, task, m
 async function openDirectTweetTabIfAvailable(task, lighthouseTabId, options = {}) {
   const openingState = runtimeState;
   const openingRunId = runtimeState.runId;
+  const openingTask = runtimeState.currentTask;
   const isCurrent = () => runtimeState === openingState && runtimeState.runId === openingRunId
+    && runtimeState.currentTask === openingTask
+    && !runtimeState.currentTask?.claimRejected && !runtimeState.currentTask?.lockFailed
     && !runtimeState.manuallyStopped && (!options.isCurrent || options.isCurrent());
   if (!isCurrent()) return null;
+  if (task?.claimRejected || task?.lockFailed) return null;
   const tweetUrl = normalizeTweetUrl(task?.tweetUrl);
   if (!tweetUrl || (task?.awaitingXTabAdoption && !options.allowAwaitingXTabAdoption)) return null;
   const existing = await getBoundMatchingTaskXTab(tweetUrl, isCurrent);
@@ -2139,7 +2172,7 @@ async function adoptTargetOpenedTweet(task, lighthouseTabId, mode) {
     manualOpenAfterMs: SITE_X_OPEN_WAIT_MS
   });
   if (!isCurrent()) return cancelled();
-  if (!adopted) {
+  if (!adopted && !runtimeState.currentTask?.claimRejected && !runtimeState.currentTask?.lockFailed) {
     const directTweetTabId = await openDirectTweetTabIfAvailable(
       runtimeState.currentTask,
       runtimeState.lighthouseTabId
@@ -2562,12 +2595,26 @@ async function recoverAndContinue(message, options = {}) {
   if (!isActiveAutoRun(runId)) return { ok: true, state: runtimeState };
 
   runtimeState.failed += 1;
-  if (options.task) markAttemptedTask(options.task);
+  const task = options.task || runtimeState.currentTask;
+  const hasExplicitSeatLockState = Object.prototype.hasOwnProperty.call(task || {}, "seatLocked");
+  const protectedOrder = Boolean(options.preserveOrder || runtimeState.uncertainAction || runtimeState.completionEvidence
+    || [task, runtimeState.currentTask].some(value => value && (
+      value.invitationAccepted || value.claimed || value.seatLocked || value.seatLockedAt)));
+  const unclaimed = !protectedOrder
+    && ((hasExplicitSeatLockState && task.seatLocked === false) || task?.claimRejected === true);
+  if (unclaimed) {
+    releaseAttemptedTask(runtimeState.currentTask);
+    releaseAttemptedTask(task);
+    // A provisional lock was already counted when its click was returned.
+    if (!task.claimRejected) runtimeState.attempts += 1;
+    runtimeState.currentTask = null;
+    runtimeState.lastXResult = null;
+    log("info", "已确认未接到单，已解除本任务去重；刷新任务广场后重新检测");
+  } else if (options.task) {
+    markAttemptedTask(options.task);
+  }
 
-  const hasExplicitSeatLockState = Object.prototype.hasOwnProperty.call(options.task || {}, "seatLocked");
-  const lockedTask = hasExplicitSeatLockState
-    ? options.task.seatLocked === true
-    : runtimeState.currentTask?.seatLocked === true;
+  const lockedTask = protectedOrder;
   if (lockedTask) {
     runtimeState.currentTask = {
       ...(runtimeState.currentTask || {}),
@@ -2807,8 +2854,9 @@ async function reloadLighthouseCampaignsAfterOrder(tabId, reason = "", isCurrent
   try {
     await chrome.tabs.reload(tabId);
     if (!isCurrent()) return false;
-    await waitForTabComplete(tabId);
+    const loaded = await waitForTabComplete(tabId);
     if (!isCurrent()) return false;
+    if (loaded === false) throw new Error("刷新后 Lighthouse 页面加载超时");
     lastCampaignsRefreshAt = Date.now();
     log("info", reason || "订单结束，已重新加载 Lighthouse 任务广场");
     return true;
@@ -3781,13 +3829,20 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
       clearXOpenWatch();
       const message = lockFailure.message || lockFailure.reason || "锁定失败：任务不可做";
       runtimeState.lastLockFailureReason = message;
+      releaseAttemptedTask(runtimeState.currentTask);
+      releaseAttemptedTask(task);
+      releaseAttemptedTask(lockFailure.task);
       runtimeState.currentTask = {
         ...(runtimeState.currentTask || {}),
         ...(task || {}),
         ...(lockFailure.task || {}),
+        taskKey: task.taskKey,
+        selectionId: task.selectionId,
+        stableTaskKey: task.stableTaskKey,
         seatLocked: false,
         seatLockedAt: null,
-        lockFailed: true
+        lockFailed: true,
+        claimRejected: true
       };
       log("warn", message);
       return false;
@@ -3882,12 +3937,21 @@ async function clickCurrentDetailTweetTargetFallback(lighthouseTabId, mode, isCu
 
 async function checkLighthouseLockFailure(lighthouseTabId) {
   if (!lighthouseTabId) return null;
+  const state = runtimeState;
+  const task = state.currentTask;
+  if (!task?.taskKey || !task.seatLockedAt || state.uncertainAction || state.completionEvidence
+      || task.claimed || task.invitationAccepted || state.lastXResult) return null;
   try {
     const result = await sendToTab(lighthouseTabId, {
       type: "CHECK_LIGHTHOUSE_LOCK_FAILURE",
-      runId: runtimeState.runId
+      runId: state.runId,
+      task
     });
-    if (result?.ok && result.failed) return result;
+    const proof = result?.claimRejection;
+    if (runtimeState === state && state.currentTask === task && state.running
+        && !state.uncertainAction && !state.completionEvidence && !state.lastXResult
+        && result?.ok && result.failed && proof?.runId === state.runId
+        && proof.taskKey === task.taskKey && proof.seatLockedAt === task.seatLockedAt) return result;
   } catch (_) {}
   return null;
 }
