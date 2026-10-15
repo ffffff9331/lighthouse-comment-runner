@@ -15,13 +15,13 @@ const tab = { id: 11, windowId: 1, url: "https://app.lhdao.top/campaigns", statu
 // Exercise the complete production background, including sendToTab's receipt
 // classification and the actual reload helper. Chrome edges are inert; no
 // fixture can reach a site, claim a seat, or post a reply.
-async function worker(t) {
+async function worker(t, initialStored = {}) {
   let now = 1000000;
   class Clock extends Date {
     constructor(...args) { super(...(args.length ? args : [now])); }
     static now() { return now; }
   }
-  const sent = [], reloads = [], effects = [], stored = {}, hooks = {}, timers = new Set();
+  const sent = [], reloads = [], effects = [], stored = clone(initialStored), hooks = {}, timers = new Set();
   const chrome = {
     runtime: { id: "test", getURL: p => `chrome-extension://test/${p}`, getManifest: () => ({ version: "test" }), onInstalled: event, onMessage: event },
     storage: { local: {
@@ -77,6 +77,151 @@ async function worker(t) {
 
 function assertTaskEligible(message, keys) {
   for (const key of keys) assert.equal(message.attemptedTaskKeys.includes(key), false, `confirmed unclaimed task remains excluded: ${key}`);
+}
+
+function immediateRefusal(message) {
+  return { ok: false, claimActionAttempted: true, message: "锁定失败：不可领取",
+    task: { ...task, seatLocked: false, claimRejected: true },
+    claimRejection: { runId: message.runId, type: message.type,
+      claimIntentId: message.claimIntentId, taskKey: task.taskKey } };
+}
+
+test("a bound immediate lock refusal clears intent and resumes the plaza without excluding the task", async t => {
+  const w = await worker(t);
+  w.hooks.claim = (message, count) => count === 1 ? immediateRefusal(message)
+    : { ok: true, claimActionAttempted: true, task: { taskKey: "next-order", seatLocked: true } };
+  await w.scan();
+  assert.equal(w.scans().length, 2);
+  assert.equal(w.reloads.length, 1);
+  assert.equal(w.state().uncertainAction, undefined);
+  assertTaskEligible(w.scans()[1], w.c.getTaskDedupeKeys(task));
+});
+
+for (const cancelled of [false, true]) {
+  test(`confirmed site cooldown is respected before refreshing (stop during wait: ${cancelled})`, async t => {
+    const w = await worker(t), delays = [];
+    w.hooks.claim = (message, count) => count === 1 ? { ...immediateRefusal(message), retryAfterMs: 30000 }
+      : { ok: true, claimActionAttempted: true, task: { taskKey: "next-order", seatLocked: true } };
+    w.c.delay = async ms => {
+      delays.push(ms);
+      if (ms === 30000) {
+        assert.equal(w.reloads.length, 0, "cooldown must precede refresh and another attempt");
+        assert.equal(w.scans().length, 1);
+        assert.equal(w.state().stage, "claim_retry_cooldown");
+        assert.equal(w.stored.lighthouseAutoRunStateV1.claimRetryNotBefore, w.now() + 30000);
+        if (cancelled) w.state().running = false;
+      }
+    };
+    await w.scan();
+    assert.ok(delays.includes(30000));
+    assert.equal(w.scans().length, cancelled ? 1 : 2);
+    assert.equal(w.reloads.length, cancelled ? 0 : 1);
+  });
+}
+
+test("a resumed worker waits out the persisted platform cooldown before claiming", async t => {
+  const w = await worker(t), delays = [];
+  w.state().claimRetryNotBefore = w.now() + 45000;
+  w.c.delay = async ms => {
+    delays.push(ms);
+    if (ms === 45000) assert.equal(w.scans().length, 0);
+  };
+  await w.scan();
+  assert.equal(delays[0], 45000);
+  assert.equal(w.scans().length, 1);
+  assert.equal(w.state().claimRetryNotBefore, undefined);
+});
+
+for (const minutes of [30, 480]) {
+  test(`a rejected batch estimate of ${minutes} minutes returns to the live plaza without local dedupe`, async t => {
+    const w = await worker(t), delays = [];
+    const listTask = { ...task, taskKey: "list-alias", stableTaskKey: "stable-alias" };
+    w.hooks.claim = (message, count) => {
+      if (count !== 1) return { ok: true, claimActionAttempted: true, task: { taskKey: "next-order", seatLocked: true } };
+      w.state().currentTask = listTask;
+      return { ...immediateRefusal(message), retryAfterMs: minutes * 60000, claimRetryScope: "task" };
+    };
+    w.c.delay = async ms => { delays.push(ms); };
+    await w.scan();
+    assert.equal(w.scans().length, 2);
+    assert.equal(w.reloads.length, 1);
+    assert.equal(w.state().claimRetryNotBefore, undefined);
+    assertTaskEligible(w.scans()[1], [...w.c.getTaskDedupeKeys(task), ...w.c.getTaskDedupeKeys(listTask)]);
+    assert.ok(delays.every(ms => ms < 15000));
+    assert.ok(w.state().logs.some(entry => entry.text.includes("返回广场读取平台新的倒计时")));
+  });
+}
+
+for (const condition of ["batch", "rate-limit", "missing-log", "wrong-deadline", "uncertain", "locked"]) {
+  test(`legacy cooldown restore respects current order and refusal identity: ${condition}`, async t => {
+    const now = 1000000, deadline = now + 1800000;
+    const saved = { running: true, mode: "auto", runId: "prior-run", claimRetryNotBefore: deadline,
+      attemptedTaskRecords: [{key: "old-unclaimed", expiresAt: deadline, claimCooldown: true}],
+      attemptedTaskKeys: ["old-unclaimed"],
+      logs: [{at: new Date(now - 3000).toISOString(), text: "平台明确拒绝本次锁位：本批名额暂不可领取，请约 30 分钟后重试。"}] };
+    if (condition === "rate-limit") saved.logs.unshift({at: new Date(now).toISOString(), text: "平台明确拒绝本次锁位：你抢的太快了，请 30 秒后重试"});
+    if (condition === "missing-log") saved.logs = [];
+    if (condition === "wrong-deadline") saved.claimRetryNotBefore += 120000;
+    if (condition === "uncertain") saved.uncertainAction = { type: "START_LIGHTHOUSE_COMMENT_TASK" };
+    if (condition === "locked") saved.currentTask = { ...task, seatLocked: true };
+    const w = await worker(t, {lighthouseAutoRunStateV1: saved});
+    assert.equal(w.state().claimRetryNotBefore, condition === "batch" ? undefined : saved.claimRetryNotBefore);
+    assert.equal(w.state().attemptedTaskRecords.length, ["uncertain", "locked"].includes(condition) ? 1 : 0);
+  });
+}
+
+test("unclaimed attempts do not create timed exclusions, locked orders retain protection", async t => {
+  const w = await worker(t);
+  w.c.markAttemptedTask({...task, deferUntil: w.now() + 1800000});
+  assert.equal(w.c.getActiveAttemptedTaskKeys().includes(task.taskKey), false);
+  w.c.markAttemptedTask({...task, seatLocked: true});
+  assert.equal(w.c.getActiveAttemptedTaskKeys().includes(task.taskKey), true);
+});
+
+test("stop after a batch refusal prevents refresh and another scan", async t => {
+  const w = await worker(t);
+  w.hooks.claim = message => ({ ...immediateRefusal(message), retryAfterMs: 1800000, claimRetryScope: "task" });
+  w.c.closeLighthouseTaskDetail = async () => { w.state().running = false; return true; };
+  await w.scan();
+  assert.equal(w.scans().length, 1);
+  assert.equal(w.reloads.length, 0);
+});
+
+for (const mismatch of ["runId", "type", "claimIntentId", "taskKey"]) {
+  test(`an immediate refusal with a different ${mismatch} retains the pending claim`, async t => {
+    const w = await worker(t);
+    w.hooks.claim = message => {
+      const result = immediateRefusal(message);
+      result.retryAfterMs = 1800000;
+      result.claimRetryScope = "task";
+      result.claimRejection[mismatch] = "unrelated";
+      return result;
+    };
+    await w.scan();
+    assert.equal(w.scans().length, 1);
+    assert.equal(w.reloads.length, 0);
+    assert.equal(w.state().stage, "action_result_unknown");
+    assert.equal(w.state().running, false);
+    assert.ok(w.stored.lighthouseAutoRunStateV1.uncertainAction);
+  });
+}
+
+for (const protection of ["seatLocked", "claimed", "invitationAccepted", "completionEvidence", "lastXResult"]) {
+  test(`an immediate refusal cannot discard concurrent ${protection} evidence`, async t => {
+    const w = await worker(t);
+    w.hooks.claim = message => {
+      w.state().currentTask = { ...task };
+      if (["completionEvidence", "lastXResult"].includes(protection)) w.state()[protection] = { ok: true };
+      else w.state().currentTask[protection] = true;
+      return immediateRefusal(message);
+    };
+    await w.scan();
+    assert.equal(w.scans().length, 1);
+    assert.equal(w.reloads.length, 0);
+    assert.equal(w.state().running, false);
+    assert.ok(w.state().uncertainAction);
+    assert.equal(w.state().currentTask.taskKey, task.taskKey);
+  });
 }
 
 test("explicit no-click refusal reloads the plaza and leaves the same task eligible", async t => {

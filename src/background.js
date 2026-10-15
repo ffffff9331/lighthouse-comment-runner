@@ -81,7 +81,6 @@ let permanentIgnoredTaskKeysLoaded = false;
 let permanentIgnoredTaskKeysCache = new Set();
 let lighthouseMonitorLastWriteAt = 0;
 let lighthouseMonitorPendingTimer = null;
-const lighthouseAlertBridgeUrls = new Map();
 let capturedTargetRecoveryPromise = null;
 let directTweetOpenPromise = null;
 let selectedStartInFlight = false;
@@ -225,11 +224,11 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.tabs.onCreated.addListener((tab) => {
-  recordPotentialLighthouseOpenedXTab(tab);
+  recordPotentialLighthouseOpenedXTab(tab, true);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (!changeInfo.url && tab.status !== "complete") return;
+  if (!changeInfo.url && changeInfo.status !== "loading" && tab.status !== "complete") return;
   recordPotentialLighthouseOpenedXTab(tab || { id: tabId, url: changeInfo.url });
 });
 
@@ -519,7 +518,6 @@ async function stopAndClearRun() {
   selectedStartInFlight = false;
   lastXTaskWidgetNotifyAt = 0;
   lastCampaignsRefreshAt = 0;
-  lighthouseAlertBridgeUrls.clear();
   if (lighthouseMonitorPendingTimer) clearTimeout(lighthouseMonitorPendingTimer);
   lighthouseMonitorPendingTimer = null;
   const cancellation = cancelSupersededLighthouseRun(previousRun, true);
@@ -1009,11 +1007,25 @@ async function startAutoRun(options, windowId = null, manualRestart = false) {
   return { ok: true, state: runtimeState };
 }
 
+async function waitForClaimRetryCooldown(runId) {
+  const state = runtimeState;
+  const remainingMs = Number(state.claimRetryNotBefore || 0) - Date.now();
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return true;
+  setStage("claim_retry_cooldown");
+  log("info", `平台已拒绝本次锁位，等待 ${Math.ceil(remainingMs / 1000)} 秒后刷新检测`);
+  await delay(remainingMs);
+  if (runtimeState !== state || !isActiveAutoRun(runId) || state.manuallyStopped) return false;
+  delete state.claimRetryNotBefore;
+  await persistAutoRunState(true);
+  return runtimeState === state && isActiveAutoRun(runId) && !state.manuallyStopped;
+}
+
 async function startNextAutoTask(reason) {
   const runId = runtimeState.runId;
   const isCurrent = captureRunGuard();
   const cancelled = () => ({ ok: false, cancelled: true, state: runtimeState });
   if (!isActiveAutoRun(runId)) return { ok: false, error: "Auto run is not active" };
+  if (!await waitForClaimRetryCooldown(runId) || !isCurrent()) return cancelled();
   const settings = await getSettings();
   if (!isCurrent()) return cancelled();
   const scheduleState = getAutoRunScheduleState(settings);
@@ -1138,6 +1150,10 @@ async function startNextAutoTask(reason) {
       return startNextAutoTask("retry_after_permanent_ignore");
     }
     const deferredRelease = result?.deferredRelease === true;
+    const retryAfterMs = Number(result?.retryAfterMs);
+    const confirmedCooldown = result?.claimRejectionConfirmed === true
+      && Number.isFinite(retryAfterMs) && retryAfterMs > 0;
+    const batchUnavailable = result?.claimRejectionConfirmed === true && result.claimRetryScope === "task";
     const transient = !!result?.transient && !deferredRelease;
     if (transient) {
       runtimeState.attempts += 1;
@@ -1154,7 +1170,7 @@ async function startNextAutoTask(reason) {
       if (deferredRelease && Number(failedTask.deferUntil) <= retryNow) {
         failedTask.deferUntil = retryNow + 250;
       }
-      if (!deferredRelease && result?.claimActionAttempted === false
+      if ((result?.claimActionAttempted === false || result?.claimRejectionConfirmed === true)
           && !runtimeState.uncertainAction && !runtimeState.completionEvidence
           && !failedTask.invitationAccepted && !failedTask.claimed
           && !failedTask.seatLocked && !failedTask.seatLockedAt) {
@@ -1162,7 +1178,9 @@ async function startNextAutoTask(reason) {
         releaseAttemptedTask(runtimeState.currentTask);
         releaseAttemptedTask(failedTask);
         runtimeState.currentTask = null;
-        log("info", "已确认未接到单，不加入去重；刷新任务广场后重新检测");
+        log("info", batchUnavailable
+          ? "本批未接到单，不加入去重；返回广场读取平台新的倒计时"
+          : "已确认未接到单，不加入去重；刷新任务广场后重新检测");
       } else {
         markAttemptedTask(failedTask);
       }
@@ -1172,8 +1190,14 @@ async function startNextAutoTask(reason) {
     setStage(deferredRelease ? "task_release_deferred" : "task_select_failed");
     log(transient || deferredRelease ? "info" : "warn", result?.message || result?.error || "任务选择失败，准备尝试下一条");
     await closeLighthouseTaskDetail(tabId, settings, deferredRelease ? "等待下一批放号，关闭详情继续扫描任务广场" : "任务选择失败后关闭详情面板");
-    if (!isCurrent()) return cancelled();
-    const reloaded = await reloadLighthouseCampaignsAfterOrder(tabId, deferredRelease ? "已登记放号前重试时间，重新加载任务广场继续检测其他任务" : "接单失败，已重新加载任务广场", isCurrent);
+    if (!isCurrent() || !isActiveAutoRun(runId)) return cancelled();
+    if (confirmedCooldown && !batchUnavailable) {
+      runtimeState.claimRetryNotBefore = Date.now() + retryAfterMs;
+      await persistAutoRunState(true);
+      if (!isCurrent() || !isActiveAutoRun(runId)) return cancelled();
+      if (!await waitForClaimRetryCooldown(runId) || !isCurrent()) return cancelled();
+    }
+    const reloaded = await reloadLighthouseCampaignsAfterOrder(tabId, deferredRelease ? "未接到单，重新加载任务广场并按平台倒计时继续检测" : "接单失败，已重新加载任务广场", isCurrent);
     if (!isCurrent()) return cancelled();
     if (reloaded === false) {
       runtimeState.running = false;
@@ -1325,7 +1349,7 @@ async function debugLockSeatAndOpenTweet() {
   runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, result.task);
   markAttemptedTask(result.task);
   const adopted = await waitForLighthouseOpenedTweet(result.task, tabId, "debug", {
-    waitLogMessage: "锁定席位已点击成功，继续等待平台自动打开 X 推文标签页",
+    waitLogMessage: "已确认本单锁位，等待平台自动打开 X 推文标签页",
     manualOpenAfterMs: 5000
   });
   if (!isCurrent()) return cancelled();
@@ -1643,7 +1667,7 @@ async function runSelectedCountdownTask(selectedTask = null, windowId = null) {
   const adopted = await waitForLighthouseOpenedTweet(runtimeState.currentTask, lighthouseTabId, "selected_once", {
     timeoutMs: 30000,
     logEveryMs: 3000,
-    waitLogMessage: "锁定席位已点击成功，继续等待平台自动打开 X 推文标签页",
+    waitLogMessage: "已确认本单锁位，等待平台自动打开 X 推文标签页",
     manualOpenAfterMs: 5000
   });
   if (!isCurrent()) return cancelled();
@@ -1889,6 +1913,8 @@ async function ensureTweetTabAfterTargetClick(lighthouseTabId, settings, task, m
       return runtimeState.xTabId;
     }
 
+    const navigating = runtimeState.pendingXOpen && await hasPendingSiteXNavigation(lighthouseTabId, isCurrent);
+    if (!isCurrent() || navigating) return null;
     clearXOpenWatch();
     if (attempt >= maxAttempts) break;
 
@@ -1919,6 +1945,7 @@ async function openDirectTweetTabIfAvailable(task, lighthouseTabId, options = {}
   const openingRunId = runtimeState.runId;
   const openingTask = runtimeState.currentTask;
   const isCurrent = () => runtimeState === openingState && runtimeState.runId === openingRunId
+    && runtimeState.running
     && runtimeState.currentTask === openingTask
     && !runtimeState.currentTask?.claimRejected && !runtimeState.currentTask?.lockFailed
     && !runtimeState.manuallyStopped && (!options.isCurrent || options.isCurrent());
@@ -1939,21 +1966,28 @@ async function openDirectTweetTabIfAvailable(task, lighthouseTabId, options = {}
     if (runtimeState.runId !== runId || !runtimeState.running) return null;
 
     const pending = runtimeState.pendingXOpen;
-    if (pending?.lighthouseTabId === lighthouseTabId) {
-      const siteCandidate = consumeXOpenCandidate(lighthouseTabId, tweetUrl)
-        || await findRecentTweetTab(
-          pending.startedAt || Date.now(),
-          lighthouseTabId,
-          pending.windowId,
-          tweetUrl
-        );
+    let siteCandidate = consumeXOpenCandidate(lighthouseTabId, tweetUrl);
+    if (!siteCandidate) {
+      const queriedCandidate = await findRecentTweetTab(
+        pending?.startedAt || Date.now(), lighthouseTabId, getRuntimeWindowId(), tweetUrl
+      );
       if (!isCurrent()) return null;
-      if (siteCandidate) {
-        adoptCurrentXTab(siteCandidate, task, "site");
-        return siteCandidate.id;
-      }
+      // A tab event can arrive while tabs.query is still returning its snapshot.
+      siteCandidate = consumeXOpenCandidate(lighthouseTabId, tweetUrl) || queriedCandidate;
+    }
+    if (!isCurrent()) return null;
+    if (siteCandidate) {
+      adoptCurrentXTab(siteCandidate, task, "site");
+      return siteCandidate.id;
     }
 
+    const navigating = await hasPendingSiteXNavigation(lighthouseTabId, isCurrent);
+    if (!isCurrent() || navigating) return null;
+    const lateCandidate = consumeXOpenCandidate(lighthouseTabId, tweetUrl);
+    if (lateCandidate) {
+      adoptCurrentXTab(lateCandidate, task, "site");
+      return lateCandidate.id;
+    }
     clearXOpenWatch();
     const createProperties = { url: tweetUrl, active: true, openerTabId: lighthouseTabId };
     const targetWindowId = getRuntimeWindowId();
@@ -2168,7 +2202,7 @@ async function adoptTargetOpenedTweet(task, lighthouseTabId, mode) {
   let adopted = await waitForLighthouseOpenedTweet(runtimeState.currentTask, runtimeState.lighthouseTabId, runtimeState.mode, {
     timeoutMs: 30000,
     logEveryMs: 3000,
-    waitLogMessage: "锁定席位已点击成功，继续等待平台自动打开 X 推文标签页",
+    waitLogMessage: "已确认本单锁位，等待平台自动打开 X 推文标签页",
     manualOpenAfterMs: SITE_X_OPEN_WAIT_MS
   });
   if (!isCurrent()) return cancelled();
@@ -2273,6 +2307,15 @@ async function completeXTaskWidgetLifecycle(tabId, runId, settings, stillCurrent
   const cancelled = () => ({ ok: false, cancelled: true });
   if (!isCurrent()) return cancelled();
   if (!tabId) return { ok: false, message: "未记录当前 X 标签页，无法提交任务" };
+  // A manual takeover changes runId, and a refreshed Lighthouse document
+  // loses its local watcher. Arm this run before the X submission can finish.
+  if (Number.isInteger(runtimeState.lighthouseTabId) && runtimeState.currentTask?.taskKey) {
+    const watch = await sendToTab(runtimeState.lighthouseTabId, {
+      type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId, task: runtimeState.currentTask
+    });
+    if (!isCurrent()) return cancelled();
+    if (!watch?.ok) return { ok: false, message: "本单完成监测未就绪，保留订单，尚未提交 X 验证" };
+  }
   setStage("x_task_completion_waiting");
   log("info", "X 动作已完成，按任务实际停留进度等待控件解锁提交");
   const completionWatch = { cancelled: false };
@@ -2293,11 +2336,11 @@ async function completeXTaskWidgetLifecycle(tabId, runId, settings, stillCurrent
     await sendToTab(tabId, { type: "CANCEL_X_RUN", runId });
     if (!isCurrent()) return cancelled();
     setStage("lighthouse_official_completion_detected");
-    log("info", "Lighthouse 已显示验证通过/奖励到账，不再等待 X 控件，准备返回任务广场");
+    log("info", "Lighthouse 已显示验证通过，准备返回任务广场；到账状态以平台为准");
     return {
       ok: true,
       officialCompletion: true,
-      message: "Lighthouse 已验证通过并奖励到账"
+      message: "Lighthouse 已验证通过，奖励状态以平台为准"
     };
   }
 
@@ -2340,13 +2383,20 @@ async function waitForLighthouseTaskCompletionAndReturn(runId, settings, isCurre
   const tabId = tab.id;
   await rememberLighthouseTabById(tabId, isCurrent);
   if (!isCurrent()) return cancelled();
+  if (!hasLatchedLighthouseCompletion(runId) && Number.isInteger(runtimeState.xTabId)) {
+    setStage("lighthouse_completion_waiting");
+    log("info", "已提交，原地等待平台自动验证；只读取本单状态，不进入进行中查单");
+    const passive = await waitForPassiveTaskCompletion(runId, settings, tabId, isCurrent);
+    if (!isCurrent()) return cancelled();
+    if (!passive?.completed) return passive;
+  }
   if (hasLatchedLighthouseCompletion(runId)) {
     const closed = await closeLighthouseDetailToCampaigns(tabId, settings, "本单官方完成证据已保存，返回广场", isCurrent);
     if (!isCurrent()) return cancelled();
     return { ok: Boolean(closed), evidence: runtimeState.completionEvidence, message: closed ? "本单已确认完成并返回广场" : "本单已完成，但回广场尚未确认" };
   }
   setStage("lighthouse_completion_waiting");
-  log("info", "已提交 X 任务，等待 Lighthouse 弹出已完成并返回任务广场");
+  log("info", "已提交，等待平台自动验证；保持页面，不进入进行中查单");
   const result = await sendToTab(tabId, {
     type: "WAIT_LIGHTHOUSE_COMPLETION_RETURN",
     runId,
@@ -2380,6 +2430,27 @@ async function waitForLighthouseTaskCompletionAndReturn(runId, settings, isCurre
     if (incomeResult) return incomeResult;
   }
   return result;
+}
+
+async function waitForPassiveTaskCompletion(runId, settings, lighthouseTabId, isCurrent) {
+  const deadline = Date.now() + Math.max(60000, Number(settings.lockSeatTimeoutMs || 0));
+  while (isCurrent()) {
+    const xResult = await sendToTab(runtimeState.xTabId, {
+      type: "CHECK_X_TASK_WIDGET_COMPLETION", runId, task: runtimeState.currentTask
+    });
+    if (!isCurrent()) return { ok: false, cancelled: true };
+    if (xResult?.completed && xResult.evidence?.source === "lighthouse_x_widget"
+        && latchLighthouseCompletion(xResult.evidence, runId)) {
+      log("info", "X 当前任务面板已显示已完成，本单结束，返回广场继续接单");
+      return xResult;
+    }
+    const official = await sendToTab(lighthouseTabId, { type: "CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION", runId });
+    if (!isCurrent()) return { ok: false, cancelled: true };
+    if (official?.completed && latchLighthouseCompletion(official.evidence, runId)) return official;
+    if (Date.now() >= deadline) break;
+    await delay(500);
+  }
+  return { ok: false, timedOut: true, message: "等待平台自动验证超时，已保留本单和原页面，未切换进行中或重复提交" };
 }
 
 // Aggregate income is supplementary only: delayed payment for another order
@@ -3254,9 +3325,20 @@ async function sendToTab(tabId, payload) {
           && detailProof.runId === claimIntent.runId && detailProof.type === claimIntent.type
           && detailProof.claimIntentId === claimIntent.intentId
           && Boolean(detailProof.taskKey) && detailProof.taskKey === result.task?.taskKey;
-        // New receipts explicitly distinguish rejection before any claim
-        // action. Older content scripts retain their narrower retry rules.
-        const safelyUnclaimed = result?.claimActionAttempted === false
+        const rejection = result?.claimRejection;
+        const confirmedRejection = result?.ok === false && result.claimActionAttempted === true
+          && ["START_LIGHTHOUSE_COMMENT_TASK", "DEBUG_LOCK_SEAT_AND_EXTRACT", "WAIT_SELECTED_COUNTDOWN_AND_LOCK"].includes(payload.type)
+          && rejection?.runId === claimIntent.runId && rejection.type === claimIntent.type
+          && rejection.claimIntentId === claimIntent.intentId
+          && Boolean(rejection.taskKey) && rejection.taskKey === result.task?.taskKey
+          && result.task?.seatLocked === false && result.task.claimRejected === true
+          && result.claimed !== true && !runtimeState.completionEvidence && !runtimeState.lastXResult
+          && ![runtimeState.currentTask, result.task].some(task => task && (
+            task.invitationAccepted || task.claimed || task.seatLocked || task.seatLockedAt));
+        if (confirmedRejection) result.claimRejectionConfirmed = true;
+        // A click can be released only by its own explicit refusal receipt.
+        // Older content scripts retain their narrower no-click retry rules.
+        const safelyUnclaimed = confirmedRejection || result?.claimActionAttempted === false
           || (result?.ok === false && result.claimActionAttempted !== true
             && (result.transient || result.permanentIgnore || result.refreshRequested || (result.claimed === false && result.clicks === 0)));
         if (confirmedDetail && result.claimActionAttempted === true) {
@@ -3590,7 +3672,9 @@ async function ensureLighthouseAlertBridge(tabId, isCurrent = () => true) {
     const tab = await chrome.tabs.get(tabId);
     if (!isCurrent()) return false;
     if (!isLighthouseUrl(tab.url)) return false;
-    if (lighthouseAlertBridgeUrls.get(tabId) === tab.url) return true;
+    // A URL does not identify a document: reloading the marketplace installs
+    // a fresh, paused bridge at the same URL. Always re-enable MAIN world
+    // before sending an action, including the first claim after a reload.
     const revision = alertPauseRevision = Math.max(Date.now(), alertPauseRevision + 1);
     await chrome.scripting.executeScript({
       target: { tabId },
@@ -3615,7 +3699,6 @@ async function ensureLighthouseAlertBridge(tabId, isCurrent = () => true) {
       }
     });
     if (!isCurrent()) return false;
-    lighthouseAlertBridgeUrls.set(tabId, tab.url);
     return true;
   } catch (error) {
     if (!isCurrent()) return false;
@@ -3793,6 +3876,7 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
   let lastLogAt = 0;
   let fallbackOpened = false;
   let detailFallbackClicked = false;
+  let navigationWaitLogged = false;
   while (Date.now() - startedAt < timeoutMs) {
     if (!isCurrent()) return false;
     const currentExpectedUrl = normalizeTweetUrl(runtimeState.currentTask?.tweetUrl || expectedTweetUrl);
@@ -3849,8 +3933,16 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
     }
     const waitedMs = Date.now() - startedAt;
     if (manualOpenAfterMs > 0 && !fallbackOpened && waitedMs >= manualOpenAfterMs) {
+      const navigating = await hasPendingSiteXNavigation(lighthouseTabId, isCurrent);
+      if (!isCurrent()) return false;
+      if (navigating) {
+        if (!navigationWaitLogged) log("info", "检测到本轮新标签仍在导航，等待目标 X 地址，不重复打开");
+        navigationWaitLogged = true;
+        await delay(500);
+        continue;
+      }
       fallbackOpened = true;
-      log("warn", `平台官网 ${Math.ceil(waitedMs / 1000)} 秒未自动打开 X，使用已校验任务直链兜底`);
+      log("info", `已等待 ${Math.ceil(waitedMs / 1000)} 秒，复查目标标签页后决定是否使用直链兜底`);
       const directTabId = await openDirectTweetTabIfAvailable(
         runtimeState.currentTask || task,
         lighthouseTabId,
@@ -3859,8 +3951,22 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
       if (!isCurrent()) return false;
       if (directTabId) {
         clearXOpenWatch();
-        log("warn", "官网未跳转，插件已兜底打开精确目标 X 推文");
+        if (runtimeState.currentTask?.xOpenSource === "extension_fallback") {
+          log("warn", "官网未跳转，插件已兜底打开精确目标 X 推文");
+        }
         return true;
+      }
+      // A concurrent recovery or a new navigation may have made the direct
+      // opener return null. Recheck before clicking a second website control.
+      const concurrentTab = await getBoundMatchingTaskXTab(currentExpectedUrl, isCurrent);
+      if (!isCurrent()) return false;
+      if (concurrentTab) return true;
+      const navigationStarted = await hasPendingSiteXNavigation(lighthouseTabId, isCurrent);
+      if (!isCurrent()) return false;
+      if (navigationStarted) {
+        fallbackOpened = false;
+        await delay(500);
+        continue;
       }
       if (!detailFallbackClicked) {
         detailFallbackClicked = true;
@@ -3893,7 +3999,9 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
           if (!isCurrent()) return false;
           if (directAfterClick) {
             clearXOpenWatch();
-            log("warn", "单次详情按钮未产生匹配页面，插件已使用新提取的任务直链兜底打开 X");
+            if (runtimeState.currentTask?.xOpenSource === "extension_fallback") {
+              log("warn", "单次详情按钮未产生匹配页面，插件已使用新提取的任务直链兜底打开 X");
+            }
             return true;
           }
         } else {
@@ -3908,7 +4016,7 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
     await delay(500);
   }
   if (!isCurrent()) return false;
-  clearXOpenWatch();
+  // Preserve navigation observations for the caller's final fallback check.
   return false;
 }
 
@@ -3972,24 +4080,25 @@ function clearXOpenWatch() {
   runtimeState.pendingXOpen = null;
 }
 
-function recordPotentialLighthouseOpenedXTab(tab) {
+function recordPotentialLighthouseOpenedXTab(tab, created = false) {
   const pending = runtimeState.pendingXOpen;
   if (!pending || !tab || !tab.id) return;
   if (!Number.isInteger(pending.windowId)) return;
   if (Number.isInteger(pending.windowId) && tab.windowId !== pending.windowId) return;
   const openerMatches = tab.openerTabId === pending.lighthouseTabId;
-  if (openerMatches && !pending.createdTabIds.includes(tab.id)) {
+  const tweetUrl = normalizeTweetUrl(tab.pendingUrl || tab.url);
+  const expected = normalizeTweetUrl(runtimeState.currentTask?.tweetUrl);
+  if ((created || openerMatches || (expected && tweetUrl === expected)) && !pending.createdTabIds.includes(tab.id)) {
     pending.createdTabIds.push(tab.id);
   }
 
   const fromTrackedNewTab = pending.createdTabIds.includes(tab.id);
   if (!fromTrackedNewTab) return;
 
-  const tweetUrl = normalizeTweetUrl(tab.url);
+  // Replace a previous URL for this tab, including navigation away from X.
+  pending.candidates = pending.candidates.filter(candidate => candidate.id !== tab.id);
   if (!tweetUrl) return;
-  if (!pending.candidates.some((candidate) => candidate.id === tab.id && candidate.url === tab.url)) {
-    pending.candidates.push(tab);
-  }
+  pending.candidates.push(tab);
 }
 
 function consumeXOpenCandidate(lighthouseTabId, expectedTweetUrl = "") {
@@ -3997,7 +4106,7 @@ function consumeXOpenCandidate(lighthouseTabId, expectedTweetUrl = "") {
   if (!pending || pending.lighthouseTabId !== lighthouseTabId) return null;
   const expected = normalizeTweetUrl(expectedTweetUrl);
   if (!expected) return null;
-  const index = pending.candidates.findIndex((candidate) => normalizeTweetUrl(candidate.url) === expected);
+  const index = pending.candidates.findIndex((candidate) => normalizeTweetUrl(candidate.pendingUrl || candidate.url) === expected);
   if (index < 0) return null;
   const [candidate] = pending.candidates.splice(index, 1);
   clearXOpenWatch();
@@ -4036,7 +4145,7 @@ async function recoverPendingXOpenFromCapturedUrl(tweetUrl) {
         log("info", "已根据官网回传的精确地址接管 Lighthouse 打开的 X 标签页");
         return candidate.id;
       }
-      await delay(200);
+      await delay(1000);
     }
 
     const directTabId = await openDirectTweetTabIfAvailable(
@@ -4048,7 +4157,9 @@ async function recoverPendingXOpenFromCapturedUrl(tweetUrl) {
       { allowAwaitingXTabAdoption: true, source: "extension_fallback", isCurrent }
     );
     if (!isCurrent()) return null;
-    if (directTabId) log("warn", "官网已回传目标地址但未创建可接管标签，插件已只创建一次精确兜底页");
+    if (directTabId && runtimeState.currentTask?.xOpenSource === "extension_fallback") {
+      log("warn", "官网已回传目标地址但未创建可接管标签，插件已只创建一次精确兜底页");
+    }
     return directTabId;
   })();
   capturedTargetRecoveryPromise = recovery;
@@ -4059,28 +4170,47 @@ async function recoverPendingXOpenFromCapturedUrl(tweetUrl) {
   }
 }
 
+async function hasPendingSiteXNavigation(lighthouseTabId, isCurrent = () => true) {
+  const pending = runtimeState.pendingXOpen;
+  if (!pending || pending.lighthouseTabId !== lighthouseTabId || !Number.isInteger(pending.windowId)) return false;
+  const tabs = await chrome.tabs.query({ windowId: pending.windowId });
+  if (!isCurrent() || runtimeState.pendingXOpen !== pending) return false;
+  return tabs.some(tab => {
+    if (tab.id === lighthouseTabId || tab.windowId !== pending.windowId
+        || !(pending.createdTabIds || []).includes(tab.id)) return false;
+    const destination = tab.pendingUrl || tab.url || "";
+    return tab.status === "loading" && !normalizeTweetUrl(destination)
+      && (!destination || destination === "about:blank" || /^https:\/\/(?:x\.com|twitter\.com|t\.co)\//i.test(destination));
+  });
+}
+
 async function findRecentTweetTab(startedAt, lighthouseTabId, windowId, expectedTweetUrl = "") {
   if (!Number.isInteger(windowId)) return null;
   const expected = normalizeTweetUrl(expectedTweetUrl);
   if (!expected) return null;
-  const query = { url: ["https://x.com/*", "https://twitter.com/*"] };
-  query.windowId = windowId;
-  const tabs = await chrome.tabs.query(query);
-  const candidates = tabs
-    .filter((tab) => tab.id !== lighthouseTabId && isTweetTab(tab))
-    .filter((tab) => tab.openerTabId === lighthouseTabId)
-    .filter((tab) => !expected || normalizeTweetUrl(tab.url) === expected)
-    .filter((tab) => {
-      const lastAccessed = Number(tab.lastAccessed || 0);
-      if (!lastAccessed) return Date.now() - startedAt < 15000;
-      return lastAccessed >= startedAt - 3000;
-    })
-    .sort((a, b) => Number(b.lastAccessed || 0) - Number(a.lastAccessed || 0));
-  return candidates[0] || null;
+  const searchingState = runtimeState;
+  const searchingRunId = runtimeState.runId;
+  const isCurrent = () => runtimeState === searchingState && runtimeState.runId === searchingRunId && runtimeState.running;
+  const fromLighthouse = tab => tab.openerTabId === lighthouseTabId;
+  // Reuse the exact target in this window regardless of opener or focus time.
+  const select = tabs => tabs
+    .filter((tab) => tab.id !== lighthouseTabId && tab.windowId === windowId && isTweetTab(tab))
+    .filter((tab) => normalizeTweetUrl(tab.pendingUrl || tab.url) === expected)
+    .sort((a, b) => Number(fromLighthouse(b)) - Number(fromLighthouse(a))
+      || Number(Number(b.lastAccessed) >= startedAt) - Number(Number(a.lastAccessed) >= startedAt)
+      || Number(b.lastAccessed || 0) - Number(a.lastAccessed || 0));
+  const committedTabs = await chrome.tabs.query({ windowId, url: ["https://x.com/*", "https://twitter.com/*"] });
+  if (!isCurrent()) return null;
+  const committed = select(committedTabs)[0];
+  if (committed) return committed;
+  // The narrow query omits about:blank tabs whose target is in pendingUrl.
+  const allTabs = await chrome.tabs.query({ windowId });
+  if (!isCurrent()) return null;
+  return select(allTabs)[0] || null;
 }
 
 function adoptCurrentXTab(tab, task = null, source = "lighthouse") {
-  const tweetUrl = normalizeTweetUrl(tab.url);
+  const tweetUrl = normalizeTweetUrl(tab.pendingUrl || tab.url);
   runtimeState.xTabId = tab.id;
   runtimeState.xTabWindowId = tab.windowId;
   runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, task, {
@@ -4157,7 +4287,7 @@ function isTabInWindow(tab, windowId) {
 }
 
 function isTweetTab(tab) {
-  return Boolean(tab && tab.id && normalizeTweetUrl(tab.url));
+  return Boolean(tab && tab.id && normalizeTweetUrl(tab.pendingUrl || tab.url));
 }
 
 function normalizeTweetUrl(url) {
@@ -4202,7 +4332,7 @@ async function getBoundMatchingTaskXTab(expectedTweetUrl = "", isCurrent = () =>
   try {
     const tab = await chrome.tabs.get(runtimeState.xTabId);
     if (!isCurrent()) return null;
-    const actualUrl = normalizeTweetUrl(tab?.url);
+    const actualUrl = normalizeTweetUrl(tab?.pendingUrl || tab?.url);
     const expectedUrl = normalizeTweetUrl(expectedTweetUrl || runtimeState.currentTask?.tweetUrl);
     if (!actualUrl || !isTabInRuntimeWindow(tab) || (expectedUrl && actualUrl !== expectedUrl)) {
       runtimeState.xTabId = null;
@@ -4230,6 +4360,11 @@ function releaseAttemptedTask(task) {
 }
 
 function markAttemptedTask(task) {
+  // Unclaimed tasks follow the live plaza countdown. Only an actual order
+  // needs local duplicate-action protection; tier exclusions are separate.
+  const protectedCurrentTask = task?.taskKey && task.taskKey === runtimeState.currentTask?.taskKey
+    && (runtimeState.completionEvidence || runtimeState.lastXResult || runtimeState.uncertainAction);
+  if (!task || !(protectedCurrentTask || task.invitationAccepted || task.claimed || task.seatLocked || task.seatLockedAt)) return;
   const keys = getTaskDedupeKeys(task);
   if (!keys.length) return;
 
@@ -4571,6 +4706,27 @@ async function restoreAutoRunState() {
       completionEvidence: saved.completionEvidence?.incomeVerified && !saved.completionEvidence.officialCompletion ? null : (saved.completionEvidence || null),
       runId: saved.runId || createRunId()
     };
+    const protectedOrder = runtimeState.uncertainAction || runtimeState.completionEvidence || runtimeState.lastXResult
+      || [runtimeState.currentTask].some(task => task && (
+        task.invitationAccepted || task.claimed || task.seatLocked || task.seatLockedAt));
+    if (!protectedOrder) {
+      // Older releases cached unclaimed tasks and even treated a batch
+      // estimate as an account-wide wait. The plaza is authoritative for
+      // unclaimed availability; permanent tier exclusions live separately.
+      runtimeState.attemptedTaskRecords = [];
+      runtimeState.attemptedTaskKeys = [];
+      const refusal = runtimeState.logs.find(entry => /^(?:\[详情页\]\s*)?平台明确拒绝本次锁位：/.test(entry.text || ""));
+      const batch = String(refusal?.text || "").replace(/\s+/g, "")
+        .match(/^(?:\[详情页\])?平台明确拒绝本次锁位：本批名额暂不可领取，请约([1-9]\d{0,3})分钟后重试[。.]?$/);
+      const refusalAt = Date.parse(refusal?.at || "");
+      const deadline = Number(runtimeState.claimRetryNotBefore);
+      const expectedDeadline = refusalAt + Number(batch?.[1] || 0) * 60000;
+      if (batch && Number.isFinite(refusalAt) && deadline >= expectedDeadline
+          && deadline - expectedDeadline <= 60000) {
+        delete runtimeState.claimRetryNotBefore;
+        log("info", "已移除旧版误设的批次等待；恢复后读取任务广场最新倒计时");
+      }
+    }
     // Reading an already-stopped snapshot is not a new run event. Logging it
     // here would append and persist another warning on every worker wakeup.
     if (saved.running === true) {
@@ -4650,6 +4806,7 @@ async function handleAutoRunKeepaliveTick() {
       // An unanswered scan can already have clicked a claim. Only the page's
       // structured receipt may release its intent and request a safe reload.
       && !runtimeState.uncertainAction
+      && !(Number(runtimeState.claimRetryNotBefore) > Date.now())
       && Date.now() - Number(runtimeState.lastProgressAt || 0) >= CAMPAIGNS_IDLE_REFRESH_MS
       && !runtimeState.marketplaceRefreshInFlight
       && Number.isInteger(runtimeState.lighthouseTabId)) {

@@ -65,7 +65,7 @@ assert.doesNotMatch(page, /任务验证通过\|验证通过即到账\|奖励已�
 assert.match(background, /markPendingVerification/);
 assert.match(background, /waitForOfficialLighthouseCompletionDuringXSubmission/);
 assert.match(background, /Promise\.race\(\[xSubmission, officialCompletion\]\)/);
-assert.match(background, /Lighthouse 已显示验证通过\/奖励到账/);
+assert.match(background, /Lighthouse 已显示验证通过，准备返回任务广场；到账状态以平台为准/);
 assert.match(background, /本单官方完成证据已保存，已恢复任务广场并准备继续扫描/);
 assert.match(page, /CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION/);
 assert.match(page, /completed: true,\s*evidence: completion\.evidence/);

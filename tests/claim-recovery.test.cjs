@@ -28,7 +28,7 @@ function content(kind = "deferred", onReport = async () => {}, entryLabel = "领
   const entry = { clicked: 0, innerText: entryLabel, getAttribute: () => "", scrollIntoView() {}, click() { this.clicked += 1; } };
   const c = vm.createContext({ console, URL, AbortController, clearTimeout, setTimeout, fetch: noNetwork,
     fixtureTask: task, fixtureDetailTask: {...detailTask, detailText: detailRoot.innerText}, fixtureKind: kind, fixtureDetailRoot: detailRoot, fixtureButton: button, fixtureInvitation: invitation, fixtureEntry: entry,
-    document: { body: detailRoot }, window: { addEventListener() {} },
+    document: { body: detailRoot, querySelectorAll: () => [] }, window: { addEventListener() {} },
     location: { href: "https://app.lhdao.top/campaigns", pathname: "/campaigns" },
     chrome: { runtime: { onMessage: { addListener(fn) { listener = fn; } },
       async sendMessage(message) { reports.push(clone(message)); return onReport(message); }
@@ -132,7 +132,7 @@ test("duplicates share the complete deferred receipt and execute the claim flow 
   assert.equal(page.reports.filter((message) => message.type === "DEBUG_TASK_CANDIDATE" && message.task.taskKey === detailTask.taskKey).length, 1);
 });
 
-test("auto scan registers the delayed task, returns to campaigns and continues with its retry deadline", async () => {
+test("auto scan returns an unclaimed delayed task to the live plaza without exclusions", async () => {
   let w;
   const page = content("deferred", (message) => w.c.handleMessage(message, {tab: {id: 11, windowId: 1}}));
   w = await worker((message) => {
@@ -145,14 +145,14 @@ test("auto scan registers the delayed task, returns to campaigns and continues w
   await w.c.startNextAutoTask("test_release_recovery");
   assert.equal(w.sent.length, 2);
   assert.equal(w.sent[1].type, "START_LIGHTHOUSE_COMMENT_TASK");
-  assert.ok(w.sent[1].attemptedTaskKeys.includes(task.taskKey));
-  assert.ok(w.sent[1].attemptedTaskKeys.includes(task.selectionId));
-  assert.ok(w.sent[1].attemptedTaskKeys.includes(task.stableTaskKey));
+  assert.ok(!w.sent[1].attemptedTaskKeys.includes(task.taskKey));
+  assert.ok(!w.sent[1].attemptedTaskKeys.includes(task.selectionId));
+  assert.ok(!w.sent[1].attemptedTaskKeys.includes(task.stableTaskKey));
   assert.deepEqual(page.reports.filter((message) => message.type === "DEBUG_TASK_CANDIDATE").map((message) => message.task.taskKey),
     [task.taskKey, detailTask.taskKey], "detail notification must overwrite the earlier list candidate in this fixture");
-  assert.equal(w.state().currentTask.taskKey, detailTask.taskKey);
+  assert.equal(w.state().currentTask, null);
   const delayed = w.state().attemptedTaskRecords.find((record) => record.key === task.taskKey);
-  assert.equal(delayed.expiresAt, page.replies[0].task.deferUntil);
+  assert.equal(delayed, undefined);
   assert.equal(w.state().failed, 0, "waiting for release is not a failed order");
   assert.ok(w.effects.indexOf("clearXOpenWatch") < w.effects.indexOf("reloadCampaigns"));
   assert.ok(w.effects.includes("closeDetail"));
@@ -216,7 +216,7 @@ test("a deferred marker alone cannot clear an unproven claim", async () => {
   assert.ok(w.state().uncertainAction);
 });
 
-test("a delayed unclaimed receipt past its deadline continues with only a 250ms retry delay", async () => {
+test("a delayed unclaimed receipt past its deadline refreshes without local exclusions", async () => {
   let w, deliveredAt;
   const page = content("deferred", (message) => w.c.handleMessage(message, {tab: {id: 11, windowId: 1}}));
   w = await worker(async (message) => {
@@ -234,7 +234,7 @@ test("a delayed unclaimed receipt past its deadline continues with only a 250ms 
   await w.c.startNextAutoTask("test_late_release_receipt");
   assert.equal(w.sent.length, 2, "an expired rescan time cannot turn an unclaimed receipt into uncertainty");
   const delayed = w.state().attemptedTaskRecords.find((record) => record.key === task.taskKey);
-  assert.equal(delayed.expiresAt, deliveredAt + 250, "must not fall back to the ordinary three-minute dedupe");
+  assert.equal(delayed, undefined, "unclaimed tasks use the platform countdown");
   assert.equal(w.state().failed, 0);
   assert.ok(w.effects.includes("closeDetail"));
   assert.ok(w.effects.includes("reloadCampaigns"));

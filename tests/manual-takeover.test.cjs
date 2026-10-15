@@ -36,6 +36,7 @@ async function worker() {
           return hooks.cancelReceipt ? hooks.cancelReceipt(reply, message) : reply;
         }
         if (message.type.startsWith("CANCEL_")) return { ok: true };
+        if (message.type === "BEGIN_LIGHTHOUSE_COMPLETION_WATCH") return { ok: true };
         if (["RUN_X_REPLY", "COMPLETE_X_TASK_WIDGET"].includes(message.type)) {
           await hooks.beforeReply?.(message);
           return { ok: true, message: "fixture reply completed" };

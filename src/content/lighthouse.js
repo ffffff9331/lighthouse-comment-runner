@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.91";
+  const SCRIPT_VERSION = "0.7.99";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -198,7 +198,7 @@
             seatLockedAt: receipt.task.seatLockedAt,
             detailSignature: claimDetailSignature(root),
             rejectionAbsent: !hasHardFailure(text),
-            positiveStateAbsent: !hasPositiveClaimState(text)
+            positiveStateAbsent: !hasPositiveClaimState(text) && !lockConfirmationEvidence(root).length
           };
         }
         if (detailConfirmed === true && receipt.ok === true && receipt.task?.taskKey
@@ -222,6 +222,7 @@
         const transient = Boolean(error.transient) || isTransientLoadError(messageText) || hasDetailRequestTimeout();
         const deferredRelease = Boolean(error.deferredRelease);
         const safeDeferredRelease = deferredRelease && operation?.claimActionAttempted === false;
+        const task = error.task || buildTask(message.settings);
         if (isCurrentInstance()) report(error.permanentIgnore ? "warn" : (transient || safeDeferredRelease ? "info" : "error"), messageText);
         return {
           ok: false,
@@ -232,7 +233,13 @@
           permanentIgnore: Boolean(error.permanentIgnore),
           ignoredTaskType: error.ignoredTaskType || "",
           ...(operation ? { claimActionAttempted: operation.claimActionAttempted } : {}),
-          task: error.task || buildTask(message.settings)
+          ...(error.confirmedClaimRejection && operation?.claimActionAttempted && task?.taskKey ? {
+            claimRejection: { runId: operation.runId, type: operation.type,
+              claimIntentId: operation.claimIntentId, taskKey: task.taskKey },
+            retryAfterMs: error.retryAfterMs || 0,
+            claimRetryScope: error.claimRetryScope || "global"
+          } : {}),
+          task
         };
       });
     // Duplicates must receive the same structured receipt, including whether
@@ -306,7 +313,7 @@
       throw error;
     }
     const task = mergeSelectedTaskIdentity(openResult.task, lockResult.task);
-    return { ok: true, message: "已提取评论任务并打开推文", task, openResult };
+    return { ok: true, message: lockResult.message, task, openResult };
   }
 
   function mergeSelectedTaskIdentity(selectedTask = {}, detailTask = {}) {
@@ -696,7 +703,7 @@
       }
 
       const detailRoot = findTaskDetailRoot();
-      const detailText = normalize(`${detailRoot?.innerText || ""} ${document.body?.innerText || ""}`);
+      const detailText = normalize(detailRoot?.innerText || "");
       if (hasBlockingTaskFailure(detailText, settings)) {
         throw new Error(`任务不可做：${extractHardFailureReason(detailText)}`);
       }
@@ -711,19 +718,17 @@
         const candidateUrl = normalizeTweetUrl(hrefBeforeClick || taskBeforeClick.tweetUrl);
         lockButton.scrollIntoView({ block: "center", inline: "center" });
         await wait(Math.max(settings.actionDelayMs || 500, 500));
-        await clickElement(lockButton, { randomDelay: false, claimAction: true });
-        report("info", `已点击锁定席位按钮：${buttonText(lockButton)}，等待按钮状态变化`);
-        await confirmLighthouseGuidanceBeforeClaim();
-        await verifyLockClickAccepted(settings, lockButton);
-        report("info", "锁定席位状态已变化，继续等待平台自动打开 X");
-        const afterClickText = normalize(document.body.innerText || "");
+        const lockObservation = observeLockAttempt(taskBeforeClick);
+        await clickAndVerifyLock(lockButton, settings, lockObservation);
+        report("info", "已确认本单锁位，继续等待平台自动打开 X");
+        const afterClickText = normalize(lockObservation.root?.innerText || "");
         if (hasBlockingTaskFailure(afterClickText, settings)) {
           throw new Error(`锁定点击后失败：${extractHardFailureReason(afterClickText)}`);
         }
         const taskAfterClick = buildTask(settings, selectedTask.taskType || "");
         return {
           ok: true,
-          message: `已点击锁定席位：${buttonText(lockButton)}`,
+          message: "已确认本单锁位，等待目标 X 页面",
           task: {
             ...taskAfterClick,
             taskKey: taskBeforeClick.taskKey || taskAfterClick.taskKey,
@@ -794,7 +799,7 @@
   function createDeferredReleaseError(task, releaseCountdown) {
     const remainingMs = Math.max(0, Number(releaseCountdown?.remainingMs || 0));
     const rescanInMs = Math.max(250, remainingMs - AUTO_DETAIL_PRELOAD_MS);
-    const error = new Error(`详情页下一批放号仍需 ${formatDuration(remainingMs)}，返回广场并在剩余 1 分钟时重新扫描本任务`);
+    const error = new Error(`详情页下一批放号仍需 ${formatDuration(remainingMs)}，返回广场读取平台最新倒计时`);
     error.deferredRelease = true;
     error.task = {
       ...(task || {}),
@@ -918,9 +923,18 @@
       sendRuntimeMessage({ type: "DEBUG_TASK_CANDIDATE", runId: activeRunId, task: taskBeforeClick });
     }
 
-    const detailText = normalize(document.body.innerText);
+    const detailText = normalize(findTaskDetailRoot()?.innerText || "");
     if (hasBlockingTaskFailure(detailText, settings)) {
       throw new Error(`任务不可做：${extractHardFailureReason(detailText)}`);
+    }
+
+    // Resume only a currently locked detail with an explicit target and no
+    // claim control. An old badge beside an available lock button is not enough.
+    if (hasConfirmedLockedDetail(findTaskDetailRoot(), taskBeforeClick.tweetUrl)) {
+      report("info", "当前详情已确认席位锁定，沿用本单并接续 X 流程");
+      return { ok: true, message: "已核对当前锁定订单，接续处理本单", task: {
+        ...taskBeforeClick, seatLocked: true, seatLockedAt: new Date().toISOString(), resumedLockedTask: true
+      } };
     }
 
     const lockButton = await findLockButtonAfterHydration(settings);
@@ -938,12 +952,16 @@
     }
 
     lockButton.scrollIntoView({ block: "center", inline: "center" });
-    await clickLockButtonWithRetry(settings, lockButton);
-    await confirmLighthouseGuidanceBeforeClaim();
-    await verifyLockClickAccepted(settings, lockButton);
+    const lockObservation = observeLockAttempt(taskBeforeClick);
+    await clickAndVerifyLock(lockButton, settings, lockObservation);
     await confirmPagePhase(["detail_ready"], settings, "锁定席位后", { timeoutMs: 2500 });
+    if (!isSameLockDetail(lockObservation)) {
+      const error = new Error("锁位确认期间任务详情已变化，未确认当前订单状态，请核对本单");
+      error.task = lockObservation.task;
+      throw error;
+    }
 
-    const afterText = normalize(document.body.innerText);
+    const afterText = normalize(lockObservation.root?.innerText || "");
     if (hasBlockingTaskFailure(afterText, settings)) {
       throw new Error(`锁定失败：${extractHardFailureReason(afterText)}`);
     }
@@ -955,7 +973,7 @@
       ok: true,
       message: tweetUrl
         ? "已锁定席位并提取推文链接"
-        : "已点击锁定席位，等待后台接管 Lighthouse 自己打开的 X 推文页",
+        : "已确认本单锁位，等待后台接管 Lighthouse 自己打开的 X 推文页",
       task: {
         ...taskAfterClick,
         taskKey: taskBeforeClick.taskKey || taskAfterClick.taskKey,
@@ -1845,6 +1863,18 @@
     if (!root) return { ok: true, completed: false };
     const target = normalizeTweetUrl(message.task?.tweetUrl || context.tweetUrl);
     const rootText = normalize(root.innerText || "");
+    const identityScope = root.closest?.("[role='dialog']") || root;
+    const originalTweetLinks = Array.from(identityScope.querySelectorAll("a[href]"))
+      .filter((node) => /^查看原推文$/.test(normalize(node.innerText || node.textContent || "")))
+      .map((node) => normalizeTweetUrl(node.href)).filter(Boolean);
+    if (originalTweetLinks.length && (!target || !originalTweetLinks.every((url) => url === target))) {
+      return { ok: true, completed: false };
+    }
+    // Reopening a progress card is only navigation. Its title and reward are
+    // not proof of identity: require the official result's original X link.
+    if (context.requireExactTarget && (!target || !originalTweetLinks.includes(target))) {
+      return { ok: true, completed: false };
+    }
     const links = Array.from(root.querySelectorAll("a[href]"))
       .map((node) => normalizeTweetUrl(node.href))
       .filter(Boolean);
@@ -1863,7 +1893,7 @@
   async function waitForTaskCompletionAndReturn(settings = {}, message = {}) {
     const started = Date.now();
     const timeoutMs = Math.max(60000, Number(settings.lockSeatTimeoutMs || 0));
-    while (Date.now() - started < timeoutMs) {
+    while (true) {
       assertActiveRun(message.runId || activeRunId);
       const completion = checkOfficialCompletion(message);
       const completionConfirmed = completion.completed;
@@ -1894,6 +1924,9 @@
           message: "官网已确认任务完成；未找到返回任务广场入口，交由后台恢复广场"
         };
       }
+      // A backgrounded tab can wake after the deadline with a fresh result.
+      // Always inspect that final DOM receipt before returning a timeout.
+      if (Date.now() - started >= timeoutMs) break;
       await wait(250);
     }
     return { ok: false, timedOut: true, message: "等待 Lighthouse 显示已完成超时，已保留 X 页面" };
@@ -1948,7 +1981,7 @@
   function isOfficialCompletionMarkerText(text) {
     const value = normalize(text);
     if (!value || value.length > 80) return false;
-    return /^(?:任务验证通过|验证(?:成功|通过)(?:\s*[·•]\s*(?:已通过|奖励已到账))?|奖励已到账|已到账奖励|任务已完成|奖励已结算)[！!。.]?$/.test(value);
+    return /^(?:任务验证通过|验证(?:成功|通过)(?:\s*[·•]\s*(?:已通过|奖励已到账|奖励托管中))?|奖励已到账|已到账奖励|任务已完成|奖励已结算)[！!。.]?$/.test(value);
   }
 
   function hasOfficialCompletionRewardText(text) {
@@ -2124,55 +2157,199 @@
     throw new Error(`任务详情等待锁定按钮超时：${extractDetailUnavailableReason(normalize(document.body.innerText || ""))}`);
   }
 
-  async function clickLockButtonWithRetry(settings, lockButton) {
-    const maxAttempts = 3;
-    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      if (!isVisible(lockButton) || isDisabled(lockButton)) return;
-      await clickElement(lockButton, { randomDelay: false, claimAction: true });
-      await confirmLighthouseGuidanceBeforeClaim();
-      const started = Date.now();
-      while (Date.now() - started < 250) {
-        if (hasLockClickStateChanged(lockButton)) return;
-        await wait(50);
+  function lockConfirmationEvidence(root) {
+    if (!root || root === document.body) return [];
+    const evidence = new Set();
+    for (const node of root.querySelectorAll?.("button,a,[role='button'],[role='status'],span,p,strong,div") || []) {
+      if (!isVisible(node)) continue;
+      const text = normalize(buttonText(node));
+      if (/^(?:已锁定(?:席位)?|席位已锁定|锁定成功|已领取(?:任务)?|任务已领取|(?:任务)?进行中)$/.test(text)) {
+        evidence.add(`status:${text}`);
       }
-      if (hasLockClickStateChanged(lockButton)) return;
-      if (attempt + 1 < maxAttempts) await wait(50);
+      // A static timeline label or a preview URL is not a claim receipt.
+      if (node.matches?.("button,a[href],[role='button']") && !isDisabled(node)
+          && /^(?:去\s*X\s*完成动作|前往\s*X\s*完成动作|在\s*X\s*打开|前往目标|查看推文)$/.test(text)) {
+        evidence.add(`action:${text}:${normalizeTweetUrl(node.href || node.getAttribute("href") || "")}`);
+      }
+    }
+    return [...evidence];
+  }
+
+  function observeLockAttempt(task) {
+    const root = findTaskDetailRoot();
+    return {
+      root, task,
+      title: root ? extractTitle(root) : "",
+      bounty: parseCandidateBounty(root?.innerText || ""),
+      tweetUrl: root ? extractTweetUrl(root) : "",
+      evidence: lockConfirmationEvidence(root),
+      priorClaimAttempted: Boolean(claimOperation?.claimActionAttempted),
+      detailSignature: claimDetailSignature(root),
+      rejectionAbsent: !hasHardFailure(normalize(root?.innerText || "")),
+      positiveStateAbsent: !hasPositiveClaimState(normalize(root?.innerText || "")),
+    };
+  }
+
+  function hasConfirmedLockedDetail(root, expectedTweetUrl = "") {
+    if (!root || root === document.body || root.isConnected === false || !isVisible(root)) return false;
+    const target = normalizeTweetUrl(extractTweetUrl(root));
+    const expected = normalizeTweetUrl(expectedTweetUrl);
+    if (!target || (expected && target !== expected)) return false;
+    // A disabled claim button can be a request still in flight. Its presence
+    // must block this fallback just as an enabled claim button does.
+    const claimControls = Array.from(root.querySelectorAll("button,a,[role='button'],input[type='button'],input[type='submit']"))
+      .filter((node) => isVisible(node) && node.matches?.("button,a[href],[role='button'],input[type='button'],input[type='submit']"))
+      .some((node) => /^(?:锁定席位|锁定名额|抢占席位|领取任务|开始任务|去评论)(?:\s|·|$)/.test(normalize(buttonText(node))));
+    if (claimControls) return false;
+    const evidence = lockConfirmationEvidence(root);
+    return evidence.some(value => /^status:(?:席位已锁定|已锁定席位|锁定成功)$/.test(value))
+      && evidence.some(value => /^action:(?:去|前往)\s*X\s*完成动作:/.test(value));
+  }
+
+  function isSameLockDetail(observation) {
+    const root = findTaskDetailRoot();
+    if (!root || root === document.body || root !== observation.root
+        || root.isConnected === false || !isVisible(root) || !isTaskDetailOpen()
+        || extractTitle(root) !== observation.title
+        || parseCandidateBounty(root.innerText || "") !== observation.bounty) return false;
+    const tweetUrl = extractTweetUrl(root);
+    return !observation.tweetUrl || !tweetUrl || tweetUrl === observation.tweetUrl;
+  }
+
+  function readLockFeedback() {
+    // react-hot-toast uses role=status, including while Radix marks its
+    // container aria-hidden. These messages can vanish before the timeout.
+    return Array.from(document.querySelectorAll(
+      "[data-rht-toaster] [role='status'],[data-sonner-toast],[role='alert'],[role='alertdialog']"
+    )).filter(isVisible).map(node => ({ node, text: normalize(node.innerText || node.textContent || "") }))
+      .filter(item => item.text && item.text.length <= 500);
+  }
+
+  function knownLockRefusal(text) {
+    const value = text.replace(/\s+/g, "");
+    const cooldown = value.match(/^本批名额暂不可领取，请约([1-9]\d{0,3})分钟后重试[。.]?$/);
+    if (cooldown) return { retryAfterMs: Number(cooldown[1]) * 60000, claimRetryScope: "task" };
+    if (/^你抢的太快了，请30秒后重试[。.]?$/.test(value)) return { retryAfterMs: 30000 };
+    if (/^当前没有可锁定的席位，请刷新任务查看最新名额[。.]?$/.test(value)) return { retryAfterMs: 15000 };
+    if (/^当前无法接单，请刷新任务后重试[。.]?$/.test(value)) return { retryAfterMs: 30000 };
+    return null;
+  }
+
+  async function clickAndVerifyLock(button, settings, observation) {
+    const runId = activeRunId;
+    const seen = new Map(readLockFeedback().map(item => [item.node, item.text]));
+    observation.feedback = [];
+    observation.collectFeedback = () => {
+      if (activeRunId !== runId || automationPaused || cancelledRunIds.has(runId)) return;
+      for (const { node, text } of readLockFeedback()) {
+        if (seen.get(node) === text) continue;
+        seen.set(node, text);
+        // Preserve diagnostic text even when it is not a proven refusal.
+        if (observation.feedback.some(item => item.text === text)) continue;
+        observation.feedback.push({ text, sameDetail: isSameLockDetail(observation), refusal: knownLockRefusal(text) });
+        if (observation.feedback.length > 20) observation.feedback.shift();
+        report("info", `锁位即时提示：${text}`);
+      }
+    };
+    const watcher = typeof MutationObserver === "function" ? new MutationObserver(observation.collectFeedback) : null;
+    watcher?.observe(document.body, { childList: true, subtree: true, characterData: true });
+    try {
+      await clickElement(button, { randomDelay: false, claimAction: true });
+      report("info", "已点击锁定席位，等待本单锁位结果");
+      observation.collectFeedback();
+      await confirmLighthouseGuidanceBeforeClaim(observation);
+      await verifyLockClickAccepted(settings, observation);
+    } finally {
+      watcher?.disconnect();
+      delete observation.collectFeedback;
     }
   }
 
-  function hasLockClickStateChanged(lockButton) {
-    if (getLighthousePreClaimNoticeButton()) return false;
-    if (!lockButton.isConnected || isDisabled(lockButton) || !isVisible(lockButton)) return true;
-    const text = normalize(document.body.innerText || "");
-    return Boolean(extractTweetUrl() || /已锁定|已领取|进行中|前往目标|在 X 打开|请先前往目标/.test(text));
-  }
-
-  async function verifyLockClickAccepted(settings, clickedButton) {
+  async function verifyLockClickAccepted(settings, observation) {
     const runId = activeRunId;
     const started = Date.now();
-    const timeoutMs = Math.min(Math.max(settings.actionDelayMs * 4, 4000), 8000);
-    while (Date.now() - started < timeoutMs) {
+    const timeoutMs = Math.min(Math.max((settings.actionDelayMs || 500) * 4, 15000), 30000);
+    while (true) {
       assertActiveRun(runId);
-      await confirmLighthouseGuidanceBeforeClaim();
+      observation.collectFeedback?.();
+      // A native dialog or a suspended tab can consume the wall-clock
+      // deadline. Reconcile the current receipt once before timing out,
+      // without dispatching another confirmation after the deadline.
+      if (Date.now() - started < timeoutMs) await confirmLighthouseGuidanceBeforeClaim(observation);
+      assertActiveRun(runId);
       if (getLighthousePreClaimNoticeButton()) {
+        if (Date.now() - started >= timeoutMs) break;
         await wait(200);
         continue;
       }
-      const text = normalize(document.body.innerText || "");
-      if (hasHardFailure(text)) throw new Error(`锁定点击后失败：${extractHardFailureReason(text)}`);
-      if (extractTweetUrl()) return true;
-      if (!clickedButton.isConnected || isDisabled(clickedButton) || !isVisible(clickedButton)) return true;
-      if (/已锁定|已领取|进行中|前往目标|在 X 打开|请先前往目标/.test(text)) return true;
+      if (isSameLockDetail(observation)) {
+        const text = normalize(observation.root.innerText || "");
+        const evidence = lockConfirmationEvidence(observation.root);
+        if (hasHardFailure(text)) {
+          const error = new Error(`锁定点击后失败：${extractHardFailureReason(text)}`);
+          // A new refusal may release this click only when no earlier claim,
+          // success evidence or unrelated detail change can explain it.
+          if (!observation.priorClaimAttempted && observation.rejectionAbsent
+              && observation.positiveStateAbsent && !hasPositiveClaimState(text)
+              && !observation.evidence.length && !evidence.length
+              && observation.detailSignature && observation.detailSignature === claimDetailSignature(observation.root)) {
+            error.confirmedClaimRejection = true;
+            error.task = { ...observation.task, detailText: text.slice(0, 1800), seatLocked: false, claimRejected: true };
+          }
+          throw error;
+        }
+        // Some renders already expose the same status/action labels in the
+        // baseline. Confirm the current same-order locked state as a whole,
+        // not only a text delta, before leaving a real claim stranded.
+        if (hasConfirmedLockedDetail(observation.root, observation.tweetUrl || observation.task?.tweetUrl)) {
+          report("info", "已复核本单席位锁定、目标链接和可用 X 入口，接续本单");
+          return true;
+        }
+        if (evidence.some(value => !observation.evidence.includes(value))) return true;
+        const refusal = observation.feedback?.find(item => item.sameDetail && item.refusal);
+        if (refusal && !observation.priorClaimAttempted && observation.rejectionAbsent
+            && observation.positiveStateAbsent && !hasPositiveClaimState(text)
+            && findLockButton() && !observation.evidence.some(value => value.startsWith("status:"))) {
+          const error = new Error(`平台明确拒绝本次锁位：${refusal.text}`);
+          error.confirmedClaimRejection = true;
+          error.retryAfterMs = refusal.refusal.retryAfterMs;
+          error.claimRetryScope = refusal.refusal.claimRetryScope;
+          error.task = { ...observation.task, detailText: text.slice(0, 1800), seatLocked: false, claimRejected: true };
+          throw error;
+        }
+      }
+      if (Date.now() - started >= timeoutMs) break;
       await wait(300);
     }
-    throw new Error("锁定点击后未观察到按钮状态变化或推文链接，判定点击未生效");
+    const root = findTaskDetailRoot();
+    const controls = Array.from(root?.querySelectorAll?.("button,a,[role='button']") || [])
+      .filter(isVisible).map(node => `${normalize(buttonText(node))}${isDisabled(node) ? "（不可点击）" : ""}`)
+      .filter(Boolean).slice(0, 12).join(" / ");
+    const alerts = [...new Set([...(observation.feedback || []).map(item => item.text), ...readLockFeedback().map(item => item.text)])]
+      .join(" / ").slice(0, 500);
+    report("warn", `锁位核对：同一详情=${isSameLockDetail(observation)}；当前控件=${controls || "无"}；页面提示=${alerts || "无"}；点击前证据=${JSON.stringify(observation.evidence)}；当前证据=${JSON.stringify(lockConfirmationEvidence(root))}`);
+    const error = new Error("已点击锁定席位，但未确认本单锁位结果；已保留本次动作，请核对订单后继续");
+    error.task = observation.task;
+    throw error;
   }
 
-  async function confirmLighthouseGuidanceBeforeClaim() {
-    const riskNoticeButton = getLighthousePreClaimNoticeButton();
+  async function confirmLighthouseGuidanceBeforeClaim(observation = null) {
+    // A confirmation can remain mounted while its request is in flight.
+    // Keep each step once per lock attempt, even if React replaces its button.
+    const submitted = observation && (observation.guidanceSteps ||= new Set());
+    let riskNoticeButton = getLighthousePreClaimNoticeButton();
     if (riskNoticeButton) {
+      if (submitted?.has("risk")) return true;
+      // The notice can replace its action during its entrance render. Wait
+      // for that transition and reacquire the current actionable button.
+      const runId = activeRunId;
+      await wait(400);
+      assertActiveRun(runId);
+      riskNoticeButton = getLighthousePreClaimNoticeButton();
+      if (!riskNoticeButton) return false;
+      submitted?.add("risk");
       await clickElement(riskNoticeButton, { randomDelay: false, claimAction: true });
-      report("info", "检测到 Lighthouse 锁位前风险提醒，已确认继续锁定席位");
+      report("info", "检测到 Lighthouse 锁位前风险提醒，已单次点击确认，等待平台回执");
       await wait(150);
       return true;
     }
@@ -2204,8 +2381,10 @@
         throw error;
       }
 
+      if (submitted?.has("guidance")) return true;
+      submitted?.add("guidance");
       await clickElement(button, { randomDelay: false, claimAction: true });
-      report("info", "检测到 Lighthouse 接单备注引导，已点击确认接单");
+      report("info", "检测到 Lighthouse 接单备注引导，已单次点击确认接单");
       await wait(150);
       return true;
     }

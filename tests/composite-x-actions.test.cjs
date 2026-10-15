@@ -52,6 +52,7 @@ function harness(options = {}) {
     fillReplyText = async () => { counters.fill++; };
     clickPostButtonAndVerify = async () => { counters.post++; return options.postResult || {ok: true, message: "已确认回复发送成功"}; };
     findDocumentVerifyActionButton = () => null;
+    findLighthouseTaskWidget = () => fixturePanel;
     revealTaskWidgetArea = async () => fixturePanel;
     findVerifyActionButton = () => null;
     findMainTweetArticle = () => ({});

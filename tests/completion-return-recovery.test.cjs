@@ -12,14 +12,16 @@ const sourceRoot = process.env.LIGHTHOUSE_TEST_SOURCE_ROOT || path.join(__dirnam
 const read = (file) => fs.readFileSync(path.join(sourceRoot, file), "utf8");
 const copy = (value) => JSON.parse(JSON.stringify(value));
 const event = { addListener() {} };
-const task = { taskKey: "completion-order", tweetUrl: "https://x.com/current/status/123", taskType: "评论", bounty: 0.2, seatLocked: true };
+const task = { taskKey: "completion-order", candidateTitle: "当前订单标题", tweetUrl: "https://x.com/current/status/123", taskType: "评论", bounty: 0.2, seatLocked: true };
 const runId = "completion-run";
 const settings = { actionDelayMs: 500, lockSeatTimeoutMs: 60000 };
 const noNetwork = async () => { throw Error("Network forbidden in completion recovery tests"); };
 
 function contentPage(options = {}) {
   let now = 1000000, listener;
-  const state = { root: null, plaza: false, clicks: 0, waited: 0, receipts: [], logs: [] };
+  const state = { root: null, plaza: false, clicks: 0, waited: 0, receipts: [], logs: [], ongoingClicks: 0, progressClicks: 0, detailCloses: 0,
+    listOpen: Boolean(options.listInitiallyOpen), ongoingSince: 0, scrolled: false, staleProgressClicks: 0 };
+  let resultDialog;
   class Clock extends Date {
     constructor(...args) { super(...(args.length ? args : [now])); }
     static now() { return now; }
@@ -35,10 +37,43 @@ function contentPage(options = {}) {
   button.click = () => { state.clicks++; if (options.buttonWorks !== false) { state.plaza = true; state.root = null; } };
   const heading = node("任务广场");
   const filters = ["全部", "可抢 0", "进行中 1"].map((text) => node(text));
+  const ongoing = node("进行中 1");
+  ongoing.getAttribute = name => name === "data-tab" ? "ongoing" : "";
+  ongoing.classList.contains = name => name === "on" && state.listOpen;
+  ongoing.click = () => { state.ongoingClicks++; state.listOpen = !options.neverOpens; state.ongoingSince = state.waited; options.onOngoing?.(state); };
+  const cardTitle = node(task.candidateTitle);
+  cardTitle.getAttribute = (name) => name === "title" ? options.cardTitle || task.candidateTitle : "";
+  const progress = node("查看进度");
+  progress.click = () => { state.progressClicks++; if (!options.progressDoesNothing) showCompletion(options.reconcileTarget || task.tweetUrl); };
+  const replacementProgress = node("查看进度");
+  replacementProgress.click = progress.click;
+  const progressRect = progress.getBoundingClientRect;
+  progress.getBoundingClientRect = () => options.offscreenProgress && !state.scrolled ? { width: 0, height: 0 } : progressRect();
+  const card = node(`待到账 ${task.candidateTitle} 待到账奖励 ${options.cardBounty ?? 0.2} LUX 查看进度`, 500, 200);
+  card.scrollIntoView = () => {
+    state.scrolled = true;
+    if (options.replaceProgressAfterScroll) {
+      progress.isConnected = false;
+      progress.click = () => { state.staleProgressClicks++; };
+    }
+  };
+  card.querySelectorAll = selector => selector === "[title]" ? [cardTitle] : selector === "button"
+    ? options.replaceProgressAfterScroll && state.scrolled ? [replacementProgress] : [progress] : [];
+  const cardRect = card.getBoundingClientRect;
+  card.getBoundingClientRect = () => options.hiddenCard || !state.listOpen ? { width: 0, height: 0 } : cardRect();
+  const close = node("Close");
+  const staleDetail = node("任务详情 席位已锁定", 500, 300);
+  staleDetail.querySelectorAll = () => [close];
+  close.click = () => { state.detailCloses++; staleDetail.isConnected = false; };
   const document = {
     body: { get innerText() { return state.plaza ? "任务广场 全部 可抢 0 进行中 1" : state.root?.innerText || "等待任务验证"; } },
     querySelector: () => null,
     querySelectorAll(selector) {
+      if (selector === "[role='dialog']") return resultDialog ? [resultDialog] : options.staleDetail && staleDetail.isConnected ? [staleDetail] : [];
+      if (selector === "main button") return options.reconcile ? [ongoing] : [];
+      if (selector === "main article[role='button']") return options.reconcile && (state.ongoingClicks || state.listOpen)
+        && state.waited - state.ongoingSince >= (options.cardsDelayMs || 0)
+        ? options.duplicateCards ? [card, card] : [card] : [];
       if (selector === "[role='dialog'],main,section,article,div" || selector === "[role='dialog'],section,article,div") return state.root ? [state.root] : [];
       if (selector === "h1,h2,[role='heading']") return state.plaza ? [heading] : [];
       if (selector === "body *") return [];
@@ -50,10 +85,15 @@ function contentPage(options = {}) {
     createTreeWalker: () => ({ nextNode: () => false })
   };
   function showCompletion(tweetUrl = task.tweetUrl) {
-    const marker = node("任务验证通过");
-    const root = node(`任务验证通过 已到账奖励 0.2 LUX${options.returnButton ? " 打开任务广场" : ""}`, 500, 300);
-    const link = { href: tweetUrl };
-    root.querySelectorAll = (selector) => selector === "a[href]" ? [link] : selector === "h1,h2,h3,p,span,div" ? [marker] : [];
+    const markerText = options.markerText || "任务验证通过";
+    const marker = node(markerText);
+    const root = node(`${markerText} ${options.rewardText || "已到账奖励"} 0.2 LUX${options.returnButton ? " 打开任务广场" : ""}`, 500, 300);
+    const link = { href: tweetUrl, innerText: options.missingOriginalLink ? "" : "查看原推文" };
+    const identityScope = node(`任务详情 ${markerText}`);
+    identityScope.querySelectorAll = () => [link];
+    if (state.progressClicks) resultDialog = identityScope;
+    root.closest = () => identityScope;
+    root.querySelectorAll = (selector) => selector === "a[href]" ? options.linkOutsideResult ? [] : [link] : selector === "h1,h2,h3,p,span,div" ? [marker] : [];
     root.contains = (other) => other === root || other === marker || other === link;
     state.root = root;
     return root;
@@ -86,9 +126,9 @@ function contentPage(options = {}) {
   };
 }
 
-async function background(page, responseEdit) {
+async function background(page, responseEdit, options = {}) {
   const stored = {}, sent = [], reloads = [], updates = [];
-  const tab = { id: 11, windowId: 1, url: "https://app.lhdao.top/campaigns", status: "complete", active: true };
+  const tab = { id: 11, windowId: 1, url: "https://app.lhdao.top/campaigns", status: "complete", active: options.active ?? true };
   const chrome = {
     runtime: { id: "test", getURL: (p) => `chrome-extension://test/${p}`, getManifest: () => ({ version: "test" }), onInstalled: event, onMessage: event },
     storage: { local: { setAccessLevel: async () => {},
@@ -99,7 +139,7 @@ async function background(page, responseEdit) {
     scripting: { executeScript: async () => [] },
     tabs: { onCreated: event, onUpdated: event, onRemoved: event,
       get: async () => ({ ...tab }), query: async () => [{ ...tab }],
-      update: async (id, patch) => { updates.push({ id, ...patch }); Object.assign(tab, patch); return { ...tab }; },
+      update: async (id, patch) => { updates.push({ id, ...patch }); Object.assign(tab, patch); await options.onUpdate?.(id, patch); return { ...tab }; },
       reload: async (id) => { reloads.push(id); page.state.plaza = true; page.state.root = null; },
       sendMessage: async (_id, message) => {
         sent.push(copy(message));
@@ -154,6 +194,17 @@ test("confirmed current-order result without a return control preserves complete
   assert.equal(p.state.plaza, false);
   assert.equal(p.state.clicks, 0);
 });
+
+for (const markerText of ["验证成功 · 奖励托管中", "验证通过 · 已通过"]) {
+  test(`platform approval in escrow is recognized: ${markerText}`, async () => {
+    const p = contentPage({ markerText, rewardText: "奖励托管中，尚未到账" });
+    await p.begin(); p.showCompletion();
+    const result = await p.wait();
+    assert.equal(result.completed, true);
+    assert.equal(result.evidence.taskKey, task.taskKey);
+    assert.match(result.evidence.text, /尚未到账/);
+  });
+}
 
 test("real content receipt lets the background recover the plaza after a completed order", async () => {
   const p = contentPage();
@@ -273,3 +324,84 @@ for (const [name, edit] of [
     assert.deepEqual(w.reloads, []);
   });
 }
+
+
+test("submitted task waits without focusing another tab or entering ongoing", async () => {
+  let p;
+  p = contentPage({ returnButton: true, reconcile: true, afterWait(state) {
+    assert.equal(state.ongoingClicks, 0); assert.equal(state.progressClicks, 0);
+    if (state.waited >= 8000 && !state.root) p.showCompletion();
+  }});
+  await p.begin();
+  const w = await background(p, undefined, { active: false });
+  const result = await w.run();
+  assert.equal(result.ok, true); assertCurrentEvidence(result.evidence);
+  assert.equal(w.updates.length, 0);
+  assert.equal(p.state.clicks, 1);
+});
+
+test("STOP during passive validation preserves the order without navigation", async () => {
+  let p;
+  p = contentPage({ reconcile: true, afterWait(state) {
+    if (state.waited >= 5000) p.dispatch({type: "AUTOMATION_PAUSE_CHANGED", paused: true});
+  }});
+  await p.begin();
+  const result = await p.wait();
+  assert.notEqual(result.ok, true);
+  assert.equal(p.state.ongoingClicks, 0); assert.equal(p.state.progressClicks, 0);
+  assert.equal(p.state.detailCloses, 0); assert.equal(p.state.clicks, 0);
+});
+
+test("official success appearing at the timeout boundary is inspected before giving up", async () => {
+  let p;
+  p = contentPage({ returnButton: true, afterWait(state) {
+    if (state.waited >= 60000 && !state.root) p.showCompletion();
+  }});
+  await p.begin();
+  const result = await p.wait();
+  assert.equal(result.ok, true);
+  assertCurrentEvidence(result.evidence);
+  assert.equal(p.state.clicks, 1);
+});
+
+test("an unrelated result at the timeout boundary cannot release the current order", async () => {
+  let p;
+  p = contentPage({ returnButton: true, afterWait(state) {
+    if (state.waited >= 60000 && !state.root) p.showCompletion("https://x.com/other/status/999");
+  }});
+  await p.begin();
+  assertUnconfirmed(await p.wait());
+  assert.equal(p.state.clicks, 0);
+});
+
+for (const staleDetail of [false, true]) {
+  for (const delayMs of [8000, 30000, 60000]) {
+    test(`passive platform verification arrives after ${delayMs}ms with stale detail ${staleDetail}`, async () => {
+      let p;
+      p = contentPage({returnButton: true, reconcile: true, staleDetail, afterWait(state) {
+        assert.equal(state.ongoingClicks, 0); assert.equal(state.progressClicks, 0);
+        assert.equal(state.detailCloses, 0);
+        if (state.waited >= delayMs && !state.root) p.showCompletion();
+      }});
+      await p.begin();
+      const result = await p.wait();
+      assert.equal(result.ok, true); assertCurrentEvidence(result.evidence);
+      assert.equal(p.state.clicks, 1);
+    });
+  }
+}
+
+for (const options of [{}, {staleDetail: true}, {listInitiallyOpen: true}, {duplicateCards: true}, {offscreenProgress: true}]) {
+  test(`missing automatic result never opens progress or manufactures success: ${JSON.stringify(options)}`, async () => {
+    const p = contentPage({reconcile: true, ...options}); await p.begin();
+    assertUnconfirmed(await p.wait());
+    assert.equal(p.state.ongoingClicks, 0); assert.equal(p.state.progressClicks, 0);
+    assert.equal(p.state.detailCloses, 0); assert.equal(p.state.clicks, 0);
+  });
+}
+
+test("original tweet in the enclosing dialog rejects another order even outside the small result panel", async () => {
+  const p = contentPage({returnButton: true, linkOutsideResult: true});
+  await p.begin(); p.showCompletion("https://x.com/other/status/999");
+  assertUnconfirmed(await p.wait()); assert.equal(p.state.clicks, 0);
+});

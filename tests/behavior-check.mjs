@@ -69,7 +69,7 @@ await test("stage changes do not reset the no-order refresh timer", () => {
   assert.equal(context.runtimeState.stage, "selecting_task");
 });
 
-await test("locked orders are not logged as three-minute retry dedupe", () => {
+await test("locked orders retain protection while unclaimed tasks have no retry dedupe", () => {
   const messages = [];
   const state = {
     attempts: 0,
@@ -95,7 +95,8 @@ await test("locked orders are not logged as three-minute retry dedupe", () => {
   state.attemptedTaskRecords = [];
   state.attemptedTaskKeys = [];
   c.markAttemptedTask({});
-  assert.equal(messages[0], "已登记失败任务临时去重 180s：0.1LUX · @locked");
+  assert.equal(messages.length, 0);
+  assert.equal(state.attemptedTaskRecords.length, 0);
 });
 
 if (platform === "lighthouse") {
@@ -394,10 +395,29 @@ if (platform === "lighthouse") {
       clickElement: async (node) => { assert.equal(node, notice); clicks += 1; },
       report() {},
       wait: async () => {},
+      activeRunId: "notice-run",
+      assertActiveRun: (runId) => assert.equal(runId, "notice-run"),
       hasUnsupportedCommentGuidance: () => false
     });
-    assert.equal(await context.confirmLighthouseGuidanceBeforeClaim(), true);
-    assert.equal(clicks, 1);
+    const observation = {};
+    assert.equal(await context.confirmLighthouseGuidanceBeforeClaim(observation), true);
+    assert.equal(await context.confirmLighthouseGuidanceBeforeClaim(observation), true);
+    assert.equal(clicks, 1, "a still-mounted confirmation is not submitted twice");
+    const replacement = { ...notice };
+    context.document.querySelectorAll = () => [replacement];
+    context.clickElement = async () => { clicks += 1; };
+    assert.equal(await context.confirmLighthouseGuidanceBeforeClaim(observation), true);
+    assert.equal(clicks, 1, "rerendered confirmation also belongs to the same attempt");
+    assert.equal(await context.confirmLighthouseGuidanceBeforeClaim({}), true);
+    assert.equal(clicks, 2, "a separately authorized attempt can confirm its own notice");
+    let clickedCurrent = false;
+    context.document.querySelectorAll = () => [notice];
+    context.wait = async ms => {
+      if (ms === 400) context.document.querySelectorAll = () => [replacement];
+    };
+    context.clickElement = async target => { assert.equal(target, replacement); clickedCurrent = true; };
+    assert.equal(await context.confirmLighthouseGuidanceBeforeClaim({}), true);
+    assert.equal(clickedCurrent, true, "the action is reacquired after the notice entrance render");
   });
   await test("unrelated page notes cannot permanently block the current detail", () => {
     const detailRoot = { innerText: "评论任务 验证通过即时到账 结算档位 Tier D 锁定席位" };
@@ -1601,6 +1621,7 @@ if (platform === "xinhuo") {
       incomeAtTaskStart: 0.3
     };
     const c = contextFor(background, ["waitForLighthouseTaskCompletionAndReturn", "verifyCompletionByPlazaIncome", "latchIncomeVerifiedCompletion"], {
+      focusLighthouseTabForAutoScan: async () => true,
       runtimeState: state, LIGHTHOUSE_CAMPAIGNS_URL: "https://app.lhdao.top/campaigns",
       getOrCreateLighthouseTab: async () => ({ id: 1 }), rememberLighthouseTabById: async () => {},
       hasLatchedLighthouseCompletion: () => Boolean(state.completionEvidence),
@@ -1623,6 +1644,7 @@ if (platform === "xinhuo") {
       incomeAtTaskStart: 0.3
     };
     const c = contextFor(background, ["waitForLighthouseTaskCompletionAndReturn", "verifyCompletionByPlazaIncome", "latchIncomeVerifiedCompletion"], {
+      focusLighthouseTabForAutoScan: async () => true,
       runtimeState: state, LIGHTHOUSE_CAMPAIGNS_URL: "https://app.lhdao.top/campaigns",
       getOrCreateLighthouseTab: async () => ({ id: 1 }), rememberLighthouseTabById: async () => {},
       hasLatchedLighthouseCompletion: () => false,
@@ -1640,6 +1662,7 @@ if (platform === "xinhuo") {
   await test("latched completion returns to marketplace without rereading vanished modal", async () => {
     let closed = 0;
     const c = contextFor(background, ["waitForLighthouseTaskCompletionAndReturn"], {
+      focusLighthouseTabForAutoScan: async () => true,
       runtimeState: { running: true, runId: "r", completionEvidence: { taskKey: "a" } },
       getOrCreateLighthouseTab: async () => ({ id: 1 }),
       LIGHTHOUSE_CAMPAIGNS_URL: "https://app.lhdao.top/campaigns",
@@ -1660,6 +1683,7 @@ if (platform === "xinhuo") {
       completionEvidence: null
     };
     const c = contextFor(background, ["waitForLighthouseTaskCompletionAndReturn", "latchLighthouseCompletion", "hasLatchedLighthouseCompletion"], {
+      focusLighthouseTabForAutoScan: async () => true,
       runtimeState: state,
       LIGHTHOUSE_CAMPAIGNS_URL: "https://app.lhdao.top/campaigns",
       getOrCreateLighthouseTab: async () => ({ id: 1 }),

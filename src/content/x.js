@@ -1,7 +1,7 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerXSingleton__";
   const RUN_LOCK_KEY = "__lighthouseCommentTaskRunnerXRunLock__";
-  const SCRIPT_VERSION = "0.7.91";
+  const SCRIPT_VERSION = "0.7.99";
   const INSTANCE_ID = `x-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const RESERVED_X_HANDLE_SLUGS = new Set(["home", "explore", "notifications", "messages", "jobs", "i", "settings"]);
   const existingSingleton = globalThis[SINGLETON_KEY];
@@ -50,6 +50,11 @@
       if (message.runId) cancelledRunIds.add(message.runId);
       if (!message.runId || message.runId === activeRunId) activeRunId = `cancelled-${Date.now()}`;
       sendResponse({ ok: true });
+      return true;
+    }
+
+    if (message.type === "CHECK_X_TASK_WIDGET_COMPLETION") {
+      sendResponse(readTaskWidgetCompletion(message));
       return true;
     }
 
@@ -882,6 +887,16 @@
 
     while (Date.now() - startedAt < timeoutMs) {
       assertActiveRun(runId);
+      const existingWidget = findLighthouseTaskWidget();
+      const existingText = normalizeText(existingWidget?.innerText || "");
+      if (existingWidget && isVisible(existingWidget)
+          && /当前任务/.test(existingText) && /已完成/.test(existingText)
+          && /验证已提交\s*[·•]\s*奖励发放中/.test(existingText)) {
+        // This is a submission receipt, not proof of final platform approval.
+        // Continue the official check without waiting for a vanished button.
+        return { ok: true, submitted: true, alreadySubmitted: true,
+          message: "X 当前任务已显示完成并提交，继续核对 Lighthouse 官方验收" };
+      }
       // Some Lighthouse versions render the verification card outside the
       // container inferred from the reply composer. Check the visible page
       // first so an enabled "验证发奖" button is clicked immediately.
@@ -913,6 +928,31 @@
 
     const reason = describeTaskWidgetCompletionBlock();
     return { ok: false, message: `X 任务闭环超时：${reason}${submitText ? `：${submitText}` : ""}` };
+  }
+
+  function readTaskWidgetCompletion(message) {
+    const target = normalizeTweetUrl(message.task?.tweetUrl || "");
+    if (automationPaused || !message.runId || cancelledRunIds.has(message.runId)
+        || message.platform !== "lighthouse" || !message.task?.taskKey
+        || !target || target !== normalizeTweetUrl(location.href)) return { ok: false, completed: false };
+    // Lighthouse mounts the current-task panel inside an open shadow root.
+    // Use the same traversal as submission controls so the completion badge
+    // remains readable after those controls are replaced by the done panel.
+    const panels = queryAccessibleElements(".lh-cur-sec").filter(isVisible);
+    if (panels.length !== 1) return { ok: true, completed: false };
+    const widget = panels[0];
+    const text = normalizeText(widget?.innerText || "");
+    const completedStatus = Array.from(widget?.querySelectorAll(".lh-cur-head .lh-cur-pill-done,.lh-cur-done-big") || [])
+      .some(node => isVisible(node) && normalizeText(node.innerText || node.textContent || "") === "已完成");
+    // The current-task completion badge is the finish line. A completed
+    // individual comment/like step is not the whole-task status.
+    if (!widget || !isVisible(widget) || !/当前任务/.test(text)
+        || !completedStatus || /待完成|未完成|验证失败|任务失败|验收失败/.test(text)) return { ok: true, completed: false };
+    return { ok: true, completed: true, evidence: {
+      runId: message.runId, taskKey: message.task.taskKey, tweetUrl: target,
+      source: "lighthouse_x_widget", officialCompletion: true, rewardPending: /奖励发放中/.test(text),
+      observedAt: Date.now(), text: text.slice(0, 500)
+    } };
   }
 
   async function waitForTaskWidgetSubmission(beforeText, submitText, timeoutMs) {
