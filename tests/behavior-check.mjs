@@ -549,7 +549,7 @@ if (platform === "lighthouse") {
   await test("worker restart resumes an interrupted auto run without a locked seat", async () => {
     let scans = 0;
     let cancelledRunIds = [];
-    const context = contextFor(background, ["tryResumeAutoRunAfterInterruption"], {
+    const context = contextFor(background, ["tryResumeAutoRunAfterInterruption", "hasLatchedLighthouseCompletion"], {
       runtimeState: {
         running: false,
         mode: "idle",
@@ -582,7 +582,7 @@ if (platform === "lighthouse") {
   });
   await test("worker restart never resumes on top of a locked unfinished seat", async () => {
     let scans = 0;
-    const context = contextFor(background, ["tryResumeAutoRunAfterInterruption"], {
+    const context = contextFor(background, ["tryResumeAutoRunAfterInterruption", "hasLatchedLighthouseCompletion"], {
       runtimeState: {
         running: false,
         mode: "idle",

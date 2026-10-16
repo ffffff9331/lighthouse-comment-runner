@@ -33,6 +33,7 @@ async function worker(options = {}) {
         if (!callback && stored[stateKey]?.uncertainAction && snapshot[stateKey] && !snapshot[stateKey].uncertainAction) {
           await hooks.onIntentClear?.();
         }
+        await hooks.onPersist?.(snapshot, Boolean(callback));
         Object.assign(stored, snapshot);
         callback?.();
       }}},
@@ -108,6 +109,202 @@ function coldMarketplaceContent(w, afterWait) {
       assert.equal(listener(message, {}, (result) => {replies.push(clone(result)); resolve(result);}), true);
     })};
 }
+
+// Lose the response channel while the real content script is still scanning,
+// exactly as a browser reload does. The production click function remains
+// intact; a late old document can only click with its own persisted permit.
+function interruptedMarketplace(w, options = {}) {
+  let listener;
+  const entered = deferred(), resume = deferred(), disconnected = deferred();
+  const clicks = [], messages = [], replies = [];
+  const fixtureButton = {click() {clicks.push("claim");}, dispatchEvent() {clicks.push("fallback");}};
+  const fixture = {afterWait: options.afterWait || "none"};
+  const c = vm.createContext({Date: w.Clock, URL, console, setTimeout, clearTimeout, fetch: noNetwork,
+    fixture, fixtureButton, fixtureEntered: entered.resolve, fixtureWait: () => resume.promise,
+    window: {addEventListener() {}}, document: {body: {innerText: "任务广场 冷却中 10m"}},
+    location: {href: "https://app.lhdao.top/campaigns", pathname: "/campaigns"},
+    chrome: {runtime: {onMessage: {addListener(fn) {listener = fn;}}, async sendMessage(message) {
+      messages.push(clone(message));
+      const response = await w.c.handleMessage(message, {tab: {id: 11, windowId: 1}, frameId: 0});
+      if (message.type === "LIGHTHOUSE_CLAIM_CHECKPOINT" && message.phase === "before_click") {
+        await options.beforePermitResponse?.(message, response);
+      }
+      return response;
+    }}}
+  });
+  const adapters = `
+    runCommentTask = async () => {
+      if (fixture.afterWait === "already_clicked") await clickElement(fixtureButton, {claimAction:true,randomDelay:false});
+      fixtureEntered();
+      await fixtureWait();
+      if (fixture.afterWait === "click_late") await clickElement(fixtureButton, {claimAction:true,randomDelay:false});
+      return {ok:false,transient:true,task:{taskKey:"unclaimed"}};
+    };
+    buildTask = () => ({taskKey:"unclaimed",seatLocked:false});
+    hasDetailRequestTimeout = () => false;
+    getLighthousePageSnapshot = () => ({phase:"campaigns",path:"/campaigns"});
+  `;
+  const source = read("content/lighthouse.js"), end = source.lastIndexOf("})();");
+  vm.runInContext(source.slice(0,end) + adapters + source.slice(end),c);
+  const page = {entered, resume, clicks, messages, replies,
+    async disconnect() {disconnected.resolve();},
+    dispatch(message) {
+      const response = new Promise(resolve => {
+        assert.equal(listener(message,{},result => {replies.push(clone(result));resolve(result);}),true);
+      });
+      return Promise.race([response, disconnected.promise.then(() => {
+        throw Error("The message port closed before a response was received.");
+      })]);
+    }
+  };
+  return page;
+}
+
+test("page refresh during an unclaimed production scan automatically resumes without an unknown order", {timeout:3000}, async () => {
+  const w = await worker(), page = interruptedMarketplace(w);
+  w.hooks.firstResponse = page.dispatch;
+  const flow = w.scan();
+  await page.entered.promise;
+  await page.disconnect();
+  await flow;
+  page.resume.resolve();
+  assert.equal(page.clicks.length,0);
+  assert.equal(w.reloads.length,1);
+  assert.equal(scans(w).length,2);
+  assert.equal(w.adopted.length,1);
+  assert.equal(w.state().running,true);
+  assert.equal(w.state().failed,0);
+  assert.equal(w.state().attempts,1, "only the subsequent claimed order counts as an attempt");
+  assert.ok(w.state().logs.some(entry => /尚未点击接单/.test(entry.text)));
+  assert.ok(!w.state().logs.some(entry => /结果未知/.test(entry.text)));
+});
+
+test("a disconnected old page cannot click after its scan intent was released", {timeout:3000}, async () => {
+  const w=await worker(), page=interruptedMarketplace(w,{afterWait:"click_late"});
+  w.hooks.firstResponse=page.dispatch;
+  const flow=w.scan(); await page.entered.promise;
+  await page.disconnect(); await flow; page.resume.resolve();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(page.clicks.length,0);
+  assert.equal(page.replies.at(-1).claimActionAttempted,false);
+  assert.equal(w.adopted.length,1);
+});
+
+test("refresh after a real claim click keeps its bound intent and never rescans", {timeout:3000}, async () => {
+  const w=await worker(), page=interruptedMarketplace(w,{afterWait:"already_clicked"});
+  w.hooks.firstResponse=page.dispatch;
+  const flow=w.scan(); await page.entered.promise;
+  const intent=w.state().uncertainAction;
+  assert.equal(page.clicks.length,1);
+  assert.equal(w.stored[stateKey].uncertainAction.claimActionAttempted,true);
+  await page.disconnect(); await flow; page.resume.resolve();
+  assert.equal(w.state().uncertainAction,intent);
+  assert.ok(intent.intentId);
+  assert.equal(w.state().stage,"action_result_unknown");
+  assert.equal(w.state().running,false);
+  assert.equal(w.reloads.length,0);
+  assert.equal(scans(w).length,1);
+});
+
+test("refresh while a persisted click permit is returning remains uncertain even before the physical click", {timeout:3000}, async () => {
+  const w=await worker(), permit=deferred(), release=deferred();
+  const page=interruptedMarketplace(w,{afterWait:"already_clicked",beforePermitResponse:async()=>{permit.resolve();await release.promise;}});
+  w.hooks.firstResponse=page.dispatch;
+  const flow=w.scan(); await permit.promise;
+  assert.equal(page.clicks.length,0);
+  assert.equal(w.stored[stateKey].uncertainAction.claimActionAttempted,true);
+  await page.disconnect(); await flow;
+  assert.equal(w.state().stage,"action_result_unknown");
+  assert.equal(w.reloads.length,0);
+  // Simulate the old document being destroyed rather than delivering a permit.
+  page.resume.resolve();
+});
+
+test("STOP while a no-click refresh recovery is persisting cannot revive scanning", {timeout:3000}, async () => {
+  const w=await worker(), page=interruptedMarketplace(w), entered=deferred(), release=deferred();
+  w.hooks.firstResponse=page.dispatch;
+  w.hooks.onIntentClear=async()=>{entered.resolve();await release.promise;};
+  const flow=w.scan(); await page.entered.promise; await page.disconnect(); await entered.promise;
+  const stop=w.stop(); release.resolve(); await stop; await flow; page.resume.resolve();
+  assert.equal(w.state().manuallyStopped,true);
+  assert.equal(w.state().stage,"stopped");
+  assert.equal(w.reloads.length,0);
+  assert.equal(scans(w).length,1);
+});
+
+for (const protection of ["locked","invitation","xResult","completion","legacy"]) {
+  test(`refresh cannot clear protected or uncheckpointed work: ${protection}`, {timeout:3000}, async () => {
+    const w=await worker(), page=interruptedMarketplace(w);
+    w.hooks.firstResponse=page.dispatch;
+    const flow=w.scan(); await page.entered.promise;
+    if(protection==="locked") w.state().currentTask={taskKey:"locked",seatLocked:true};
+    if(protection==="invitation") w.state().currentTask={taskKey:"invited",invitationAccepted:{}};
+    if(protection==="xResult") w.state().lastXResult={ok:true};
+    if(protection==="completion") w.state().completionEvidence={officialCompletion:true};
+    if(protection==="legacy") delete w.state().uncertainAction.checkpointVersion;
+    await page.disconnect(); await flow; page.resume.resolve();
+    assert.equal(w.state().stage,"action_result_unknown");
+    assert.equal(w.reloads.length,0);
+    assert.equal(scans(w).length,1);
+  });
+}
+
+test("claim checkpoints reject other runs, intents, tabs and page instances", {timeout:3000}, async () => {
+  const w=await worker(), page=interruptedMarketplace(w);
+  w.hooks.firstResponse=page.dispatch;
+  const flow=w.scan(); await page.entered.promise;
+  const ready=page.messages.find(message=>message.type==="LIGHTHOUSE_CLAIM_CHECKPOINT");
+  assert.ok(ready);
+  for(const patch of [{runId:"old"},{claimIntentId:"old"},{instanceId:"other"},{operationType:"other"},{version:0}]) {
+    const reply=await w.c.handleMessage({...ready,phase:"before_click",...patch},{tab:{id:11,windowId:1}});
+    assert.equal(reply.ok,false);
+    assert.equal(w.state().uncertainAction.claimActionAttempted,false);
+  }
+  assert.equal((await w.c.handleMessage({...ready,phase:"before_click"},{tab:{id:99,windowId:1}})).ok,false);
+  await page.disconnect(); await flow; page.resume.resolve();
+});
+
+test("repeated ready checkpoint cannot reset a persisted claim attempt", {timeout:3000}, async () => {
+  const w=await worker(), page=interruptedMarketplace(w,{afterWait:"already_clicked"});
+  w.hooks.firstResponse=page.dispatch;
+  const flow=w.scan(); await page.entered.promise;
+  const ready=page.messages.find(message=>message.type==="LIGHTHOUSE_CLAIM_CHECKPOINT");
+  assert.equal((await w.c.handleMessage(ready,{tab:{id:11,windowId:1}})).ok,true);
+  assert.equal(w.state().uncertainAction.claimActionAttempted,true);
+  assert.equal(w.stored[stateKey].uncertainAction.claimActionAttempted,true);
+  await page.disconnect(); await flow; page.resume.resolve();
+  assert.equal(w.state().stage,"action_result_unknown");
+});
+
+test("failure to persist a click checkpoint prevents the real DOM click", {timeout:3000}, async () => {
+  const w=await worker(), page=interruptedMarketplace(w,{afterWait:"already_clicked"});
+  w.hooks.firstResponse=page.dispatch;
+  w.hooks.onPersist=async(snapshot,callback)=>{
+    if(!callback && snapshot[stateKey]?.uncertainAction?.claimActionAttempted===true) throw Error("storage failed");
+  };
+  const result=await w.c.sendToTab(11,{type:"START_LIGHTHOUSE_COMMENT_TASK",runId:"scan-run",settings:{}});
+  assert.equal(page.clicks.length,0);
+  assert.equal(result.claimActionAttempted,false);
+  assert.equal(w.state().uncertainAction,undefined);
+  assert.equal(w.reloads.length,0);
+});
+
+test("a run change while the click checkpoint is persisting prevents its physical click", {timeout:3000}, async () => {
+  const w=await worker(), page=interruptedMarketplace(w,{afterWait:"already_clicked"});
+  w.hooks.firstResponse=page.dispatch;
+  let changed=false;
+  w.hooks.onPersist=async(snapshot,callback)=>{
+    if(!changed && !callback && snapshot[stateKey]?.uncertainAction?.claimActionAttempted===true) {
+      changed=true;
+      w.state().runId="new-run";
+    }
+  };
+  const result=await w.c.sendToTab(11,{type:"START_LIGHTHOUSE_COMMENT_TASK",runId:"scan-run",settings:{}});
+  assert.equal(changed,true);
+  assert.equal(page.clicks.length,0);
+  assert.equal(result.cancelled,true);
+  assert.equal(w.reloads.length,0);
+});
 
 const cancellers = (w) => w.sent.filter((message) => message.type.startsWith("CANCEL_"));
 const scans = (w) => w.sent.filter((message) => message.type === "START_LIGHTHOUSE_COMMENT_TASK");

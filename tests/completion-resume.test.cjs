@@ -13,7 +13,7 @@ function load(file, name, globals) {
   const next = new RegExp(`^${match[1]}(?:async )?function \\w+\\(`, "gm");
   next.lastIndex = match.index + match[0].length;
   const end = next.exec(source)?.index ?? source.lastIndexOf("})();");
-  const context = vm.createContext({ console, ...globals });
+  const context = vm.isContext(globals) ? globals : vm.createContext({ console, ...globals });
   vm.runInContext(source.slice(match.index, end), context);
   return context;
 }
@@ -21,25 +21,30 @@ function load(file, name, globals) {
 function xPage(text, visible = true) {
   let now = 0;
   const effects = { clicks: 0, waited: 0 };
-  const widget = { innerText: text };
+  const task = {taskKey:"order",tweetUrl:"https://x.com/fixture/status/123"};
+  const widget = { innerText: text, querySelectorAll: () => /当前任务 已完成/.test(text) ? [{innerText:"已完成"}] : [] };
   const context = load("content/x.js", "completeTaskWidgetLifecycle", {
     activeRunId: "current", assertActiveRun() {}, Date: { now: () => now },
+    automationPaused:false,cancelledRunIds:new Set(),location:{href:task.tweetUrl},
+    normalizeTweetUrl:value=>value,queryAccessibleElements:()=>[widget],
     normalizeText: value => String(value).replace(/\s+/g, " ").trim(),
     findLighthouseTaskWidget: () => widget, isVisible: () => visible,
     findDocumentVerifyActionButton: () => null, revealTaskWidgetArea: async () => widget,
     findVerifyActionButton: () => null, describeTaskWidgetCompletionBlock: () => "no verified receipt",
     async wait(ms) { now += ms; effects.waited += ms; }
   });
-  return { context, effects, run: () => context.completeTaskWidgetLifecycle({}) };
+  load("content/x.js", "readTaskWidgetCompletion", context);
+  return { context, effects, run: () => context.completeTaskWidgetLifecycle({},task) };
 }
 
-test("already completed X widget continues official verification without waiting for a submit button", async () => {
+test("already completed X widget finishes without waiting for submission controls or payment", async () => {
   const p = xPage("当前任务 已完成 验证已提交 · 奖励发放中 打开任务广场");
   const result = await p.run();
   assert.equal(result.ok, true);
   assert.equal(result.submitted, true);
   assert.equal(result.alreadySubmitted, true);
-  assert.notEqual(result.officialCompletion, true);
+  assert.equal(result.completed, true);
+  assert.equal(result.evidence.officialCompletion, true);
   assert.equal(p.effects.waited, 0);
 });
 
@@ -179,7 +184,8 @@ async function shadowCompletionPage(options = {}) {
     assert.ok(result, "Read-only completion responds synchronously");
     return result;
   }
-  return {panel, badge, host, shadow, document, runtimeMessages, dispatch, check: () => dispatch(message)};
+  return {panel, badge, host, shadow, document, runtimeMessages, dispatch, check: () => dispatch(message),
+    submit: () => new Promise(resolve => listener({...message,type:"COMPLETE_X_TASK_WIDGET",settings:{}},{},resolve))};
 }
 
 test("production listener reads the completed current-task panel inside its open shadow root", async () => {
@@ -262,3 +268,11 @@ for (const outcome of ["widget", "lighthouse", "timeout", "stop"]) {
     if (outcome === "stop") {assert.equal(result.cancelled,true);assert.equal(sent.length,1);}
   });
 }
+
+test("submission entry recognizes a completed shadow panel without looking for or clicking removed controls", async()=>{
+  const p=await shadowCompletionPage();
+  const r=await p.submit();
+  assert.equal(r.ok,true);assert.equal(r.completed,true);assert.equal(r.alreadySubmitted,true);
+  assert.equal(r.evidence.source,"lighthouse_x_widget");
+  assert.deepEqual(p.runtimeMessages,["GET_CONTENT_SETTINGS"]);
+});

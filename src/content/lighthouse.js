@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.99";
+  const SCRIPT_VERSION = "0.7.101";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -173,6 +173,7 @@
       runId: message.runId,
       type: message.type,
       claimIntentId: message.claimIntentId || "",
+      checkpointRequired: message.claimCheckpointRequired === true,
       claimActionAttempted: false
     } : null;
     if (operation) claimOperation = operation;
@@ -180,6 +181,7 @@
       if (automationPauseReady) await automationPauseReady;
       assertActiveRun(message.runId || activeRunId);
       if (operation) assertActiveRun(operation.runId);
+      if (operation?.checkpointRequired) await writeClaimCheckpoint(operation, "ready");
       return handler();
     })
       .then((result) => {
@@ -2797,6 +2799,22 @@
     return normalize(text).slice(0, 220);
   }
 
+  async function writeClaimCheckpoint(operation, phase) {
+    assertActiveRun(operation.runId);
+    if (claimOperation !== operation) throw new Error("接单操作已被替换，未允许点击");
+    const receipt = await chrome.runtime.sendMessage({
+      type: "LIGHTHOUSE_CLAIM_CHECKPOINT", version: 1, phase,
+      runId: operation.runId, operationType: operation.type,
+      claimIntentId: operation.claimIntentId, instanceId: INSTANCE_ID
+    });
+    assertActiveRun(operation.runId);
+    if (claimOperation !== operation || receipt?.ok !== true || receipt.checkpointRegistered !== true
+        || receipt.claimIntentId !== operation.claimIntentId || receipt.instanceId !== INSTANCE_ID
+        || (phase === "before_click" && receipt.permitClaimClick !== true)) {
+      throw new Error("后台未确认接单检查点，尚未点击接单");
+    }
+  }
+
   async function clickElement(node, options = {}) {
     const runId = activeRunId;
     assertActiveRun(runId);
@@ -2807,7 +2825,12 @@
     if (claimOperation) assertActiveRun(claimOperation.runId);
     // Mark before dispatch: a handler can perform the action and then throw.
     // Invitation/confirmation buttons can claim an order just like a lock.
-    if (options.claimAction && claimOperation) claimOperation.claimActionAttempted = true;
+    if (options.claimAction && claimOperation) {
+      const operation = claimOperation;
+      if (operation.checkpointRequired) await writeClaimCheckpoint(operation, "before_click");
+      assertActiveRun(runId);
+      operation.claimActionAttempted = true;
+    }
     try {
       node.click();
       return;

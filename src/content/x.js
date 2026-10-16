@@ -1,7 +1,7 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerXSingleton__";
   const RUN_LOCK_KEY = "__lighthouseCommentTaskRunnerXRunLock__";
-  const SCRIPT_VERSION = "0.7.99";
+  const SCRIPT_VERSION = "0.7.101";
   const INSTANCE_ID = `x-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const RESERVED_X_HANDLE_SLUGS = new Set(["home", "explore", "notifications", "messages", "jobs", "i", "settings"]);
   const existingSingleton = globalThis[SINGLETON_KEY];
@@ -61,8 +61,8 @@
     const actions = {
       RUN_X_REPLY: () => runReply(message.task, message.settings),
       RUN_X_WIDGET_CLAIM: () => runTaskWidgetClaim(message.task, message.settings),
-      CLICK_X_TASK_VERIFY: () => completeTaskWidgetLifecycle(message.settings),
-      COMPLETE_X_TASK_WIDGET: () => completeTaskWidgetLifecycle(message.settings)
+      CLICK_X_TASK_VERIFY: () => completeTaskWidgetLifecycle(message.settings, message.task),
+      COMPLETE_X_TASK_WIDGET: () => completeTaskWidgetLifecycle(message.settings, message.task)
     };
     if (!actions[message.type]) return false;
     executeXStep(message, actions[message.type]).then(sendResponse);
@@ -879,7 +879,7 @@
     return { ok: true, message: `已点击 X 任务验证按钮：${text}` };
   }
 
-  async function completeTaskWidgetLifecycle(settings = {}) {
+  async function completeTaskWidgetLifecycle(settings = {}, task = {}) {
     const runId = activeRunId;
     const startedAt = Date.now();
     const timeoutMs = Math.max(60000, Number(settings.lockSeatTimeoutMs || 0));
@@ -887,15 +887,10 @@
 
     while (Date.now() - startedAt < timeoutMs) {
       assertActiveRun(runId);
-      const existingWidget = findLighthouseTaskWidget();
-      const existingText = normalizeText(existingWidget?.innerText || "");
-      if (existingWidget && isVisible(existingWidget)
-          && /当前任务/.test(existingText) && /已完成/.test(existingText)
-          && /验证已提交\s*[·•]\s*奖励发放中/.test(existingText)) {
-        // This is a submission receipt, not proof of final platform approval.
-        // Continue the official check without waiting for a vanished button.
-        return { ok: true, submitted: true, alreadySubmitted: true,
-          message: "X 当前任务已显示完成并提交，继续核对 Lighthouse 官方验收" };
+      const completion = readTaskWidgetCompletion({platform:"lighthouse", runId, task});
+      if (completion.completed) {
+        return { ...completion, submitted: true, alreadySubmitted: true,
+          message: "X 当前任务已显示已完成，本单结束，无需再次提交" };
       }
       // Some Lighthouse versions render the verification card outside the
       // container inferred from the reply composer. Check the visible page

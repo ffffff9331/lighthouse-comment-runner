@@ -27,7 +27,7 @@ function savedStorage(extra = {}) {
   };
 }
 
-async function boot(t, stored) {
+async function boot(t, stored, beforeWrite = null) {
   const event = { addListener() {} };
   const calls = { runStateWrites: [], alarmsCreated: [], alarmsCleared: [], browser: [], scans: [] };
   const timers = new Set();
@@ -42,6 +42,7 @@ async function boot(t, stored) {
       async setAccessLevel() {},
       async get(keys) { return Object.fromEntries(keys.map((key) => [key, clone(stored[key])])); },
       async set(values, callback) {
+        await beforeWrite?.(values, callback);
         if (Object.hasOwn(values, STATE_KEY)) calls.runStateWrites.push(clone(values[STATE_KEY]));
         Object.assign(stored, clone(values));
         callback?.();
@@ -170,4 +171,71 @@ test("STOP_RUN followed by reboot and keepalive retains the stop without startin
   assert.deepEqual(rebooted.calls.alarmsCleared, [KEEPALIVE, IDLE_RELOAD]);
   assert.deepEqual(rebooted.calls.browser, []);
   assert.deepEqual(rebooted.calls.scans, []);
+});
+
+const safeScanIntent = {type:"START_LIGHTHOUSE_COMMENT_TASK", runId:"saved-run", tabId:11,
+  intentId:"intent-id", checkpointRequired:true, checkpointVersion:1, contentInstanceId:"page-id", claimActionAttempted:false};
+test("worker restart revokes a proven no-click scan and resumes it once", async t => {
+  const stored = savedStorage({running:true, mode:"auto", stage:"selecting_task", currentTask:null, xTabId:null, uncertainAction:safeScanIntent});
+  const w = await boot(t,stored);
+  assert.equal(w.state().stage,"interrupted_not_resumed");
+  assert.equal(w.state().uncertainAction,undefined);
+  assert.equal(stored[STATE_KEY].uncertainAction,undefined);
+  const late = await w.context.handleMessage({type:"LIGHTHOUSE_CLAIM_CHECKPOINT",version:1,phase:"before_click",
+    runId:"saved-run",operationType:safeScanIntent.type,claimIntentId:"intent-id",instanceId:"page-id"},{tab:{id:11},frameId:0});
+  assert.equal(late.ok,false);
+  await w.context.handleAutoRunKeepaliveTick();
+  assert.equal(w.state().running,true);
+  assert.equal(w.calls.scans.length,1);
+});
+for (const change of [
+  {claimActionAttempted:true},{checkpointVersion:0},{checkpointRequired:false},{contentInstanceId:""},
+  {runId:"another-run"},{tabId:99},{intentId:""}
+]) test(`restart keeps unsafe or unbound claim intents protected: ${JSON.stringify(change)}`,async t=>{
+  const intent={...safeScanIntent,...change};
+  const w=await boot(t,savedStorage({running:true,mode:"auto",currentTask:null,uncertainAction:intent}));
+  await w.context.handleAutoRunKeepaliveTick();
+  assert.equal(w.state().running,false);assert.deepEqual(clone(w.state().uncertainAction),intent);
+  assert.equal(w.calls.scans.length,0);
+});
+for (const extra of [{currentTask:lockedTask},{lastXResult:{ok:true}},{completionEvidence:{taskKey:"order",runId:"saved-run"}},{manuallyStopped:true},{running:false}]) {
+  test(`checkpoint does not release protected or stopped state: ${JSON.stringify(extra)}`,async t=>{
+    const w=await boot(t,savedStorage({running:true,mode:"auto",currentTask:null,uncertainAction:safeScanIntent,...extra}));
+    await w.context.handleAutoRunKeepaliveTick();
+    assert.equal(w.state().running,false);assert.equal(w.calls.scans.length,0);
+  });
+}
+
+for (const counted of [false,true]) test(`restart finishes a confirmed order exactly once (alreadyCounted=${counted})`,async t=>{
+  const stored=savedStorage({running:true,mode:"auto",stage:"campaigns_returned",completed:counted?4:3,
+    currentTask:{...lockedTask,completionCounted:counted}, completionEvidence:{runId:"saved-run",taskKey:lockedTask.taskKey,officialCompletion:true}});
+  const w=await boot(t,stored);
+  w.context.closeLighthouseDetailToCampaigns=async()=>true;
+  w.context.reloadLighthouseCampaignsAfterOrder=async()=>true;
+  w.context.delay=async()=>{};
+  await w.context.handleAutoRunKeepaliveTick();
+  assert.equal(w.state().completed,4);
+  assert.equal(w.state().currentTask,null);
+  assert.equal(w.state().completionEvidence,null);
+  assert.deepEqual(w.calls.scans,["after_success"]);
+  assert.equal(w.calls.browser.some(x=>x.type==="sendMessage"&&x.payload.type==="RUN_X_REPLY"),false);
+});
+for (const extra of [{currentTask:{taskKey:"claimed-only",claimed:true}}, {currentTask:null,lastXResult:{ok:true}},
+  {completionEvidence:{runId:"different",taskKey:lockedTask.taskKey}},
+  {completionEvidence:{runId:"saved-run",taskKey:"different"}}]) {
+  test(`restart cannot discard an unfinished or mismatched order: ${JSON.stringify(extra)}`,async t=>{
+    const w=await boot(t,savedStorage({running:true,mode:"auto",...extra}));
+    await w.context.handleAutoRunKeepaliveTick();
+    assert.equal(w.state().running,false);assert.equal(w.calls.scans.length,0);
+  });
+}
+
+test("failed durable revocation keeps a restarted no-click scan stopped",async t=>{
+  const stored=savedStorage({running:true,mode:"auto",currentTask:null,uncertainAction:safeScanIntent});
+  const w=await boot(t,stored,(values,callback)=>{
+    if(!callback&&values[STATE_KEY]&&!values[STATE_KEY].uncertainAction)throw Error("storage unavailable");
+  });
+  await w.context.handleAutoRunKeepaliveTick();
+  assert.equal(w.state().running,false);assert.equal(w.state().stage,"stopped");
+  assert.deepEqual(clone(w.state().uncertainAction),safeScanIntent);assert.equal(w.calls.scans.length,0);
 });

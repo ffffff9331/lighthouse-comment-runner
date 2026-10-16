@@ -31,7 +31,17 @@ function content(kind = "deferred", onReport = async () => {}, entryLabel = "领
     document: { body: detailRoot, querySelectorAll: () => [] }, window: { addEventListener() {} },
     location: { href: "https://app.lhdao.top/campaigns", pathname: "/campaigns" },
     chrome: { runtime: { onMessage: { addListener(fn) { listener = fn; } },
-      async sendMessage(message) { reports.push(clone(message)); return onReport(message); }
+      async sendMessage(message) {
+        reports.push(clone(message));
+        const result = await onReport(message);
+        // Isolated content fixtures use an acknowledged background checkpoint;
+        // connected fixtures execute the real background handler above.
+        if (!result && message.type === "LIGHTHOUSE_CLAIM_CHECKPOINT") return {
+          ok: true, checkpointRegistered: true, permitClaimClick: message.phase === "before_click",
+          claimIntentId: message.claimIntentId, instanceId: message.instanceId
+        };
+        return result;
+      }
     } }
   });
   const adapters = `
