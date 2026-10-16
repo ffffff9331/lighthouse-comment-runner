@@ -2911,13 +2911,15 @@ async function refreshLighthouseCampaignsTab(tabId, reason = "", isCurrent = () 
     if (!isCurrent()) return cancelled();
     const readyBeforeReload = await waitForTabComplete(tabId);
     if (!isCurrent()) return cancelled();
-    if (readyBeforeReload === false) throw new Error("刷新前 Lighthouse 页面加载超时");
+    if (readyBeforeReload === false && !await waitForCampaignsReloadReadiness(tabId, isCurrent)) throw new Error("刷新前 Lighthouse 页面加载超时");
+    if (!isCurrent()) return cancelled();
     log("info", reason || "准备刷新 Lighthouse 任务广场");
     await chrome.tabs.reload(tabId);
     if (!isCurrent()) return cancelled();
     const readyAfterReload = await waitForTabComplete(tabId);
     if (!isCurrent()) return cancelled();
-    if (readyAfterReload === false) throw new Error("刷新后 Lighthouse 页面加载超时");
+    if (readyAfterReload === false && !await waitForCampaignsReloadReadiness(tabId, isCurrent)) throw new Error("刷新后 Lighthouse 页面加载超时");
+    if (!isCurrent()) return cancelled();
     lastCampaignsRefreshAt = Date.now();
     return { ok: true, skippedCooldown: false, message: "" };
   } catch (error) {
@@ -2938,7 +2940,8 @@ async function reloadLighthouseCampaignsAfterOrder(tabId, reason = "", isCurrent
     if (!isCurrent()) return false;
     const loaded = await waitForTabComplete(tabId);
     if (!isCurrent()) return false;
-    if (loaded === false) throw new Error("刷新后 Lighthouse 页面加载超时");
+    if (loaded === false && !await waitForCampaignsReloadReadiness(tabId, isCurrent)) throw new Error("刷新后 Lighthouse 页面加载超时");
+    if (!isCurrent()) return false;
     lastCampaignsRefreshAt = Date.now();
     log("info", reason || "订单结束，已重新加载 Lighthouse 任务广场");
     return true;
@@ -3810,6 +3813,36 @@ async function waitForTabComplete(tabId) {
     const tab = await chrome.tabs.get(tabId);
     if (tab.status === "complete") return true;
     await delay(250);
+  }
+  return false;
+}
+
+async function waitForCampaignsReloadReadiness(tabId, isCurrent) {
+  const deadline = Date.now() + 50000;
+  log("info", "Chrome 仍在加载页面资源，继续只读核对任务广场是否已就绪");
+  while (isCurrent() && Date.now() <= deadline) {
+    const tab = await chrome.tabs.get(tabId);
+    if (!isCurrent()) return false;
+    const url = tab.pendingUrl || tab.url;
+    if (!isLighthouseUrl(url) || new URL(url).pathname.replace(/\/$/, "") !== "/campaigns") return false;
+    if (tab.status === "complete") return true;
+    let timer;
+    try {
+      const ready = await Promise.race([
+        chrome.tabs.sendMessage(tabId, {type: "CHECK_LIGHTHOUSE_CAMPAIGNS_READY", platform: "lighthouse"}),
+        new Promise(resolve => {timer = setTimeout(() => resolve(null), 1500);})
+      ]);
+      if (!isCurrent()) return false;
+      if (ready?.ok && ready.ready === true && isLighthouseUrl(ready.url)
+          && new URL(ready.url).pathname.replace(/\/$/, "") === "/campaigns") {
+        log("info", "任务广场已就绪，页面附属资源仍在加载，继续扫描");
+        return true;
+      }
+    } catch (_) {
+      // The new document may not have installed its content listener yet.
+    } finally {clearTimeout(timer);}
+    if (!isCurrent()) return false;
+    await delay(1000);
   }
   return false;
 }
@@ -4943,7 +4976,7 @@ async function handleAutoRunKeepaliveTick() {
           if (!ownsRecovery()) return;
           const reloaded = await waitForTabComplete(marketplaceTabId);
           if (!ownsRecovery()) return;
-          if (reloaded === false) throw new Error("重新检测前 Lighthouse 页面加载超时");
+          if (reloaded === false && !await waitForCampaignsReloadReadiness(marketplaceTabId, ownsRecovery)) throw new Error("重新检测前 Lighthouse 页面加载超时");
         }
         if (!ownsRecovery()) return;
         // startAutoRun can keep scanning for hours. Observe its refusal/error

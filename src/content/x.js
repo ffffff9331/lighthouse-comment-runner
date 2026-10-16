@@ -1,7 +1,7 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerXSingleton__";
   const RUN_LOCK_KEY = "__lighthouseCommentTaskRunnerXRunLock__";
-  const SCRIPT_VERSION = "0.7.101";
+  const SCRIPT_VERSION = "0.7.102";
   const INSTANCE_ID = `x-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const RESERVED_X_HANDLE_SLUGS = new Set(["home", "explore", "notifications", "messages", "jobs", "i", "settings"]);
   const existingSingleton = globalThis[SINGLETON_KEY];

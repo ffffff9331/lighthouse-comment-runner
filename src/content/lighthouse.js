@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.101";
+  const SCRIPT_VERSION = "0.7.102";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -117,6 +117,11 @@
       // Mark the run cancelled before yielding, then wait only for its own
       // operation's terminal receipt. An acknowledgement alone proves nothing.
       cancelRun(message).then((result) => { if (isCurrentInstance()) sendResponse(result); });
+      return true;
+    }
+    if (message.type === "CHECK_LIGHTHOUSE_CAMPAIGNS_READY") {
+      sendResponse({ ok: message.platform === "lighthouse", url: location.href,
+        ready: message.platform === "lighthouse" && !automationPaused && isCampaignsListOpen() });
       return true;
     }
     if (automationPaused) {

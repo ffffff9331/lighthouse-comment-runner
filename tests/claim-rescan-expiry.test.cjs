@@ -165,6 +165,7 @@ function reloadHarness(waitResult) {
     lastCampaignsRefreshAt: 0,
     chrome: { tabs: { async reload(tabId) { assert.equal(tabId, 7); reloads++; } } },
     waitForTabComplete: async () => waitResult,
+    waitForCampaignsReloadReadiness: async () => false,
     log: (level, text) => logs.push({ level, text }),
   });
   vm.runInContext(source.slice(start, end), context);
