@@ -30,6 +30,8 @@ function declaration(source, name) {
 }
 function contextFor(source, names, globals = {}) {
   const context = vm.createContext({ console, URL, AbortController, setTimeout, clearTimeout,
+    ELIGIBILITY_BLOCK_MARKERS: JSON.parse(page.match(/const ELIGIBILITY_BLOCK_MARKERS = (\[[^;]+\]);/)[1]),
+    ACCOUNT_RISK_REVIEW_MARKERS: ["账户风险中", "等待审核", "风险审核"],
     normalize: (s) => String(s).replace(/\s+/g, " ").trim(),
     normalizeText: (s) => String(s).replace(/\s+/g, " ").trim(),
     startTaskWidgetAssist() {}, ...globals });
@@ -421,7 +423,7 @@ if (platform === "lighthouse") {
   });
   await test("unrelated page notes cannot permanently block the current detail", () => {
     const detailRoot = { innerText: "评论任务 验证通过即时到账 结算档位 Tier D 锁定席位" };
-    const context = contextFor(page, ["hasUnsupportedCommentGuidance", "assertSupportedDetailTask"], {
+    const context = contextFor(page, ["hasUnsupportedCommentGuidance", "getEligibilityBlockReason", "assertSupportedDetailTask"], {
       document: {
         body: {
           innerText: `${detailRoot.innerText} 推荐任务 接单备注 不要使用 AI 评论`
@@ -1395,7 +1397,7 @@ if (platform === "xinhuo") {
   });
   await test("candidate collection preserves invitation state without changing comment eligibility", () => {
     const card = { innerText: "评论留言 邀请接单 预计获得 0.1 LUX" };
-    const c = contextFor(page, ["collectTaskCandidates"], {
+    const c = contextFor(page, ["collectTaskCandidates", "getCardUnavailableReason", "getEligibilityBlockReason", "hasAccountRiskReviewBlock"], {
       isTaskDetailOrRecoverableOverlayOpen: () => false,
       collectExecutableTaskCards: () => [card],
       isLikelySingleTaskCard: () => true,
@@ -1428,7 +1430,7 @@ if (platform === "xinhuo") {
     assert.equal(c.isIgnoredNonCommentTask({ title: "Follow 任务" }), true);
   });
   await test("risk-review lock state is a permanent detail block, not a cooldown", () => {
-    const c = contextFor(page, ["hasAccountRiskReviewBlock", "hasBlockingTaskFailure", "hasCooldownState"], {
+    const c = contextFor(page, ["hasAccountRiskReviewBlock", "hasBlockingTaskFailure", "getEligibilityBlockReason", "hasCooldownState"], {
       normalize: (value) => String(value || "").replace(/\s+/g, " ").trim(),
       TIER_MISMATCH_PHRASE: "档位不符，无法领取",
       ACCOUNT_RISK_REVIEW_MARKERS: ["账户风险中", "等待审核", "风险审核"],
@@ -1489,7 +1491,7 @@ if (platform === "xinhuo") {
   });
   await test("a valid card-local cooldown wins over blocked words in the tweet excerpt", () => {
     const card = { innerText: "评论留言 预计获得 0.1 LUX 项目已完成升级 冷却中 · 1m 20s" };
-    const c = contextFor(page, ["collectTaskCandidates"], {
+    const c = contextFor(page, ["collectTaskCandidates", "getCardUnavailableReason", "getEligibilityBlockReason", "hasAccountRiskReviewBlock"], {
       isTaskDetailOrRecoverableOverlayOpen: () => false,
       collectExecutableTaskCards: () => [card],
       isLikelySingleTaskCard: () => true,

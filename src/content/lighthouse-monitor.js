@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseHighBountyMonitor__";
-  const SCRIPT_VERSION = "0.7.105";
+  const SCRIPT_VERSION = "0.7.106";
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) return;
   if (existingSingleton?.stop) existingSingleton.stop();
@@ -30,7 +30,8 @@
     { markers: ["原创推文", "原创建推文", "原创内容", "发推", "发布推文", "创建推文", "发一条推文", "Create Tweet", "Post Tweet", "Original Post"], label: "原创推文" }
   ];
   const ACTION_MARKERS = ["查看详情", "评论留言", "邀请接单", "邀请任务", "接单邀请", "受邀任务", "邀请单", "被邀请", "接受邀请", "确认邀请", "同意接单", "接受接单", "立即接单", "冷却中", "进行中", "已完成", "已提交", "席位已满", "去完成", "开始任务", "领取任务"];
-  const BLOCKED_MARKERS = ["进行中", "已完成", "已提交", "席位已满", "名额已满", "已结束", "不可领取", "无法参与", "档位不符", "需灯塔严选资格", "当前等级不可", "额度不足"];
+  const ELIGIBILITY_BLOCK_MARKERS = ["档位不符", "需灯塔严选资格", "当前等级不可", "额度不足", "暂不可接单"];
+  const BLOCKED_MARKERS = ["进行中", "已完成", "已提交", "席位已满", "名额已满", "已结束", "不可领取", "无法参与", ...ELIGIBILITY_BLOCK_MARKERS];
   const COOLING_MARKERS = ["冷却中", "冷却", "后可", "等待"];
   const READY_MARKERS = ["查看详情", "评论留言", "接受邀请", "确认邀请", "同意接单", "接受接单", "立即接单", "去完成", "开始任务", "领取任务"];
 
@@ -373,7 +374,8 @@
   }
 
   function parseStatusFromCard(card) {
-    const candidates = getVisibleTextBlocks(card)
+    const actionRoot = card.querySelector?.('[data-mobile-card-slot="action"]') || card;
+    const candidates = getVisibleTextBlocks(actionRoot)
       .filter((entry) => {
         const text = entry.text;
         return belongsToTaskCard(entry.node, card)
@@ -393,17 +395,23 @@
 
     const statusText = candidates[0]?.text || "";
     const cardText = normalize(card.innerText || "");
+    const eligibilityBlock = ELIGIBILITY_BLOCK_MARKERS.find(marker => cardText.replace(/\s+/g, "").includes(marker));
+    const controls = Array.from(actionRoot.querySelectorAll?.("button,a,[role='button']") || [])
+      .filter(node => isVisible(node) && belongsToTaskCard(node, card));
+    const disabled = node => node.disabled || node.getAttribute?.("aria-disabled") === "true" || node.classList?.contains("disabled");
+    const disabledAction = controls.find(node => disabled(node)
+      && !/冷却|后可|等待(?:下一批|下一波)?(?:席位)?(?:释放|开放)/.test(normalize(node.innerText || node.textContent || "")));
     const hasCoolingStatus = COOLING_MARKERS.some((marker) => statusText.includes(marker));
-    const isBlocked = !hasCoolingStatus && (
+    const isBlocked = Boolean(eligibilityBlock) || Boolean(disabledAction && controls.every(disabled)) || (!hasCoolingStatus && (
       BLOCKED_MARKERS.some((marker) => cardText.includes(marker))
       || hasUnsupportedCommentGuidance(cardText)
-    );
+    ));
     const isCooling = !isBlocked && hasCoolingStatus;
     const isReady = !isBlocked && !isCooling && READY_MARKERS.some((marker) => statusText.includes(marker));
     const countdownSec = isCooling ? parseCountdownSeconds(statusText) : 0;
 
     return {
-      rawText: statusText,
+      rawText: eligibilityBlock || (isBlocked && disabledAction ? normalize(disabledAction.innerText || disabledAction.textContent || "") : statusText),
       isBlocked,
       isCooling,
       isReady,

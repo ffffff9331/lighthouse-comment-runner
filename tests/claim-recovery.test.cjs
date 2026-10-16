@@ -21,7 +21,7 @@ const noNetwork = async () => { throw Error("Network forbidden in claim recovery
 function content(kind = "deferred", onReport = async () => {}, entryLabel = "领取任务") {
   let listener;
   const replies = [], reports = [];
-  const detailRoot = { innerText: kind === "hard_refusal" || kind.startsWith("entry_") ? "不可领取" : "下一批放号 14:12" };
+  const detailRoot = { innerText: kind === "eligibility_refusal" ? "需灯塔严选资格" : (kind === "hard_refusal" || kind.startsWith("entry_") ? "不可领取" : "下一批放号 14:12") };
   const button = { clicked: 0, href: "", innerText: "锁定席位", isConnected: true,
     getAttribute: () => "", scrollIntoView() {}, click() { this.clicked += 1; } };
   const invitation = { clicked: 0, innerText: "接受邀请", click() { this.clicked += 1; } };
@@ -303,3 +303,28 @@ for (const [label, attempted] of [
     }
   });
 }
+
+test("a live eligibility refusal exits without a claim and the automatic runner scans the next task", async () => {
+  let w;
+  const page = content("eligibility_refusal", (message) => w.c.handleMessage(message, { tab: { id: 11, windowId: 1 } }));
+  w = await worker((message) => {
+    if (w.sent.length === 1) return page.dispatch(message);
+    w.state().running = false;
+    return { ok: false, cancelled: true, message: "test ends after confirmed continuation" };
+  });
+  const reload = w.c.reloadLighthouseCampaignsAfterOrder;
+  w.c.reloadLighthouseCampaignsAfterOrder = async (...args) => {
+    assert.equal(w.state().uncertainAction, undefined, "the rejected order is cleared before the next scan starts");
+    return reload(...args);
+  };
+  await w.c.startNextAutoTask("eligibility_refusal");
+  assert.equal(page.replies[0].claimActionAttempted, false);
+  assert.match(page.replies[0].message, /需灯塔严选资格/);
+  assert.equal(page.button.clicked + page.invitation.clicked, 0);
+  assert.equal(w.sent.length, 2);
+  assert.equal(w.sent[1].type, "START_LIGHTHOUSE_COMMENT_TASK");
+  assert.ok(w.effects.includes("closeDetail"));
+  assert.ok(w.effects.includes("reloadCampaigns"));
+  assert.ok(!w.sent[1].attemptedTaskKeys.includes(task.taskKey));
+  assert.equal(w.state().currentTask, null);
+});

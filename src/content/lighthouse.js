@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.105";
+  const SCRIPT_VERSION = "0.7.106";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -44,11 +44,11 @@
     "邀请接单"
   ];
   const DETAIL_TASK_MARKERS = ["评论任务", "Comment", "评论留言", "点赞互动", "点赞", "Like", "关注", "Follow", "完成后回来点击", "Twitter API", "原创推文", "原创建推文", "原创内容", "发推", "转发", "转推", "Repost", "Retweet", "邀请接单", "邀请任务", "接单邀请", "受邀任务", "邀请单", "被邀请"];
-  const BLOCKED_MARKERS = ["进行中", "已完成", "已提交", "档位不符", "需灯塔严选资格", "当前等级不可", "额度不足"];
+  const ELIGIBILITY_BLOCK_MARKERS = ["档位不符", "需灯塔严选资格", "当前等级不可", "额度不足", "暂不可接单"];
+  const BLOCKED_MARKERS = ["进行中", "已完成", "已提交", ...ELIGIBILITY_BLOCK_MARKERS];
   const HARD_FAIL_MARKERS = ["席位已满或无法锁定", "席位已满", "位置已满", "名额已满", "任务已满", "已抢完", "不可领取", "不能参与", "无法参与", "无法锁定", "已结束", "任务失败"];
   const ACCOUNT_RISK_REVIEW_MARKERS = ["账户风险中", "等待审核", "风险审核"];
   const TASK_UNAVAILABLE_MARKERS = ["任务暂时无法打开", "请返回任务广场后重试"];
-  const TIER_MISMATCH_PHRASE = "档位不符，无法领取";
   const COOLDOWN_MARKERS = ["冷却中", "冷却", "等待", "后可"];
   const AUTO_DETAIL_PRELOAD_MS = 60000;
   const AUTO_DETAIL_MAX_RELEASE_WAIT_MS = 60000;
@@ -838,7 +838,7 @@
       if (!isTaskDetailOpen() && !hasRecoverableDetailLoadFailure()) {
         throw new Error("等待倒计时期间任务详情已关闭");
       }
-      const text = normalize(document.body.innerText || "");
+      const text = normalize(findTaskDetailRoot()?.innerText || "");
       if (hasBlockingTaskFailure(text, settings)) {
         throw new Error(`任务不可做：${extractHardFailureReason(text)}`);
       }
@@ -1214,7 +1214,7 @@
       const cooldown = parseCooldownFromCard(card, rawText);
       const cooldownMs = cooldown.remainingMs;
       const hasCardCooldown = Number.isFinite(cooldownMs) && cooldownMs > 0;
-      const isBlocked = Boolean(cooldown.isBlocked) || /账户风险中|等待审核|风险审核/.test(text) || (!hasCardCooldown && (
+      const isBlocked = Boolean(getCardUnavailableReason(card)) || Boolean(cooldown.isBlocked) || /账户风险中|等待审核|风险审核/.test(text) || (!hasCardCooldown && (
         BLOCKED_MARKERS.some((marker) => text.includes(marker))
         || hasHardFailure(text)
         || hasUnsupportedCommentGuidance(text)
@@ -1248,10 +1248,41 @@
 
   function hasBlockingTaskFailure(text, settings = {}) {
     const value = normalize(text);
-    const compact = value.replace(/\s+/g, "").replace(/[，,]/g, "，");
-    if (compact.includes(TIER_MISMATCH_PHRASE)) return true;
+    if (getEligibilityBlockReason(value)) return true;
     if (hasAccountRiskReviewBlock(value)) return true;
     return hasHardFailure(value);
+  }
+
+  function getEligibilityBlockReason(text) {
+    const compact = normalize(text).replace(/\s+/g, "");
+    return ELIGIBILITY_BLOCK_MARKERS.find((marker) => compact.includes(marker)) || "";
+  }
+
+  function getCardUnavailableReason(card) {
+    if (!card) return "";
+    if (card.isConnected === false) return "任务卡片已更新，请重新检测";
+    const text = normalize(card.innerText || "");
+    const restriction = getEligibilityBlockReason(text);
+    if (restriction) return restriction;
+    if (hasAccountRiskReviewBlock(text)) return extractHardFailureReason(text);
+    // The article itself remains clickable when the site's action is disabled.
+    // A real release timer is waitable; an unknown disabled action is not.
+    const actionRoot = card.querySelector?.('[data-mobile-card-slot="action"]') || card;
+    const controls = Array.from(actionRoot.querySelectorAll?.("button,a,[role='button']") || [])
+      .filter((node) => isVisible(node) && isOwnedByTaskCard(node, card));
+    const blockedControl = controls.find((node) => isDisabled(node) && !hasCooldownState(buttonText(node)));
+    if (blockedControl && controls.every(isDisabled)) {
+      return buttonText(blockedControl) || "任务操作按钮不可用";
+    }
+    return "";
+  }
+
+  function assertCardAvailable(card) {
+    const reason = getCardUnavailableReason(card);
+    if (!reason) return;
+    const error = new Error(`任务当前不可接：${reason}`);
+    error.taskUnavailable = true;
+    throw error;
   }
 
   function hasUnsupportedCommentGuidance(text) {
@@ -1442,15 +1473,18 @@
     const detailRoot = findTaskDetailRoot();
     const detailText = normalize(detailRoot?.innerText || "");
     const taskType = explicitTaskType || detectTaskTypeFromText(detailText || task.detailText || "");
-    const tierMismatch = detailText.replace(/\s+/g, "").replace(/[，,]/g, "，").includes(TIER_MISMATCH_PHRASE);
+    const restriction = getEligibilityBlockReason(detailText);
+    if (restriction) {
+      const error = new Error(`任务当前不可接：${restriction}`);
+      error.task = { ...(task || {}), taskType };
+      throw error;
+    }
     const unsupportedGuidance = hasUnsupportedCommentGuidance(detailText);
-    if (!tierMismatch && !unsupportedGuidance && ["评论", "评论+点赞", "评论+赞", "点赞互动", "点赞"].includes(taskType)) return;
-    const reason = tierMismatch
-      ? `平台提示：${TIER_MISMATCH_PHRASE}`
-      : (unsupportedGuidance ? "任务备注要求人工提供内容" : `已识别为${taskType || "非回复"}任务`);
+    if (!unsupportedGuidance && ["评论", "评论+点赞", "评论+赞", "点赞互动", "点赞"].includes(taskType)) return;
+    const reason = unsupportedGuidance ? "任务备注要求人工提供内容" : `已识别为${taskType || "非回复"}任务`;
     const error = new Error(`${reason}，永久忽略不再打开`);
     error.permanentIgnore = true;
-    error.ignoredTaskType = tierMismatch ? TIER_MISMATCH_PHRASE : (unsupportedGuidance ? "人工评论要求" : taskType);
+    error.ignoredTaskType = unsupportedGuidance ? "人工评论要求" : taskType;
     error.task = { ...(task || {}), taskType };
     throw error;
   }
@@ -1461,7 +1495,6 @@
     return clickables.find((node) => !isDisabled(node) && DETAIL_BUTTON_TEXTS.some((text) => buttonText(node).includes(text)))
       || clickables.find((node) => !isDisabled(node) && isInvitationAcceptLabel(buttonText(node)))
       || clickables.find((node) => !isDisabled(node))
-      || clickables[0]
       || card;
   }
 
@@ -1516,6 +1549,7 @@
 
   async function openTaskDetailOrFail(selection, settings) {
     const runId = activeRunId;
+    assertCardAvailable(selection.card);
     const targets = getOpenTargetsInCard(selection.card, selection.target);
     if (!targets.length) throw new Error("未找到任务卡片入口");
 
@@ -1523,10 +1557,11 @@
     for (const target of targets) {
       assertActiveRun(runId);
       try {
-        await tryOpenTaskDetailTarget(target, settings);
+        await tryOpenTaskDetailTarget(target, settings, selection.card);
         report("info", "已打开选中任务详情，开始查找在 X 打开/前往目标控件");
         return;
       } catch (error) {
+        if (error.taskUnavailable) throw error;
         lastError = error.message || String(error);
         if (isTaskDetailOpen()) {
           report("info", "已打开选中任务详情，开始查找在 X 打开/前往目标控件");
@@ -1540,7 +1575,7 @@
     throw new Error(lastError || "任务详情页加载超时，返回任务广场重新选择任务");
   }
 
-  async function tryOpenTaskDetailTarget(target, settings) {
+  async function tryOpenTaskDetailTarget(target, settings, card = null) {
     const runId = activeRunId;
     const beforeUrl = location.href;
     target.scrollIntoView({ block: "center", inline: "center" });
@@ -1573,13 +1608,14 @@
       }
 
       if (!detailNavigationStarted && clickCount < maxClickAttempts && isCampaignsListOpen() && Date.now() - lastClickAt >= getTaskEntryRetryWaitMs(settings)) {
+        assertCardAvailable(card);
         clickCount += 1;
         lastClickAt = Date.now();
         // A list entry can accept/claim directly. Match its complete label;
         // a fallback card's prose can mention these words without claiming.
         const entryLabels = [buttonText(target), target.getAttribute?.("aria-label")].map(normalize);
         const claimAction = entryLabels.some((label) => INVITATION_ACCEPT_BUTTON_TEXTS.includes(label) || LOCK_BUTTON_TEXTS.includes(label));
-        await clickElement(target, { claimAction });
+        await clickElement(target, { claimAction, beforeClick: () => assertCardAvailable(card) });
         report("info", `已点击任务入口，第 ${clickCount} 次，等待点击后复核`);
         await wait(250);
         continue;
@@ -1687,7 +1723,7 @@
     const preferred = preferredTarget ? [preferredTarget] : [];
     const detailTargets = clickables.filter((node) => DETAIL_BUTTON_TEXTS.some((text) => buttonText(node).includes(text)));
     const targets = [...detailTargets, ...preferred, ...clickables, card].filter(Boolean);
-    return Array.from(new Set(targets)).filter(isVisible);
+    return Array.from(new Set(targets)).filter((node) => isVisible(node) && !isDisabled(node));
   }
 
   function isTaskDetailOpen() {
@@ -2472,8 +2508,7 @@
   }
 
   function extractDetailUnavailableReason(text) {
-    if (hasAccountRiskReviewBlock(text)) return extractHardFailureReason(text);
-    if (hasHardFailure(text)) return extractHardFailureReason(text);
+    if (hasBlockingTaskFailure(text)) return extractHardFailureReason(text);
     if (hasCooldownState(text)) return "详情页仍在等待席位释放";
     const disabledLockText = Array.from(document.querySelectorAll("button,a,[role='button']"))
       .map((node) => buttonText(node))
@@ -2697,7 +2732,7 @@
 
   function extractHardFailureReason(text) {
     if (/账户风险中|等待审核|风险审核/.test(normalize(text))) return "账户风险中，等待审核";
-    return HARD_FAIL_MARKERS.find((marker) => text.includes(marker)) || "任务不可做";
+    return getEligibilityBlockReason(text) || HARD_FAIL_MARKERS.find((marker) => text.includes(marker)) || "任务不可做";
   }
 
   function hasAccountRiskReviewBlock(text) {
@@ -2710,6 +2745,9 @@
     if (typeof monitorParser === "function") {
       try {
         const status = monitorParser(card);
+        if (status?.isBlocked) {
+          return { remainingMs: 0, text: status.rawText || "不可接", source: "monitor", isBlocked: true };
+        }
         if (status?.isCooling) {
           const countdownSec = Math.max(0, Number(status.countdownSec) || 0);
           return {
@@ -2717,9 +2755,6 @@
             text: status.countdown || status.rawText || "冷却中",
             source: "monitor"
           };
-        }
-        if (status?.isBlocked) {
-          return { remainingMs: 0, text: status.rawText || "不可接", source: "monitor", isBlocked: true };
         }
         if (status?.isReady) {
           return { remainingMs: 0, text: status.rawText || "可做", source: "monitor", isReady: true };
@@ -2880,12 +2915,14 @@
     }
     assertActiveRun(runId);
     if (claimOperation) assertActiveRun(claimOperation.runId);
+    options.beforeClick?.();
     // Mark before dispatch: a handler can perform the action and then throw.
     // Invitation/confirmation buttons can claim an order just like a lock.
     if (options.claimAction && claimOperation) {
       const operation = claimOperation;
       if (operation.checkpointRequired) await writeClaimCheckpoint(operation, "before_click");
       assertActiveRun(runId);
+      options.beforeClick?.();
       operation.claimActionAttempted = true;
     }
     try {
