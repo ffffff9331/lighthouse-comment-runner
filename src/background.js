@@ -88,6 +88,8 @@ let manualDebugCommandTail = Promise.resolve();
 let manualDebugCommandEpoch = 0;
 let manualStopPromise = null;
 let alertPauseRevision = 0;
+let claimReconciliation = null;
+let lastClaimReconciliation = { intent: null, at: 0 };
 
 async function buildLighthouseMonitorSnapshot(reason = "update") {
   const task = runtimeState.currentTask || {};
@@ -236,12 +238,12 @@ async function handleMessage(message, sender) {
   await runtimeStateReady;
   if (!message || !message.type) return { ok: false, error: "Missing message type" };
   const manualStep = /^DEBUG_(?:OPEN_CAMPAIGNS|OPEN_FIRST_TASK|LOCK_SEAT_OPEN_TWEET|RUN_X_REPLY|FAST_X_CLAIM_REPLY_VERIFY|COMPLETE_X_TASK_WIDGET|WAIT_LIGHTHOUSE_COMPLETION_RETURN|CLOSE_X_RETURN_LIGHTHOUSE|CLICK_DONE|RETURN_CAMPAIGNS)$/.test(message.type);
-  if (runtimeState.manuallyStopped && (message.type === "START_RUN" || manualStep) && !message.expectedRunId && manualStopPromise) {
+  if (runtimeState.manuallyStopped && (["START_RUN", "RUN_SELECTED_COUNTDOWN_TASK"].includes(message.type) || manualStep) && !message.expectedRunId && manualStopPromise) {
     const requestedEpoch = manualDebugCommandEpoch;
     await manualStopPromise;
     if (requestedEpoch !== manualDebugCommandEpoch) return { ok: false, cancelled: true, state: runtimeState };
   }
-  if (runtimeState.manuallyStopped && !["START_RUN", "STOP_RUN", "GET_STATE", "GET_CONTENT_SETTINGS", "GET_REPLY_RECORDS", "SAVE_SETTINGS", "CLEAR_REPLY_RECORDS", "OPEN_DEBUG_PAGE", "MONITOR_GET_COUNTDOWNS", "MONITOR_GET_STATUS", "MONITOR_GET_SETTINGS", "MONITOR_MIGRATE_SETTINGS", "MONITOR_SET_ENABLED", "MONITOR_SET_THRESHOLD", "MONITOR_SET_VOICE"].includes(message.type) && !manualStep) {
+  if (runtimeState.manuallyStopped && !["START_RUN", "RUN_SELECTED_COUNTDOWN_TASK", "STOP_RUN", "GET_STATE", "GET_CONTENT_SETTINGS", "GET_REPLY_RECORDS", "SAVE_SETTINGS", "CLEAR_REPLY_RECORDS", "OPEN_DEBUG_PAGE", "MONITOR_GET_COUNTDOWNS", "MONITOR_GET_STATUS", "MONITOR_GET_SETTINGS", "MONITOR_MIGRATE_SETTINGS", "MONITOR_SET_ENABLED", "MONITOR_SET_THRESHOLD", "MONITOR_SET_VOICE"].includes(message.type) && !manualStep) {
     return { ok: true, ignored: true, paused: true };
   }
   if (runtimeState.manuallyStopped && message.type === "MONITOR_GET_COUNTDOWNS") {
@@ -271,7 +273,7 @@ async function handleMessage(message, sender) {
     return { ok: false, error: "当前流程仍在执行，请勿同时启动调试或另一轮任务", state: runtimeState };
   }
   // Automatic orchestration consumes direct responses, never duplicate legacy events.
-  if (runtimeState.mode === "auto" && ["LIGHTHOUSE_TASK_READY", "X_REPLY_RESULT", "LIGHTHOUSE_TASK_DONE"].includes(message.type)) {
+  if (["auto", "selected_once"].includes(runtimeState.mode) && ["LIGHTHOUSE_TASK_READY", "X_REPLY_RESULT", "LIGHTHOUSE_TASK_DONE"].includes(message.type)) {
     return { ok: true, ignored: true };
   }
   if (isWindowScopedCommand(message.type)) {
@@ -282,6 +284,7 @@ async function handleMessage(message, sender) {
   switch (message.type) {
     case "GET_STATE":
       if (sender?.tab && !String(sender.url || "").startsWith("chrome-extension://")) return { ok: false, error: "完整设置仅限扩展界面访问" };
+      if (!runtimeState.running && runtimeState.uncertainAction) await reconcileStoppedClaim();
       return { ok: true, state: runtimeState, settings: await getSettings() };
     case "GET_CONTENT_SETTINGS":
       return { ok: true, settings: { autoMinTaskBounty: (await getSettings()).autoMinTaskBounty }, paused: Boolean(runtimeState.manuallyStopped) };
@@ -628,6 +631,11 @@ function enqueueManualDebugCommand(message, windowId) {
 }
 
 async function runManualDebugCommand(message, windowId) {
+  if (!runtimeState.running && runtimeState.uncertainAction) await reconcileStoppedClaim(true);
+  if (runtimeState.currentTask?.claimReconciled && hasLatchedLighthouseCompletion(runtimeState.runId)
+      && ["DEBUG_RUN_X_REPLY", "DEBUG_LOCK_SEAT_OPEN_TWEET", "DEBUG_COMPLETE_X_TASK_WIDGET", "DEBUG_CLICK_DONE"].includes(message.type)) {
+    return { ok: false, error: "本单已确认完成，请返回任务广场或启动全量检测，无需再次评论或提交", state: runtimeState };
+  }
   if (message.expectedRunId && (message.expectedRunId !== runtimeState.runId || !runtimeState.running || runtimeState.mode !== "debug")) {
     return { ok: false, cancelled: true, error: "旧单步队列已失效", state: runtimeState };
   }
@@ -921,6 +929,11 @@ async function openDebugPage(windowId = null) {
 }
 
 async function startAutoRun(options, windowId = null, manualRestart = false) {
+  if (manualRestart && !runtimeState.running && runtimeState.uncertainAction) await reconcileStoppedClaim(true);
+  if (runtimeState.currentTask?.claimReconciled && !hasLatchedLighthouseCompletion(runtimeState.runId)) {
+    if (manualRestart) return resumeReconciledClaim(windowId);
+    return { ok: false, error: "已核对本单席位锁定，请从第 4 步接续本单，完成前不能另接新单", state: runtimeState };
+  }
   if (runtimeState.manuallyStopped && !manualRestart) return { ok: false, cancelled: true, error: "已手动停止，请点击全量检测或单步流程" };
   if (runtimeState.running) return { ok: false, error: "当前流程仍在执行" };
   if (runtimeState.currentTask?.invitationAccepted && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId)) {
@@ -1518,6 +1531,10 @@ async function debugFastXClaimReplyVerify(selectedTask = null, windowId = null) 
 }
 
 async function startSelectedCountdownTask(selectedTask = null, windowId = null) {
+  if (!runtimeState.running && runtimeState.uncertainAction) await reconcileStoppedClaim(true);
+  if (runtimeState.currentTask?.claimReconciled && !hasLatchedLighthouseCompletion(runtimeState.runId)) {
+    return { ok: false, error: "本单席位已锁定，请先完成本单，不能切换到另一个选中任务", state: runtimeState };
+  }
   if (!selectedTask) {
     log("error", "未选中倒计时任务，请先在任务倒计时列表点击一条任务");
     return { ok: false, error: "未选中任务", state: runtimeState };
@@ -1558,52 +1575,37 @@ async function startSelectedCountdownTask(selectedTask = null, windowId = null) 
 }
 
 async function runSelectedCountdownTask(selectedTask = null, windowId = null) {
-  const previousStopEpoch = runtimeState.stopEpoch;
+  const previous = runtimeState;
   runtimeState = createInitialState();
-  runtimeState.stopEpoch = previousStopEpoch;
+  runtimeState.stopEpoch = previous.stopEpoch;
+  runtimeState.manuallyStopped = Boolean(previous.manuallyStopped);
   setRuntimeWindow(windowId);
-  runtimeState.runId = createRunId();
   runtimeState.running = true;
   runtimeState.mode = "selected_once";
-  const startingState = runtimeState;
-  const runId = runtimeState.runId;
-  const stopEpoch = runtimeState.stopEpoch;
-  const ownsRun = () => runtimeState === startingState && runtimeState.runId === runId && runtimeState.stopEpoch === stopEpoch;
+  // Persist the selection identity, never use its old clock as execution state.
+  runtimeState.selectedTask = selectedTask ? { ...selectedTask } : null;
+  const state = runtimeState;
+  const runId = state.runId;
+  const ownsRun = () => runtimeState === state && runtimeState.runId === runId;
   const isCurrent = () => ownsRun() && runtimeState.running;
   const cancelled = () => ({ ok: false, cancelled: true, state: runtimeState });
-  await ensureAutoRunKeepalive();
+  const interrupted = result => ownsRun() && !state.manuallyStopped
+    ? { ok: false, uncertain: Boolean(state.uncertainAction), result, error: result?.message || result?.error, state }
+    : cancelled();
+  if (state.manuallyStopped && !await resumeAfterManualStop(isCurrent)) return cancelled();
+  const settings = await getSettings();
   if (!isCurrent()) return cancelled();
-
-  if (!selectedTask) {
-    runtimeState.running = false;
-    setStage("selected_task_missing");
-    log("error", "未选中倒计时任务，请先在任务倒计时列表点击一条任务");
-    return { ok: false, error: "未选中任务", state: runtimeState };
-  }
+  if (!selectedTask) return finishSelectedRun("selected_task_missing", "未选中任务", null, settings, isCurrent);
   if (isIgnoredNonCommentTask(selectedTask)) {
     await markPermanentIgnoredTask(selectedTask, selectedTask.taskType || "非评论");
     if (!isCurrent()) return cancelled();
-    runtimeState.running = false;
-    setStage("selected_original_tweet_ignored");
-    log("warn", `已忽略原创/转发任务，不打开详情：${describeTaskForLog(selectedTask)}`);
-    return { ok: true, ignored: true, reason: "ignored_non_comment_task", state: runtimeState };
+    return finishSelectedRun("selected_original_tweet_ignored", "已忽略原创/转发任务", null, settings, isCurrent);
   }
-
-  const settings = await getSettings();
+  if (settings.replyMode !== "post" || !settings.autoSubmitLighthouse) {
+    return finishSelectedRun("selected_task_blocked", "选中启动需要自动发送回复并开启自动提交 Lighthouse", null, settings, isCurrent);
+  }
+  await ensureAutoRunKeepalive();
   if (!isCurrent()) return cancelled();
-  if (settings.replyMode !== "post") {
-    runtimeState.running = false;
-    setStage("selected_task_blocked");
-    log("error", "选中启动需要 X 回复模式=自动发送，否则无法安全闭环提交验证");
-    return { ok: false, error: "选中启动需要 X 回复模式=自动发送", state: runtimeState };
-  }
-  if (!settings.autoSubmitLighthouse) {
-    runtimeState.running = false;
-    setStage("selected_task_blocked");
-    log("error", "选中启动需要开启自动提交 Lighthouse，否则回复后不会提交验证");
-    return { ok: false, error: "选中启动需要开启自动提交 Lighthouse", state: runtimeState };
-  }
-
   const lighthouseTabId = await resolveLighthouseTab(isCurrent);
   if (!isCurrent()) return cancelled();
   await rememberLighthouseTabById(lighthouseTabId, isCurrent);
@@ -1612,159 +1614,96 @@ async function runSelectedCountdownTask(selectedTask = null, windowId = null) {
   if (!isCurrent()) return cancelled();
   await waitForTabComplete(lighthouseTabId);
   if (!isCurrent()) return cancelled();
-  setStage("selected_task_opening");
-  log("info", `选中启动：打开任务详情 ${selectedTask.bounty || "?"}LUX · ${selectedTask.title || selectedTask.taskType || "任务"}`);
 
-  const openResult = await sendToTab(lighthouseTabId, {
-    type: "OPEN_SELECTED_COUNTDOWN_TASK_DETAIL",
-    runId,
-    settings,
-    selectedTask
-  });
-  if (!ownsRun()) return cancelled();
-
-  if (!openResult || !openResult.ok) {
-    runtimeState.running = false;
-    runtimeState.failed += 1;
-    setStage("selected_task_open_failed");
-    log("error", openResult?.message || openResult?.error || "选中任务详情打开失败");
-    await closeLighthouseTaskDetail(lighthouseTabId, settings, "选中任务打开失败后关闭详情", ownsRun);
-    if (!ownsRun()) return cancelled();
-    return { ok: false, result: openResult, state: runtimeState };
+  try {
+    while (isCurrent()) {
+      setStage("selected_task_opening");
+      log("info", `选中启动：打开任务详情 ${selectedTask.bounty || "?"}LUX · ${selectedTask.title || selectedTask.taskType || "任务"}`);
+      const openResult = await sendToTab(lighthouseTabId, {
+        type: "OPEN_SELECTED_COUNTDOWN_TASK_DETAIL", runId, settings, selectedTask
+      });
+      if (!isCurrent()) return interrupted(openResult);
+      if (!openResult?.ok) {
+        if (openResult?.claimActionAttempted === false && (openResult.transient || openResult.refreshRequested)
+            && !runtimeState.uncertainAction && !runtimeState.currentTask?.invitationAccepted) {
+          runtimeState.attempts += 1;
+          if (!isLimitReached(runtimeState.attempts, settings.maxTaskAttempts)) {
+            setStage("selected_retry_waiting");
+            const ready = await reloadLighthouseCampaignsAfterOrder(lighthouseTabId, "未接单页面中断，刷新后继续选中任务", isCurrent);
+            if (!isCurrent()) return cancelled();
+            if (ready !== false) continue;
+          }
+        }
+        return finishSelectedRun("selected_task_open_failed", openResult?.message || openResult?.error || "选中任务已不可用", lighthouseTabId, settings, isCurrent);
+      }
+      runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, openResult.task);
+      setStage("selected_countdown_waiting");
+      log("info", "已进入选中任务详情，按页面实时放号状态等待；不使用侧栏旧倒计时");
+      beginXOpenWatch(lighthouseTabId, "selected_once");
+      const lockResult = await sendToTab(lighthouseTabId, {
+        type: "WAIT_SELECTED_COUNTDOWN_AND_LOCK", runId, settings, selectedTask
+      });
+      if (!isCurrent()) return interrupted(lockResult);
+      if (lockResult?.ok) {
+        runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, lockResult.task);
+        markAttemptedTask(runtimeState.currentTask);
+        // Both automatic entry points now use the same X handoff, reply,
+        // completion proof, return, durable count and finalization path.
+        return await adoptTargetOpenedTweet(runtimeState.currentTask, lighthouseTabId, "selected_once");
+      }
+      const protectedOrder = runtimeState.uncertainAction || runtimeState.completionEvidence || runtimeState.lastXResult
+        || [runtimeState.currentTask, lockResult?.task].some(task => task && (
+          task.invitationAccepted || task.claimed || task.seatLocked || task.seatLockedAt));
+      if (protectedOrder) {
+        return recoverAndContinue(lockResult?.message || "本单接单结果尚未核对", { runId, preserveOrder: true, closeX: false });
+      }
+      clearXOpenWatch();
+      const safelyUnclaimed = lockResult?.claimRejectionConfirmed === true || lockResult?.claimActionAttempted === false;
+      const retryable = safelyUnclaimed && (lockResult?.claimRejectionConfirmed || lockResult?.deferredRelease
+        || lockResult?.transient || lockResult?.refreshRequested);
+      runtimeState.attempts += 1;
+      if (!retryable || isLimitReached(runtimeState.attempts, settings.maxTaskAttempts)) {
+        return finishSelectedRun("selected_lock_failed", lockResult?.message || "选中任务无法领取", lighthouseTabId, settings, isCurrent);
+      }
+      // No order exists. Close and refresh while the run still owns its
+      // command permit; stopping first would cancel its own cleanup.
+      setStage("selected_retry_waiting");
+      log("info", `${lockResult.message || "本次未接到单"}；保留选中任务，刷新平台状态后继续等待`);
+      await closeLighthouseTaskDetail(lighthouseTabId, settings, "未接到单，返回广场重新核对选中任务", isCurrent);
+      if (!isCurrent()) return cancelled();
+      runtimeState.currentTask = null;
+      if (lockResult.claimRetryScope === "global" && Number(lockResult.retryAfterMs) > 0) {
+        await delay(Number(lockResult.retryAfterMs));
+        if (!isCurrent()) return cancelled();
+      }
+      const reloaded = await reloadLighthouseCampaignsAfterOrder(lighthouseTabId, "已刷新选中任务的实时状态", isCurrent);
+      if (!isCurrent()) return cancelled();
+      if (reloaded === false) return finishSelectedRun("campaigns_reload_failed", "平台任务列表未恢复，已停止本次选中任务", null, settings, isCurrent);
+      await delay(Math.max(1000, settings.actionDelayMs || 0));
+    }
+    return cancelled();
+  } catch (error) {
+    if (!isCurrent()) return cancelled();
+    if (runtimeState.uncertainAction || runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.invitationAccepted) {
+      return recoverAndContinue(error.message || String(error), { runId, preserveOrder: true, closeX: false });
+    }
+    return finishSelectedRun("selected_task_failed", error.message || String(error), lighthouseTabId, settings, isCurrent);
   }
-
-  runtimeState.currentTask = openResult.task || { selectedTask };
-  setStage("selected_countdown_waiting");
-  log("info", openResult.message || "已打开选中任务详情，等待倒计时窗口");
-  const selectedForLock = await waitForSelectedCountdownWindow(selectedTask, settings, isCurrent);
-  if (!isCurrent() || !selectedForLock) return cancelled();
-
-  beginXOpenWatch(lighthouseTabId, "selected_once");
-  const lockResult = await sendToTab(lighthouseTabId, {
-    type: "WAIT_SELECTED_COUNTDOWN_AND_LOCK",
-    runId,
-    settings,
-    selectedTask: selectedForLock
-  });
-  if (!isCurrent()) return cancelled();
-
-  if (!lockResult || !lockResult.ok) {
-    clearXOpenWatch();
-    runtimeState.running = false;
-    runtimeState.failed += 1;
-    setStage("selected_lock_failed");
-    log("warn", lockResult?.message || lockResult?.error || "10 秒内锁定按钮未可点击，关闭详情并结束本次选中启动");
-    await closeLighthouseTaskDetail(lighthouseTabId, settings, "选中任务锁定失败后关闭详情", ownsRun);
-    if (!ownsRun()) return cancelled();
-    return { ok: false, result: lockResult, state: runtimeState };
-  }
-
-  runtimeState.currentTask = {
-    ...(runtimeState.currentTask || {}),
-    ...(lockResult.task || {})
-  };
-  markAttemptedTask(runtimeState.currentTask);
-  log("info", lockResult.message || "已点击锁定，等待平台自动打开 X");
-
-  const adopted = await waitForLighthouseOpenedTweet(runtimeState.currentTask, lighthouseTabId, "selected_once", {
-    timeoutMs: 30000,
-    logEveryMs: 3000,
-    waitLogMessage: "已确认本单锁位，等待平台自动打开 X 推文标签页",
-    manualOpenAfterMs: 5000
-  });
-  if (!isCurrent()) return cancelled();
-  if (!adopted || !runtimeState.xTabId) {
-    runtimeState.running = false;
-    runtimeState.failed += 1;
-    setStage("selected_x_open_failed");
-    const message = runtimeState.lastLockFailureReason || "已点击锁定，但 30 秒内未检测到平台自动打开的 X 推文页";
-    log("error", message);
-    await closeLighthouseTaskDetail(lighthouseTabId, settings, "X 未打开后关闭任务详情", ownsRun);
-    if (!ownsRun()) return cancelled();
-    return { ok: false, error: message, state: runtimeState };
-  }
-
-  setStage("tweet_opened");
-  log("info", "已接管平台自动打开的 X 推文页，继续旧流程第 4 步回复");
-  const xTabId = runtimeState.xTabId;
-  await waitForXReadyBeforeReply(xTabId, settings, isCurrent);
-  if (!isCurrent()) return cancelled();
-  const replyResult = await sendToTab(xTabId, {
-    type: "RUN_X_REPLY",
-    runId,
-    task: runtimeState.currentTask,
-    settings
-  });
-  if (!isCurrent()) return cancelled();
-
-  if (!replyResult || !replyResult.ok) {
-    runtimeState.running = false;
-    runtimeState.failed += 1;
-    setStage("selected_reply_failed");
-    log("error", replyResult?.message || replyResult?.error || "选中任务 X 回复失败");
-    log("info", "已保留当前 X 页面，方便检查任务状态");
-    return { ok: false, result: replyResult, state: runtimeState };
-  }
-
-  runtimeState.lastXResult = replyResult;
-  await recordReplyHistory(replyResult);
-  if (!isCurrent()) return cancelled();
-  const completionResult = await completeXTaskWidgetLifecycle(xTabId, runId, settings, isCurrent);
-  if (!isCurrent()) return cancelled();
-  if (!completionResult?.ok) {
-    runtimeState.failed += 1;
-    log("warn", completionResult?.message || completionResult?.error || "X 任务闭环未确认，保留当前页面");
-    runtimeState.running = false;
-    setStage("selected_completion_failed");
-    return { ok: false, result: { openResult, lockResult, replyResult, completionResult }, state: runtimeState };
-  }
-
-  const campaignsResult = await waitForLighthouseTaskCompletionAndReturn(runId, settings, isCurrent);
-  if (!isCurrent()) return cancelled();
-  if (!campaignsResult?.ok) {
-    runtimeState.failed += 1;
-    runtimeState.running = false;
-    setStage("selected_completion_failed");
-    log("warn", campaignsResult?.message || "Lighthouse 未确认任务完成，保留 X 页面");
-    return { ok: false, result: { openResult, lockResult, replyResult, completionResult, campaignsResult }, state: runtimeState };
-  }
-  runtimeState.completed += 1;
-
-  await closeLighthouseDetailToCampaigns(lighthouseTabId, settings, "选中启动完成后关闭任务详情回到广场", isCurrent);
-  if (!isCurrent()) return cancelled();
-  runtimeState.running = false;
-  setStage("selected_flow_done");
-  log("info", "选中启动流程已结束，已回到任务广场");
-  return { ok: true, result: { openResult, lockResult, replyResult, completionResult, campaignsResult }, state: runtimeState };
 }
 
-async function waitForSelectedCountdownWindow(selectedTask, settings, stillCurrent = null) {
-  const waitingState = runtimeState;
-  const runId = runtimeState.runId;
-  const isCurrent = () => runtimeState === waitingState && runtimeState.runId === runId
-    && runtimeState.running && runtimeState.mode === "selected_once" && (!stillCurrent || stillCurrent());
-  if (!isCurrent()) return null;
-  const remainingMs = Math.max(0, Math.ceil(Number(selectedTask?.countdownSec || 0)) * 1000);
-  const waitBeforeWindowMs = Math.max(0, remainingMs - 5000);
-  if (waitBeforeWindowMs <= 0) {
-    return { ...(selectedTask || {}), countdownSec: Math.min(5, Math.ceil(remainingMs / 1000)) };
+async function finishSelectedRun(stage, message, tabId, settings, isCurrent) {
+  if (!isCurrent()) return { ok: false, cancelled: true, state: runtimeState };
+  if (tabId && !runtimeState.uncertainAction) {
+    await closeLighthouseTaskDetail(tabId, settings, message, isCurrent);
+    if (!isCurrent()) return { ok: false, cancelled: true, state: runtimeState };
   }
-
-  const started = Date.now();
-  let lastLogAt = 0;
-  while (Date.now() - started < waitBeforeWindowMs) {
-    if (!isCurrent()) return null;
-    const leftMs = waitBeforeWindowMs - (Date.now() - started);
-    if (Date.now() - lastLogAt > 5000) {
-      lastLogAt = Date.now();
-      log("info", `选中任务倒计时等待中，约 ${formatDuration(leftMs + 5000)} 后进入锁定窗口`);
-    }
-    await delay(Math.min(1000, Math.max(250, leftMs)));
-    if (!isCurrent()) return null;
-  }
-  await delay(randomBetween(0, Math.min(500, Math.max(0, settings.cooldownPollMs || 500))));
-  if (!isCurrent()) return null;
-  return { ...(selectedTask || {}), countdownSec: 5 };
+  clearXOpenWatch();
+  runtimeState.running = false;
+  runtimeState.failed += 1;
+  setStage(stage);
+  log("warn", message);
+  await persistAutoRunState(true);
+  return { ok: false, error: message, state: runtimeState };
 }
 
 async function openNextLighthouseTaskTweetTab(settings, stillCurrent = null) {
@@ -2229,12 +2168,12 @@ async function adoptTargetOpenedTweet(task, lighthouseTabId, mode) {
         closeX: false
       });
     }
-    if (runtimeState.mode === "auto") {
+    if (["auto", "selected_once"].includes(runtimeState.mode)) {
       runtimeState.failed += 1;
       clearXOpenWatch();
+      runtimeState.running = false;
       setStage("locked_task_target_unavailable");
       log("error", `${message}；已保留平台进行中订单，停止扫描新任务以避免订单串单`);
-      runtimeState.running = false;
       return { ok: false, error: message, state: runtimeState };
     }
     return failStep({ task: runtimeState.currentTask }, message);
@@ -2244,7 +2183,7 @@ async function adoptTargetOpenedTweet(task, lighthouseTabId, mode) {
   log("info", runtimeState.currentTask?.xOpenSource === "extension_fallback"
     ? "官网未在 5 秒内打开 X，已使用任务直链兜底打开目标推文页"
     : "已检测到 Lighthouse 官网打开的目标 X 推文页");
-  if (runtimeState.mode !== "auto") return { ok: true, state: runtimeState };
+  if (!["auto", "selected_once"].includes(runtimeState.mode)) return { ok: true, state: runtimeState };
 
   const incomeAtTaskStart = await readPlazaTodayIncome(runtimeState.lighthouseTabId, runId);
   if (!isCurrent()) return cancelled();
@@ -2603,7 +2542,7 @@ async function handleLighthouseDone(result, resumeCountedCompletion = false) {
   const doneState = runtimeState;
   const isCurrent = () => runtimeState === doneState && runtimeState.runId === runId && !runtimeState.manuallyStopped;
   if (!isCurrent()) return { ok: false, cancelled: true };
-  if (runtimeState.mode === "auto" && result?.ok && !hasLatchedLighthouseCompletion(runId)) {
+  if (["auto", "selected_once"].includes(runtimeState.mode) && result?.ok && !hasLatchedLighthouseCompletion(runId)) {
     return recoverAndContinue("缺少本单官方完成证据，不计为完成", { runId, task: runtimeState.currentTask, closeX: false });
   }
   const alreadyCounted = Boolean(runtimeState.currentTask?.completionCounted);
@@ -2656,8 +2595,8 @@ async function handleLighthouseDone(result, resumeCountedCompletion = false) {
   const canContinue = runtimeState.mode === "auto" && runtimeState.running && !isLimitReached(runtimeState.completed, settings.maxTasksPerRun);
   if (!canContinue) {
     runtimeState.running = false;
-    setStage("finished");
-    log("info", "运行结束");
+    setStage(runtimeState.mode === "selected_once" ? "selected_flow_done" : "finished");
+    log("info", runtimeState.mode === "selected_once" ? "选中任务已完成，已回到任务广场；本次只完成这一单" : "运行结束");
     return { ok: true, state: runtimeState };
   }
 
@@ -2674,7 +2613,7 @@ async function recoverAndContinue(message, options = {}) {
   const runId = options.runId || runtimeState.runId;
   const isCurrent = captureRunGuard();
   const cancelled = () => ({ ok: false, cancelled: true, state: runtimeState });
-  if (!isActiveAutoRun(runId)) return { ok: true, state: runtimeState };
+  if (runId !== runtimeState.runId || !runtimeState.running || !["auto", "selected_once"].includes(runtimeState.mode)) return { ok: false, cancelled: true, state: runtimeState };
 
   runtimeState.failed += 1;
   const task = options.task || runtimeState.currentTask;
@@ -2737,6 +2676,9 @@ async function recoverAndContinue(message, options = {}) {
     log("warn", `关闭任务详情失败，稍后重试：${error.message}`);
   }
 
+  if (runtimeState.mode === "selected_once") {
+    return finishSelectedRun("selected_task_failed", message || "选中任务未完成", null, settings, isCurrent);
+  }
   await delay(Math.max(settings.actionDelayMs * 2, 2000));
   if (!isActiveAutoRun(runId)) return { ok: true, state: runtimeState };
   return startNextAutoTask("recover_after_failure");
@@ -3307,8 +3249,10 @@ async function recordLighthouseClaimCheckpoint(message, sender) {
 }
 
 function canResumeInterruptedClaimScan(intent, state = runtimeState) {
-  return state.running === true && !state.manuallyStopped && state.mode === "auto"
-    && intent?.type === "START_LIGHTHOUSE_COMMENT_TASK"
+  const resumableCommand = state.mode === "auto" && intent?.type === "START_LIGHTHOUSE_COMMENT_TASK"
+    || state.mode === "selected_once" && state.selectedTask
+      && ["OPEN_SELECTED_COUNTDOWN_TASK_DETAIL", "WAIT_SELECTED_COUNTDOWN_AND_LOCK"].includes(intent?.type);
+  return state.running === true && !state.manuallyStopped && resumableCommand
     && state.uncertainAction === intent && intent.checkpointRequired === true && intent.checkpointVersion === 1
     && intent.runId === state.runId && intent.tabId === state.lighthouseTabId && Boolean(intent.intentId)
     && intent.claimActionAttempted === false && Boolean(intent.contentInstanceId)
@@ -3322,6 +3266,7 @@ async function sendToTab(tabId, payload) {
   payload = { ...payload, platform: "lighthouse", task: payload.task || runtimeState.currentTask };
   const claimsOrder = ["START_LIGHTHOUSE_COMMENT_TASK", "DEBUG_OPEN_FIRST_COMMENT_TASK", "OPEN_SELECTED_COUNTDOWN_TASK_DETAIL", "OPEN_SELECTED_COUNTDOWN_TASK_TWEET", "DEBUG_LOCK_SEAT_AND_EXTRACT", "WAIT_SELECTED_COUNTDOWN_AND_LOCK", "RUN_X_WIDGET_CLAIM"].includes(payload.type);
   let claimIntent = null;
+  let actionIntent = null;
   let ownsMarketplaceRefresh = false;
   const sentState = runtimeState;
   const sentRunId = runtimeState.runId;
@@ -3347,7 +3292,8 @@ async function sendToTab(tabId, payload) {
       if (!payload.type.startsWith("CANCEL_") && (stale() || (payload.runId && !runtimeState.running))) {
         return { ok: false, cancelled: true, message: "流程已变化，未发送旧消息" };
       }
-      if (runtimeState.uncertainAction && runtimeState.uncertainAction !== claimIntent && !readOnlyOrCancel) {
+      if (runtimeState.uncertainAction && runtimeState.uncertainAction !== claimIntent
+          && runtimeState.uncertainAction !== actionIntent && !readOnlyOrCancel) {
         return { ok: false, uncertain: true, message: "旧动作结果未知，禁止重复执行，请先核对本单" };
       }
       if (claimsOrder && !claimIntent) {
@@ -3367,6 +3313,15 @@ async function sendToTab(tabId, payload) {
         }
       }
       const irreversible = ["RUN_X_REPLY", "RUN_X_WIDGET_CLAIM", "COMPLETE_X_TASK_WIDGET", "CLICK_X_TASK_VERIFY", "DEBUG_CLICK_I_DONE", "COMPLETE_LIGHTHOUSE_COMMENT_TASK"].includes(payload.type);
+      if (irreversible && !claimIntent && !actionIntent) {
+        // The worker can disappear while the page is executing. Persist the
+        // intent before sending, not only after a channel error is reported.
+        actionIntent = { type: payload.type, runId: payload.runId, tabId,
+          taskKey: payload.task?.taskKey || "", intentId: createRunId() };
+        runtimeState.uncertainAction = actionIntent;
+        await persistAutoRunState(true);
+        if (stale() || !runtimeState.running || runtimeState.manuallyStopped) return { ok: false, cancelled: true };
+      }
       const activeAction = irreversible ? { state: sentState, type: payload.type, runId: payload.runId, tabId, taskKey: payload.task?.taskKey || "" } : null;
       let result;
       if (activeAction) activeTabActions.add(activeAction);
@@ -3377,6 +3332,12 @@ async function sendToTab(tabId, payload) {
       }
       if (!payload.type.startsWith("CANCEL_") && (stale() || (payload.runId && !runtimeState.running))) {
         return { ok: false, cancelled: true, message: "流程已变化，未采用旧回执" };
+      }
+      if (actionIntent && runtimeState.uncertainAction === actionIntent
+          && (result?.ok === true || result?.actionAttempted === false)) {
+        delete runtimeState.uncertainAction;
+        await persistAutoRunState(true);
+        if (stale() || !runtimeState.running) return { ok: false, cancelled: true };
       }
       if (claimIntent && runtimeState.uncertainAction === claimIntent) {
         const claimedTask = result?.task?.seatLocked || result?.task?.claimed || result?.task?.seatLockedAt;
@@ -3414,6 +3375,22 @@ async function sendToTab(tabId, payload) {
         } else if (!safelyUnclaimed && !confirmedDetail) {
           runtimeState.running = false;
           setStage("action_result_unknown");
+          // Reconcile a delayed receipt inside the original orchestration,
+          // rather than leaving continuation dependent on status polling.
+          if (["auto", "selected_once"].includes(sentState.mode)) {
+            await reconcileStoppedClaim(true);
+            if (stale() || runtimeState.manuallyStopped) return { ok: false, cancelled: true };
+            if (!runtimeState.running && runtimeState.stage === "claim_locked_reconciled"
+                && runtimeState.currentTask?.claimReconciled && !runtimeState.uncertainAction
+                && !runtimeState.lastXResult && !runtimeState.completionEvidence) {
+              runtimeState.running = true;
+              setStage("claim_confirmed_after_recheck");
+              await persistAutoRunState(true);
+              if (stale() || !runtimeState.running) return { ok: false, cancelled: true };
+              log("info", "已核对本单完整锁位回执，原自动流程继续处理本单");
+              return { ok: true, task: runtimeState.currentTask, message: "本单锁位已核对，继续自动流程" };
+            }
+          }
           log("error", `接单动作 ${payload.type} 未确认订单状态，已停止并保留执行意图；不会自动重试，请先核对本单${result?.message ? `。页面回执：${result.message}` : ""}`);
           return { ok: false, uncertain: true, message: result?.message || "接单回执未确认订单状态，已保留执行意图，请先核对本单" };
         }
@@ -3455,6 +3432,13 @@ async function sendToTab(tabId, payload) {
           message: "未接单扫描被网页刷新中断，重新加载任务广场后继续检测" };
       }
       if (isReceivingEndMissingError(error)) {
+        if (actionIntent && runtimeState.uncertainAction === actionIntent) {
+          // No receiver means no dispatch. Only this transport error permits
+          // another send; a closed channel after delivery remains unknown.
+          delete runtimeState.uncertainAction;
+          await persistAutoRunState(true);
+          actionIntent = null;
+        }
         if (claimIntent && runtimeState.uncertainAction === claimIntent) {
           delete runtimeState.uncertainAction;
           await persistAutoRunState(true);
@@ -3466,8 +3450,8 @@ async function sendToTab(tabId, payload) {
           continue;
         }
       } else if (!readOnlyOrCancel) {
-        runtimeState.uncertainAction = claimIntent || { type: payload.type, taskKey: payload.task?.taskKey || "", runId: payload.runId, tabId };
-        if (payload.type === "COMPLETE_X_TASK_WIDGET" && sentState.mode === "auto"
+        runtimeState.uncertainAction = claimIntent || actionIntent || { type: payload.type, taskKey: payload.task?.taskKey || "", runId: payload.runId, tabId };
+        if (payload.type === "COMPLETE_X_TASK_WIDGET" && ["auto", "selected_once"].includes(sentState.mode)
             && payload.runId === sentState.runId && tabId === sentState.xTabId
             && payload.task?.taskKey && payload.task.taskKey === sentState.currentTask?.taskKey
             && sentState.lastXResult?.ok === true) {
@@ -3527,6 +3511,125 @@ async function cancelSupersededLighthouseRun(previousRun, paused = false) {
 function hasIdentifiedUncertainAction(state) {
   const action = state.uncertainAction;
   return Boolean(action?.type && action.runId && Number.isInteger(action.tabId));
+}
+
+// A missing reply is not a permanent order state. Re-read the bound order
+// while stopped, using the same content-side receipt reader as initial claim
+// confirmation. This never clicks, posts, verifies, or starts another order.
+async function reconcileStoppedClaim(force = false) {
+  const state = runtimeState;
+  const intent = state.uncertainAction;
+  const task = state.currentTask;
+  const tweetUrl = normalizeTweetUrl(task?.tweetUrl);
+  const claimTypes = ["START_LIGHTHOUSE_COMMENT_TASK", "DEBUG_LOCK_SEAT_AND_EXTRACT", "WAIT_SELECTED_COUNTDOWN_AND_LOCK"];
+  if (state.running || state.manuallyStopped || !hasIdentifiedUncertainAction(state)
+      || !claimTypes.includes(intent.type) || !task?.taskKey || !tweetUrl
+      || intent.tabId !== state.lighthouseTabId || intent.runId !== state.runId) return false;
+  if (claimReconciliation) return claimReconciliation;
+  if (!force && lastClaimReconciliation.intent === intent && Date.now() - lastClaimReconciliation.at < 5000) return false;
+  lastClaimReconciliation = { intent, at: Date.now() };
+  const epoch = manualDebugCommandEpoch;
+  const isCurrent = () => runtimeState === state && !state.running && !state.manuallyStopped
+    && state.uncertainAction === intent && state.runId === intent.runId
+    && state.currentTask === task && normalizeTweetUrl(task.tweetUrl) === tweetUrl
+    && manualDebugCommandEpoch === epoch;
+  const operation = (async () => {
+    try {
+      const tab = await chrome.tabs.get(intent.tabId);
+      if (!isCurrent() || !isLighthouseUrl(tab.url) || !isTabInRuntimeWindow(tab)) return false;
+      const payload = { type: "CHECK_LIGHTHOUSE_ORDER_OUTCOME", platform: "lighthouse",
+        runId: intent.runId, claimIntentId: intent.intentId || "", task: { taskKey: task.taskKey, tweetUrl } };
+      const read = async () => {
+        let timer;
+        try {
+          return await Promise.race([chrome.tabs.sendMessage(intent.tabId, payload),
+            new Promise(resolve => { timer = setTimeout(() => resolve(null), 2000); })]);
+        } catch (_) { return null; }
+        finally { clearTimeout(timer); }
+      };
+      let result = await read();
+      if (!isCurrent()) return false;
+      if (!result && await ensureContentScriptInjected(intent.tabId, isCurrent)) result = await read();
+      if (!isCurrent() || result?.ok !== true || result.runId !== intent.runId
+          || result.claimIntentId !== (intent.intentId || "") || result.taskKey !== task.taskKey
+          || normalizeTweetUrl(result.tweetUrl) !== tweetUrl || !["locked", "completed"].includes(result.outcome)) return false;
+      const completed = result.outcome === "completed";
+      const text = completed
+        ? "已按原推文核对本单验证成功，解除旧接单未知状态；可继续全量检测，不重复评论或验证"
+        : "已按原推文核对本单席位锁定，解除旧接单未知状态；请从第 4 步接续本单";
+      const next = { ...state, running: false, uncertainAction: null,
+        currentTask: { ...task, claimReconciled: true, seatLocked: true,
+          seatLockedAt: task.seatLockedAt || new Date().toISOString() },
+        stage: completed ? "claim_completed_reconciled" : "claim_locked_reconciled",
+        completionEvidence: completed ? { runId: state.runId, taskKey: task.taskKey, tweetUrl,
+          observedAt: result.observedAt, officialCompletion: true, source: "bound_order_reconciliation" } : state.completionEvidence,
+        logs: [{ at: new Date().toISOString(), level: "info", text, source: "background", pagePhase: "" }, ...(state.logs || [])].slice(0, 120) };
+      // Persist before releasing the pending intent. A failed save preserves
+      // the stopped state; a newer stop/run always wins over this result.
+      await chrome.storage.local.set({ [AUTO_RUN_STATE_KEY]: { ...next, pendingXOpen: null } });
+      if (!isCurrent()) { await persistAutoRunState(true); return false; }
+      Object.assign(state, next);
+      publishLighthouseMonitorSnapshot("order_reconciled");
+      return true;
+    } catch (_) { return false; }
+  })();
+  claimReconciliation = operation;
+  try { return await operation; }
+  finally { if (claimReconciliation === operation) claimReconciliation = null; }
+}
+
+// An explicit restart of a reconciled order continues that order through the
+// common automatic pipeline. Never clear it and acquire another seat.
+async function resumeReconciledClaim(windowId) {
+  const state = runtimeState;
+  const task = state.currentTask;
+  const runId = state.runId;
+  const epoch = manualDebugCommandEpoch;
+  const current = () => runtimeState === state && state.runId === runId
+    && state.currentTask === task && manualDebugCommandEpoch === epoch && !state.manuallyStopped;
+  const stopped = () => current() && !state.running;
+  const cancelled = () => ({ ok: false, cancelled: true, state: runtimeState });
+  if (state.running || state.manuallyStopped || state.uncertainAction || state.lastXResult
+      || state.completionEvidence || !task?.claimReconciled || !task.taskKey
+      || !normalizeTweetUrl(task.tweetUrl) || !Number.isInteger(state.lighthouseTabId)) {
+    return { ok: false, error: "本单仍有未核对的后续动作，不能自动重发", state };
+  }
+  const tab = await chrome.tabs.get(state.lighthouseTabId);
+  if (!stopped()) return cancelled();
+  if (!isLighthouseUrl(tab.url) || !isTabInRuntimeWindow(tab)
+      || (Number.isInteger(windowId) && windowId !== tab.windowId)) {
+    return { ok: false, error: "本单页面或运行窗口不匹配，已保留订单", state };
+  }
+  await ensureContentScriptInjected(tab.id, stopped);
+  if (!stopped()) return cancelled();
+  const outcome = await chrome.tabs.sendMessage(tab.id, { type: "CHECK_LIGHTHOUSE_ORDER_OUTCOME",
+    platform: "lighthouse", runId, task: { taskKey: task.taskKey, tweetUrl: task.tweetUrl } });
+  if (!stopped()) return cancelled();
+  if (!outcome?.ok || outcome.runId !== runId || outcome.taskKey !== task.taskKey
+      || normalizeTweetUrl(outcome.tweetUrl) !== normalizeTweetUrl(task.tweetUrl) || outcome.outcome !== "locked") {
+    return { ok: false, error: "未重新确认本单仍处于锁位状态，保留订单等待核对", state };
+  }
+  const settings = await getSettings();
+  if (!stopped()) return cancelled();
+  if (settings.replyMode !== "post" || !settings.autoSubmitLighthouse) {
+    return { ok: false, error: "接续本单需要自动发送回复并开启自动提交 Lighthouse", state };
+  }
+  state.running = true;
+  state.mode = "auto";
+  setStage("claim_resuming");
+  try { await persistAutoRunState(true); }
+  catch (_) {
+    if (current()) {
+      state.running = false;
+      setStage("claim_resume_failed");
+    }
+    return { ok: false, error: "本单接续状态保存失败，已停止并保留订单", state: runtimeState };
+  }
+  if (!current() || !state.running) return cancelled();
+  await ensureAutoRunKeepalive();
+  if (!current() || !state.running) return cancelled();
+  log("info", "已重新核对本单锁位，接续原订单的自动回复与验证");
+  return adoptTargetOpenedTweet(task, tab.id, "auto");
 }
 
 async function cancelCurrentRun(isCurrent = () => true) {
@@ -4818,13 +4921,15 @@ async function restoreAutoRunState() {
       return;
     }
     const resumableScan = canResumeInterruptedClaimScan(saved.uncertainAction, saved);
-    const mayResume = saved.running === true && saved.mode === "auto" && (!saved.uncertainAction || resumableScan);
+    const automaticMode = saved.mode === "auto" || saved.mode === "selected_once" && saved.selectedTask;
+    const mayResume = saved.running === true && automaticMode && (!saved.uncertainAction || resumableScan);
     runtimeState = {
       ...createInitialState(),
       ...saved,
       running: false,
       mode: "idle",
       stage: mayResume ? "interrupted_not_resumed" : "stopped",
+      resumeMode: saved.mode,
       logs: Array.isArray(saved.logs) ? saved.logs.slice(0, 120) : [],
       pendingXOpen: null,
       // Only the live worker owns a refresh; no in-flight operation survives
@@ -5059,9 +5164,15 @@ async function tryResumeAutoRunAfterInterruption() {
       catch (_) {}
       if (!isCurrentRecovery() || runtimeState.running || runtimeState.stage !== "interrupted_not_resumed") return runtimeState.running;
     }
+    if (runtimeState.resumeMode === "selected_once" && !completedOrder) {
+      const selectedTask = runtimeState.selectedTask;
+      if (!selectedTask) return false;
+      await runSelectedCountdownTask(selectedTask, windowId);
+      return runtimeState.running;
+    }
     recoveringRunId = runtimeState.runId = createRunId();
     runtimeState.running = true;
-    runtimeState.mode = "auto";
+    runtimeState.mode = runtimeState.resumeMode === "selected_once" ? "selected_once" : "auto";
     if (completedOrder) runtimeState.completionEvidence = { ...runtimeState.completionEvidence, runId: recoveringRunId };
     await armCampaignsIdleReloadAlarm();
     if (!isCurrentRecovery() || !runtimeState.running) return runtimeState.running;

@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.102";
+  const SCRIPT_VERSION = "0.7.105";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -107,6 +107,14 @@
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!isCurrentInstance()) return false;
+    // Order reconciliation is observational. It must also work after the run
+    // was cancelled or the worker restarted, without reviving that run.
+    if (message.type === "CHECK_LIGHTHOUSE_ORDER_OUTCOME") {
+      const outcome = message.platform === "lighthouse" ? readBoundOrderOutcome(message.task) : { outcome: "unknown" };
+      sendResponse({ ok: message.platform === "lighthouse", ...outcome,
+        runId: message.runId, claimIntentId: message.claimIntentId });
+      return true;
+    }
     if (message.type === "AUTOMATION_PAUSE_CHANGED") {
       applyAutomationPause(message.paused);
       sendResponse({ ok: true, paused: automationPaused });
@@ -698,7 +706,8 @@
     await acceptInvitationIfPresent(settings);
     const started = Date.now();
     const timeoutMs = getPageWaitMs(settings);
-    const deadline = started + timeoutMs;
+    let deadline = started + timeoutMs;
+    const maxDeadline = started + Math.max(timeoutMs, Number(settings.maxCooldownWaitMs) || 600000);
     let lastReason = "";
     let lastWaitReportAt = 0;
     let lastReleaseText = "";
@@ -748,8 +757,13 @@
       }
 
       const releaseCountdown = parseDetailReleaseCountdown(detailText);
-      if (releaseCountdown && releaseCountdown.remainingMs > AUTO_DETAIL_MAX_RELEASE_WAIT_MS) {
-        throw createDeferredReleaseError(taskBeforeClick, releaseCountdown);
+      if (releaseCountdown) {
+        // The visible order owns release time. Sidebar snapshots are display
+        // data and may already belong to a previous batch.
+        if (Date.now() + releaseCountdown.remainingMs > maxDeadline) {
+          throw createDeferredReleaseError(taskBeforeClick, releaseCountdown);
+        }
+        deadline = Math.min(maxDeadline, Math.max(deadline, Date.now() + releaseCountdown.remainingMs + timeoutMs));
       }
       if (releaseCountdown && releaseCountdown.remainingMs > 5000) {
         if (releaseCountdown.text !== lastReleaseText) {
@@ -2223,6 +2237,30 @@
     return !observation.tweetUrl || !tweetUrl || tweetUrl === observation.tweetUrl;
   }
 
+  function readBoundOrderOutcome(task, includeCompletion = true) {
+    const tweetUrl = normalizeTweetUrl(task?.tweetUrl || "");
+    const identity = { taskKey: task?.taskKey || "", tweetUrl };
+    if (!identity.taskKey || !tweetUrl) return { ...identity, outcome: "unknown" };
+    // Unlike a watch started before submission, recovery has no baseline.
+    // A visible official result must identify this exact original tweet;
+    // titles, reward totals and recommended tasks cannot identify the order.
+    for (const root of includeCompletion ? findOfficialCompletionRoots() : []) {
+      const scope = root.closest?.("[role='dialog']") || root;
+      const originals = Array.from(scope.querySelectorAll("a[href]"))
+        .filter(node => isVisible(node) && normalize(node.innerText || node.textContent || "") === "查看原推文")
+        .map(node => normalizeTweetUrl(node.href));
+      if (originals.length && originals.every(url => url === tweetUrl)) {
+        return { ...identity, outcome: "completed", observedAt: Date.now(),
+          text: normalize(root.innerText || "").slice(0, 500) };
+      }
+    }
+    const root = findTaskDetailRoot();
+    if (!hasHardFailure(normalize(root?.innerText || "")) && hasConfirmedLockedDetail(root, tweetUrl)) {
+      return { ...identity, outcome: "locked", observedAt: Date.now() };
+    }
+    return { ...identity, outcome: "unknown" };
+  }
+
   function readLockFeedback() {
     // react-hot-toast uses role=status, including while Radix marks its
     // container aria-hidden. These messages can vanish before the timeout.
@@ -2279,6 +2317,20 @@
     while (true) {
       assertActiveRun(runId);
       observation.collectFeedback?.();
+      // A claim receipt is the state transition. An earlier notice can stay
+      // mounted after that transition and must not shadow the actual order.
+      // Use the same exact-order reader as interrupted-run reconciliation.
+      if (isSameLockDetail(observation)
+          && readBoundOrderOutcome({ ...observation.task,
+            // The site reveals the target link only after claiming. Before
+            // that transition the same detail may contain only an X button.
+            // Keep any known target binding; otherwise bind the newly
+            // revealed target only inside this unchanged claim observation.
+            tweetUrl: observation.tweetUrl || observation.task?.tweetUrl
+              || extractTweetUrl(observation.root) }, false).outcome === "locked") {
+        report("info", "已复核本单席位锁定、目标链接和可用 X 入口，接续本单");
+        return true;
+      }
       // A native dialog or a suspended tab can consume the wall-clock
       // deadline. Reconcile the current receipt once before timing out,
       // without dispatching another confirmation after the deadline.

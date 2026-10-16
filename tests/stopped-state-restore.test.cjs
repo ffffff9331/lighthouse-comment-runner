@@ -239,3 +239,28 @@ test("failed durable revocation keeps a restarted no-click scan stopped",async t
   assert.equal(w.state().running,false);assert.equal(w.state().stage,"stopped");
   assert.deepEqual(clone(w.state().uncertainAction),safeScanIntent);assert.equal(w.calls.scans.length,0);
 });
+
+for (const type of ["OPEN_SELECTED_COUNTDOWN_TASK_DETAIL", "WAIT_SELECTED_COUNTDOWN_AND_LOCK"]) {
+  test(`selected run restart resumes only its saved selection before any claim: ${type}`, async t => {
+    const selection={selectionId:"chosen",taskType:"评论",title:"chosen"};
+    const intent={...safeScanIntent,type};
+    const w=await boot(t,savedStorage({running:true,mode:"selected_once",selectedTask:selection,currentTask:null,uncertainAction:intent}));
+    assert.equal(w.state().stage,"interrupted_not_resumed");
+    assert.equal(w.state().uncertainAction,undefined);
+    let resumed;
+    w.context.runSelectedCountdownTask=async task=>{resumed=clone(task);w.state().running=true;w.state().mode="selected_once";};
+    await w.context.handleAutoRunKeepaliveTick();
+    assert.deepEqual(resumed,selection);
+    assert.equal(w.calls.scans.length,0);
+  });
+  test(`selected run restart preserves an already dispatched claim: ${type}`, async t => {
+    const intent={...safeScanIntent,type,claimActionAttempted:true};
+    const w=await boot(t,savedStorage({running:true,mode:"selected_once",selectedTask:{selectionId:"chosen"},currentTask:null,uncertainAction:intent}));
+    let resumed=false;
+    w.context.runSelectedCountdownTask=async()=>{resumed=true;};
+    await w.context.handleAutoRunKeepaliveTick();
+    assert.equal(resumed,false);
+    assert.equal(w.state().running,false);
+    assert.equal(w.state().uncertainAction.claimActionAttempted,true);
+  });
+}

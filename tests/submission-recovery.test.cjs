@@ -56,12 +56,12 @@ test("a lost X publish receipt still stops and is never replayed",async()=>{
   assert.equal(w.state().uncertainAction.type,"RUN_X_REPLY");
 });
 
-for (const mode of ["debug","selected_once"]) test(`submission-loss recovery does not revive a ${mode} run`,async()=>{
+for (const mode of ["debug"]) test(`submission-loss recovery does not revive a ${mode} run`,async()=>{
   const w=await worker();Object.assign(w.state(),{mode,lastXResult:{ok:true}});
   await w.c.sendToTab(12,{type:"COMPLETE_X_TASK_WIDGET",runId:"run",task});
   assert.equal(w.state().running,false);assert.deepEqual(w.sent,["COMPLETE_X_TASK_WIDGET"]);
 });
-for (const transition of ["stop","new_run","storage_failure"]) test(`submission loss respects ${transition} while saving the pending action`,async()=>{
+for (const transition of ["stop","new_run","storage_failure"]) test(`submission respects ${transition} before dispatching the pending action`,async()=>{
   const w=await worker();w.state().lastXResult={ok:true};
   const original=w.chrome.storage.local.set;
   w.chrome.storage.local.set=async(values,callback)=>{
@@ -73,11 +73,21 @@ for (const transition of ["stop","new_run","storage_failure"]) test(`submission 
     return original(values,callback);
   };
   const result=await w.c.sendToTab(12,{type:"COMPLETE_X_TASK_WIDGET",runId:"run",task});
-  assert.notEqual(result.ok,true);assert.deepEqual(w.sent,["COMPLETE_X_TASK_WIDGET"]);
+  assert.notEqual(result.ok,true);assert.deepEqual(w.sent,[]);
   if(transition==="new_run")assert.equal(w.state().stage,"new_run");
   else assert.equal(w.state().running,false);
 });
 test("lost submission without a confirmed reply cannot enter auto verification",async()=>{
   const w=await worker();await w.c.sendToTab(12,{type:"COMPLETE_X_TASK_WIDGET",runId:"run",task});
   assert.equal(w.state().running,false);assert.deepEqual(w.sent,["COMPLETE_X_TASK_WIDGET"]);
+});
+
+test("selected run shares the read-only submission recovery used by full scanning",async()=>{
+  const w=await worker();w.state().mode="selected_once";
+  await w.c.handleXReplyResult({ok:true,mode:"post"},{runId:"run"});
+  assert.equal(w.state().completed,1);assert.equal(w.state().running,false);
+  assert.equal(w.state().stage,"selected_flow_done");
+  assert.equal(w.sent.filter(t=>t==="COMPLETE_X_TASK_WIDGET").length,1);
+  assert.equal(w.state().uncertainAction,null);
+  assert.equal(w.effects.includes("scan"),false);
 });

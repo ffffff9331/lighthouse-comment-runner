@@ -146,8 +146,6 @@
                 <option value="debug">调试模式：一步一步</option>
                 <option value="auto">正式模式：全自动</option>
               </select>
-              <input id="maxTasksPerRun" type="number" min="1" max="9999" step="1">
-              <input id="maxTaskAttempts" type="number" min="1" max="9999" step="1">
               <input id="enableCooldownSniping" type="checkbox">
               <input id="autoSubmitLighthouse" type="checkbox">
             </div>
@@ -228,6 +226,15 @@
               </summary>
               <div class="settingsGroupBody">
                 <div class="formGrid">
+                  <label>
+                    <span>每轮完成上限</span>
+                    <input id="maxTasksPerRun" type="number" min="1" max="9999" step="1">
+                    <small class="fieldHint">全量检测完成指定单数后自动停止。</small>
+                  </label>
+                  <label>
+                    <span>每轮尝试上限</span>
+                    <input id="maxTaskAttempts" type="number" min="1" max="9999" step="1">
+                  </label>
                   <label class="check">
                     <span>运行时段</span>
                     <input id="runWindowEnabled" type="checkbox">

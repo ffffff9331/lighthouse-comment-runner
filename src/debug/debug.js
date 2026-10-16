@@ -1203,16 +1203,15 @@ function selectCountdownTask(task) {
 }
 
 function resolveSelectedCountdownTask() {
-  if (selectedCountdownTask) return deriveLocalCountdownTask(selectedCountdownTask);
-  if (selectedCountdownKey) {
-    const found = [...renderedCountdownTasks, ...countdownTasks]
-      .find((task) => buildCountdownSelectionKey(task) === selectedCountdownKey);
-    if (found) {
-      selectedCountdownTask = { ...found };
-      return deriveLocalCountdownTask(selectedCountdownTask);
-    }
-  }
-  return null;
+  // Selection stores identity only. A refreshed list replaces availability;
+  // an expired snapshot must never resurrect a removed or postponed task.
+  const key = selectedCountdownKey || (selectedCountdownTask && buildCountdownSelectionKey(selectedCountdownTask));
+  if (!key) return null;
+  const found = [...renderedCountdownTasks, ...countdownTasks]
+    .find(task => buildCountdownSelectionKey(task) === key);
+  if (!found) return null;
+  selectedCountdownTask = { ...found };
+  return deriveLocalCountdownTask(found);
 }
 
 function buildCountdownSelectionKey(task) {

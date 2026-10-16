@@ -29,7 +29,7 @@ function page(options = {}) {
     static now() { return now; }
   }
   const observers = new Set();
-  const fixture = { clicks: 0, outside: "", reports: [], nodes: [], notices: options.initialNotices || [], root: null,
+  const fixture = { get elapsedMs() { return now - 1000000; }, releaseAtMs: options.releaseAtMs || 0, clicks: 0, outside: "", reports: [], nodes: [], notices: options.initialNotices || [], root: null,
     elapse(ms) { now += ms; },
     notify(text) { this.notices.push(node(text)); for (const observer of observers) observer.callback(); },
     clearNotices() { this.notices = []; for (const observer of observers) observer.callback(); },
@@ -42,7 +42,9 @@ function page(options = {}) {
   fixture.nodes.push(button, ...(options.initialNodes || []));
   const root = {
     title: "Fixture order", isConnected: true, visible: true,
-    get innerText() { return `${this.title} 评论任务 0.1 LUX 当前可抢 0 席 ${fixture.nodes.map(n => n.innerText).join(" ")}`; },
+    get innerText() { const sec = Math.ceil(Math.max(0, fixture.releaseAtMs - fixture.elapsedMs) / 1000);
+      const countdown = sec ? `等待下一批释放 · ${String(Math.floor(sec / 60)).padStart(2, "0")}:${String(sec % 60).padStart(2, "0")}` : "";
+      return `${countdown} ${this.title} 评论任务 0.1 LUX 当前可抢 0 席 ${fixture.nodes.map(n => n.innerText).join(" ")}`; },
     querySelectorAll(selector) {
       if (selector === "a[href]") return fixture.nodes.filter(n => n.href);
       if (selector.includes("h1,h2,h3")) return [node(this.title)];
@@ -73,13 +75,13 @@ function page(options = {}) {
   const adapters = `
     findTaskDetailRoot = () => fixture.root;
     isTaskDetailOpen = () => true;
-    findLockButton = () => fixture.nodes.find(node => node.innerText === "锁定席位") || null;
+    findLockButton = () => fixture.elapsedMs < fixture.releaseAtMs ? null : (fixture.nodes.find(node => node.innerText === "锁定席位") || null);
     isVisible = node => Boolean(node && node.visible && node.isConnected);
     isDisabled = node => node.disabled;
     confirmPagePhase = async (...args) => { await fixturePhase(...args); return { phase: "detail_ready" }; };
     acceptInvitationIfPresent = async () => false;
     confirmLighthouseGuidanceBeforeClaim = async () => false;
-    getLighthousePreClaimNoticeButton = () => null;
+    getLighthousePreClaimNoticeButton = () => fixture.pendingNotice || null;
     hasDetailRequestTimeout = () => false;
     assertSupportedDetailTask = () => {};
     buildTask = () => ({ taskKey: "detail-order", title: fixture.root.title,
@@ -435,3 +437,57 @@ test("real confirmed lock persists the order and clears the pending intent", asy
   assert.equal(w.state().uncertainAction, undefined);
   assert.equal(w.stored.lighthouseAutoRunStateV1.currentTask.seatLocked, true);
 });
+
+test("a lingering pre-claim notice cannot hide the complete same-order lock receipt",async()=>{
+ const p=page({initialNodes:[node("在 X 打开",{control:true,href:URL_X})],onClick(f,button){
+   f.nodes=f.nodes.filter(n=>n!==button);f.nodes.push(node("席位已锁定"),node("去 X 完成动作",{control:true,href:URL_X}));f.pendingNotice={};
+ }});
+ const r=await p.dispatch();assert.equal(r.ok,true,r.message);assert.equal(r.task.seatLocked,true);assert.equal(p.fixture.clicks,1);
+});
+
+for (const incomplete of ["status only", "wrong target", "claim control remains"]) {
+  test(`a lingering notice still waits when the receipt is incomplete: ${incomplete}`, async () => {
+    const p = page({ initialNodes: [node("在 X 打开", { control: true, href: URL_X })], onClick(f, button) {
+      if (incomplete !== "claim control remains") f.nodes = f.nodes.filter(n => n !== button);
+      f.nodes.push(node("席位已锁定"));
+      if (incomplete !== "status only") f.nodes.push(node("去 X 完成动作", { control: true, href: URL_X }));
+      if (incomplete === "wrong target") {
+        for (const n of f.nodes) if (n.href) n.href = "https://x.com/other/status/456";
+      }
+      f.pendingNotice = {};
+    } });
+    const result = await p.dispatch();
+    assert.equal(result.ok, false);
+    assert.notEqual(result.task?.seatLocked, true);
+    assert.equal(p.fixture.clicks, 1);
+  });
+}
+
+test("selected locking follows the changing detail clock past the old one-minute cutoff", async () => {
+  const p = page({ releaseAtMs: 125000, onClick(f, button) {
+    f.nodes = f.nodes.filter(n => n !== button);
+    f.nodes.push(node("席位已锁定"), node("去 X 完成动作", { control: true, href: URL_X }));
+  } });
+  const result = await p.dispatch("WAIT_SELECTED_COUNTDOWN_AND_LOCK", { selectedTask: { countdownSec: 0 } });
+  assert.equal(result.ok, true, result.message);
+  assert.equal(p.fixture.clicks, 1);
+  assert.ok(p.fixture.elapsedMs >= 125000);
+});
+
+// Production exposes the target link only after the claim succeeds. The
+// pre-claim "在 X 打开" is a button with no href, not a preview anchor.
+for (const route of ["DEBUG_LOCK_SEAT_AND_EXTRACT", "WAIT_SELECTED_COUNTDOWN_AND_LOCK", "START_LIGHTHOUSE_COMMENT_TASK"]) {
+  test(`${route}: a target revealed only after locking is accepted before a lingering notice`, async () => {
+    const p = page({ initialNodes: [node("在 X 打开", { control: true })], onClick(f, button) {
+      f.nodes = f.nodes.filter(n => n !== button);
+      f.nodes.push(node("席位已锁定"), node("去 X 完成动作", { control: true }),
+        node("没有自动打开？点此直接前往目标", { control: true, href: URL_X }));
+      f.pendingNotice = {};
+    } });
+    const result = await p.dispatch(route);
+    assert.equal(result.ok, true, result.message);
+    assert.equal(result.task.seatLocked, true);
+    assert.equal(result.task.tweetUrl, URL_X);
+    assert.equal(p.fixture.clicks, 1);
+  });
+}

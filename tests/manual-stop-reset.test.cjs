@@ -311,14 +311,16 @@ test("an old expectedRunId continuation cannot release manual pause", async t =>
   assert.deepEqual(w.effects.slice(count), []);
 });
 
-test("selected-countdown start cannot release pause before an explicit full or single-step start", async t => {
+test("an empty selected start cannot release manual pause", async t => {
   const w = await boot(t);
   await w.message("STOP_RUN");
   await flush();
   const stopped = clone(w.state()), count = w.effects.length;
-  const result = await w.message("RUN_SELECTED_COUNTDOWN_TASK", { selectedTask: { selectionId: "stale-selection", taskType: "评论", countdownSec: 0 } });
-  assert.ok(result.ok === false || (result.ignored === true && result.paused === true), "selected start must be refused or explicitly ignored while paused");
-  assert.deepEqual(clone(w.state()), stopped);
+  const result = await w.message("RUN_SELECTED_COUNTDOWN_TASK");
+  assert.equal(result.ok, false);
+  assert.equal(w.state().manuallyStopped, true);
+  assert.equal(w.state().runId, stopped.runId);
+  assert.equal(w.state().running, false);
   assert.deepEqual(w.effects.slice(count), []);
 });
 

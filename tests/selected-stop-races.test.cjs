@@ -40,57 +40,8 @@ function restart(context, effects) {
   };
 }
 
-function selectedWorker(boundary) {
-  const effects = [], entered = deferred(), release = deferred();
-  let held = false;
-  const edge = async (name, result) => {
-    effects.push({ name });
-    if (!held && name === boundary) { held = true; entered.resolve(); await release.promise; }
-    return result;
-  };
-  const c = load(["runSelectedCountdownTask"], {
-    runtimeState: { stopEpoch: 1 },
-    createInitialState: () => ({ failed: 0, completed: 0 }), setRuntimeWindow() {}, createRunId: () => "old-run",
-    ensureAutoRunKeepalive: async () => {}, isIgnoredNonCommentTask: () => false,
-    getSettings: async () => ({ replyMode: "post", autoSubmitLighthouse: true }),
-    resolveLighthouseTab: async () => 11, rememberLighthouseTabById: async () => {},
-    chrome: { tabs: { update: async () => {} } }, waitForTabComplete: async () => {},
-    log() {}, setStage(stage) { c.runtimeState.stage = stage; },
-    sendToTab: async (tabId, message) => {
-      effects.push({ name: "send", tabId, type: message.type, runId: message.runId });
-      return edge(message.type, { ok: true, task: { taskKey: "old-task" } });
-    },
-    waitForSelectedCountdownWindow: async () => edge("countdown", { taskKey: "old-task" }),
-    beginXOpenWatch() { effects.push({ name: "watch" }); }, clearXOpenWatch() {}, markAttemptedTask() {},
-    waitForLighthouseOpenedTweet: async () => { c.runtimeState.xTabId = 12; return edge("adopt", true); },
-    waitForXReadyBeforeReply: async () => edge("ready", true),
-    recordReplyHistory: async () => edge("history", true),
-    completeXTaskWidgetLifecycle: async () => edge("completion", { ok: true }),
-    waitForLighthouseTaskCompletionAndReturn: async () => edge("campaigns", { ok: true }),
-    closeLighthouseDetailToCampaigns: async () => edge("close", true),
-    closeLighthouseTaskDetail: async () => edge("close-failure", true),
-  });
-  return { c, effects, entered, release };
-}
-
-for (const boundary of ["countdown", "WAIT_SELECTED_COUNTDOWN_AND_LOCK", "adopt", "ready", "RUN_X_REPLY", "history", "completion", "campaigns", "close"]) {
-  test(`selected task: ${boundary} completion after STOP and restart has no effect`, { timeout: 2000 }, async () => {
-    const w = selectedWorker(boundary);
-    const pending = w.c.runSelectedCountdownTask({ taskKey: "old-task" });
-    await w.entered.promise;
-    const unchanged = restart(w.c, w.effects);
-    w.release.resolve();
-    assert.equal((await pending).cancelled, true);
-    unchanged();
-  });
-}
-
-test("selected task still completes when its identity remains current", async () => {
-  const w = selectedWorker("unused");
-  assert.equal((await w.c.runSelectedCountdownTask({ taskKey: "old-task" })).ok, true);
-  assert.equal(w.c.runtimeState.stage, "selected_flow_done");
-  assert.equal(w.c.runtimeState.completed, 1);
-});
+// Selected-run races now execute the full background transport and
+// completion path in runner-lifecycle.test.cjs.
 
 for (const boundary of ["tab", "window"]) {
   test(`focus X: old ${boundary} update receipt cannot restore cleared tab records`, async () => {
@@ -152,20 +103,6 @@ test("official completion: old X cancellation receipt cannot overwrite a new sta
   unchanged();
 });
 
-test("selected countdown final jitter cannot return an old task after restart", async () => {
-  const entered = deferred(), release = deferred();
-  let now = 0;
-  const c = load(["waitForSelectedCountdownWindow"], {
-    runtimeState: { runId: "old-run", running: true, mode: "selected_once" },
-    Date: { now: () => now }, log() {}, formatDuration: String, randomBetween: () => 10,
-    async delay(ms) { if (ms === 10) { entered.resolve(); await release.promise; } else now += ms; },
-  });
-  const pending = c.waitForSelectedCountdownWindow({ countdownSec: 6 }, { cooldownPollMs: 500 });
-  await entered.promise;
-  restart(c, []);
-  release.resolve();
-  assert.equal(await pending, null);
-});
 
 test("old selected-start finally cannot unlock a new selected-start request", async () => {
   const entered = deferred(), release = deferred();
