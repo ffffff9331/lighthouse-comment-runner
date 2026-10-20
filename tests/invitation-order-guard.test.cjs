@@ -6,6 +6,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const sourceRoot = process.env.LIGHTHOUSE_TEST_SOURCE_ROOT || path.join(__dirname, "../src");
+const version = JSON.parse(fs.readFileSync(path.join(__dirname, "../manifest.json"), "utf8")).version;
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const stateKey = "lighthouseAutoRunStateV1";
 const event = { addListener() {} };
@@ -23,7 +24,7 @@ async function worker(saved = null) {
   const state = () => vm.runInContext("runtimeState", context);
   const chrome = {
     runtime: { id: "test", getURL: (p) => `chrome-extension://test/${p}`,
-      getManifest: () => ({ version: "test" }), onInstalled: event, onMessage: event },
+      getManifest: () => ({ version }), onInstalled: event, onMessage: event },
     storage: { session: require("./session-fixture.cjs")(), local: {
       setAccessLevel: async () => {},
       async get(keys) { return Object.fromEntries(keys.filter(key => Object.hasOwn(stored, key)).map((key) => [key, stored[key]])); },
@@ -36,6 +37,9 @@ async function worker(saved = null) {
       update: async () => lighthouseTab,
       async sendMessage(id, payload) {
         sent.push({ id, payload: clone(payload) });
+        if (payload.type === "CHECK_LIGHTHOUSE_RUNNER_READY") {
+          return { ok: true, version, instanceId: "fixture-page", url: lighthouseTab.url, paused: false };
+        }
         if (payload.type.startsWith("CANCEL_")) return { ok: true };
         if (payload.type === "DEBUG_OPEN_FIRST_COMMENT_TASK") {
           const opens = sent.filter((entry) => entry.payload.type === payload.type).length;

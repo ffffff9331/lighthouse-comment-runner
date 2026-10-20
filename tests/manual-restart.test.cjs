@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const version = JSON.parse(fs.readFileSync(path.join(__dirname, "../manifest.json"), "utf8")).version;
 
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const task = { taskKey: "previous-order", claimed: true, seatLocked: true };
@@ -22,7 +23,7 @@ async function worker(extra = {}) {
   const event = { addListener() {} }, calls = [], scans = [];
   const chrome = {
     runtime: { id: "test", getURL: (p) => `chrome-extension://test/${p}`,
-      getManifest: () => ({ version: "test" }), onInstalled: event, onMessage: event },
+      getManifest: () => ({ version }), onInstalled: event, onMessage: event },
     storage: { session: require("./session-fixture.cjs")(), local: {
       async setAccessLevel() {},
       async get(keys) { return Object.fromEntries(keys.filter(key => Object.hasOwn(stored, key)).map((key) => [key, stored[key]])); },
@@ -31,7 +32,13 @@ async function worker(extra = {}) {
     alarms: { onAlarm: event, async create() {}, async clear() {} },
     tabs: { onCreated: event, onUpdated: event, onRemoved: event,
       async update(id) { return { id, windowId: 1 }; },
-      async sendMessage(id, payload) { calls.push({ id, payload: clone(payload) }); return { ok: true }; },
+      async sendMessage(id, payload) {
+        calls.push({ id, payload: clone(payload) });
+        if (payload.type === "CHECK_LIGHTHOUSE_RUNNER_READY") {
+          return { ok: true, version, instanceId: "fixture-page", url: "https://app.lhdao.top/campaigns", paused: false };
+        }
+        return { ok: true };
+      },
     },
   };
   const c = vm.createContext({ chrome, console, URL, AbortController, importScripts() {}, clearTimeout,
@@ -117,6 +124,9 @@ test("selected start reaches the platform despite stale local order flags and re
   const w = await worker({ uncertainAction: { type: "RUN_X_REPLY", runId: "old-run" } });
   w.chrome.tabs.sendMessage = async (id, payload) => {
     w.calls.push({ id, payload: clone(payload) });
+    if (payload.type === "CHECK_LIGHTHOUSE_RUNNER_READY") {
+      return { ok: true, version, instanceId: "fixture-page", url: "https://app.lhdao.top/campaigns", paused: false };
+    }
     if (payload.type.startsWith("CANCEL_")) return { ok: true };
     return { ok: false, message: "platform: active order" };
   };

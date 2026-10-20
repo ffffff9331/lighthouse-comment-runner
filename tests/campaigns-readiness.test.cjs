@@ -44,7 +44,7 @@ function page({ loading = false, overlay = false, completed = false, heading = t
     formatDuration: (ms) => `${ms}ms`,
     wait: async (ms) => { now += ms; },
   });
-  for (const name of ["hasLoadedCampaignListShell", "isCampaignsListOpen", "waitForCampaignsReady"])
+  for (const name of ["findStandaloneInvitation", "hasLoadedCampaignListShell", "isCampaignsListOpen", "waitForCampaignsReady"])
     vm.runInContext(declaration(name), c);
   return { c, reports, now: () => now };
 }

@@ -38,6 +38,10 @@ async function worker(t, initialStored = {}) {
       async reload(id) { reloads.push(id); effects.push("reload"); },
       async sendMessage(id, message) {
         sent.push(clone(message));
+        if (message.type === "CHECK_LIGHTHOUSE_RUNNER_READY") return {
+          ok: true, version: "test", instanceId: "claim-failure-page", url: tab.url, paused: false
+        };
+        if (message.type === "CHECK_LIGHTHOUSE_INVITATION") return { ok: true, invitationPending: false };
         if (message.type === "START_LIGHTHOUSE_COMMENT_TASK") {
           const count = sent.filter(item => item.type === message.type).length;
           return hooks.claim ? hooks.claim(message, count) : { ok: true, claimActionAttempted: true, task: { ...task, taskKey: "next-order", seatLocked: true } };

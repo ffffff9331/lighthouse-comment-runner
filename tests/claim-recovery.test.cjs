@@ -90,7 +90,15 @@ async function worker(responseFactory) {
     } },
     alarms: { onAlarm: event, async create() {}, async clear() {} },
     tabs: { onCreated: event, onUpdated: event, onRemoved: event,
-      async sendMessage(id, payload) { sent.push(clone(payload)); return responseFactory(payload); }
+      async sendMessage(id, payload) {
+        // Keep the existing action-receipt sequence separate from this new
+        // observational handshake so action-count assertions stay unchanged.
+        if (payload.type === "CHECK_LIGHTHOUSE_RUNNER_READY") return {
+          ok: true, version: "test", instanceId: "claim-recovery-page",
+          url: "https://app.lhdao.top/campaigns", paused: false
+        };
+        sent.push(clone(payload)); return responseFactory(payload);
+      }
     }
   };
   const c = vm.createContext({ chrome, console, URL, AbortController, importScripts() {}, clearTimeout,

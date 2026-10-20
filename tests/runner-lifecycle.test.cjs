@@ -39,6 +39,10 @@ async function worker(options = {}) {
         effects.push({ type: payload.type, running: state().running, task: payload.task?.taskKey });
         await options.onSend?.(payload, { stored, state, effects });
         await edge(payload.type);
+        if (payload.type === "CHECK_LIGHTHOUSE_RUNNER_READY") return {
+          ok: true, version: "fixture", instanceId: "runner-lifecycle-page",
+          url: "https://app.lhdao.top/campaigns", paused: false
+        };
         if (/^CANCEL_|^AUTOMATION_/.test(payload.type)) return { ok: true };
         if (payload.type === "OPEN_SELECTED_COUNTDOWN_TASK_DETAIL") {
           if (options.missing) return { ok: false, claimActionAttempted: false, message: "目标任务已下架" };

@@ -43,6 +43,10 @@ async function worker(options = {}) {
       async reload(id) {reloads.push(id); await hooks.onReload?.();},
       async sendMessage(id, message) {
         sent.push(clone(message));
+        if (message.type === "CHECK_LIGHTHOUSE_RUNNER_READY") return {
+          ok: true, version: "test", instanceId: "idle-recovery-page",
+          url: "https://app.lhdao.top/campaigns", paused: false
+        };
         if (message.type === "START_LIGHTHOUSE_COMMENT_TASK") {
           scanCount++;
           if (scanCount === 1) {firstSent.resolve(); return hooks.firstResponse ? hooks.firstResponse(message) : safeRefresh();}
@@ -51,6 +55,7 @@ async function worker(options = {}) {
         if (message.type === "CANCEL_LIGHTHOUSE_RUN") {await hooks.onCancel?.(message); return {ok: true};}
         if (message.type.startsWith("CANCEL_") || message.type === "BEGIN_LIGHTHOUSE_COMPLETION_WATCH") return {ok: true};
         if (message.type === "CLOSE_LIGHTHOUSE_TASK_DETAIL") return {ok: true, message: "已关闭详情"};
+        if (message.type === "CHECK_LIGHTHOUSE_INVITATION") return {ok: true, invitationPending: false};
         throw Error("Unexpected Chrome message: " + message.type);
       }}
   };

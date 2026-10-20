@@ -28,7 +28,9 @@ function fixtureFactory(file, marker, returned, replacements = []) {
   return new Function("require", "__dirname", "fixtureSend", `${prefix}\nreturn ${returned};`);
 }
 
-const workerFactory = fixtureFactory("background-tweet-identity.test.cjs", "for (const [name, tab] of [", "worker");
+const workerFactory = fixtureFactory("background-tweet-identity.test.cjs", "for (const [name, tab] of [", "worker", [
+  ['getManifest: () => ({ version: "test" })', 'getManifest: () => JSON.parse(fs.readFileSync(path.join(__dirname, "../manifest.json"), "utf8"))'],
+]);
 const contentFactory = fixtureFactory("post-lock-navigation.test.cjs", 'test("same locked order', "page", [
   ["return { f, showNotice, identity: c.identityApi,", "return { f, showNotice, dispatch, identity: c.identityApi,"],
   ["f.reports.push(message); return { ok: true, paused: false };", "f.reports.push(message); return fixtureSend(message);"],

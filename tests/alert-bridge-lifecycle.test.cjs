@@ -6,6 +6,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const sourceRoot = process.env.LIGHTHOUSE_TEST_SOURCE_ROOT || path.join(__dirname, "../src");
+const version = JSON.parse(fs.readFileSync(path.join(__dirname, "../manifest.json"), "utf8")).version;
 const background = fs.readFileSync(path.join(sourceRoot, "background.js"), "utf8");
 const bridge = fs.readFileSync(path.join(sourceRoot, "content/lighthouse-alert-bridge.js"), "utf8");
 const warning = "此推文含有未经验证的链接，请 KOL 接单时仔细分辨";
@@ -42,7 +43,7 @@ function fixture({ manifestBridge = true } = {}) {
   reload();
   const state = { running: true, runId: "run-1", mode: "auto" };
   const c = vm.createContext({
-    console, Date, URL, runtimeState: state, activeTabActions: new Set(),
+    console, Date, URL, setTimeout, clearTimeout, runtimeState: state, activeTabActions: new Set(),
     // Kept to exercise the old implementation in regression checks too.
     lighthouseAlertBridgeUrls: new Map(), alertPauseRevision: 0,
     isLighthouseUrl: url => /^https:\/\/app\.lhdao\.top\//.test(url),
@@ -50,9 +51,13 @@ function fixture({ manifestBridge = true } = {}) {
     createRunId: () => "fixture-intent", persistAutoRunState: async () => {},
     mergeTaskPreservingCapturedTweetUrl: (...values) => Object.assign({}, ...values),
     chrome: {
+      runtime: { getManifest: () => ({ version }) },
       tabs: {
         async get() { return tab; },
         async sendMessage(_id, message) {
+          if (message.type === "CHECK_LIGHTHOUSE_RUNNER_READY") {
+            return { ok: true, version, instanceId: "fixture-page", url: tab.url, paused: false };
+          }
           effects.push({ sent: message.type });
           if (!message.type.startsWith("CANCEL_")) page.window.alert(warning);
           return { ok: true, task: { taskKey: "fixture-task", seatLocked: true } };
@@ -70,7 +75,7 @@ function fixture({ manifestBridge = true } = {}) {
       } }
     }
   });
-  for (const name of ["ensureLighthouseAlertBridge", "pauseLighthouseAlertBridge", "sendToTab"]) {
+  for (const name of ["ensureLighthouseAlertBridge", "pauseLighthouseAlertBridge", "ensureLighthouseRunnerReady", "sendToTab"]) {
     vm.runInContext(declaration(name), c);
   }
   return { c, state, pages, effects, reload, pending,

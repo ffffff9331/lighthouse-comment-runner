@@ -1093,7 +1093,15 @@ async function startNextAutoTask(reason) {
   // detail to close; the extra close round-trip and settle delay only added
   // seconds to every round boundary.
   if (runtimeState.stage !== "campaigns_returned") {
-    await closeLighthouseTaskDetail(tabId, settings, "开始选择下一单前关闭残留任务详情");
+    const closed = await closeLighthouseTaskDetail(tabId, settings, "开始选择下一单前关闭残留任务详情", isCurrent, true);
+    if (!isCurrent() || !isActiveAutoRun(runId)) return cancelled();
+    if (!closed) {
+      runtimeState.running = false;
+      setStage("campaigns_reload_failed");
+      const error = "开始扫描前未确认任务页面就绪，已停止，未发送接单动作";
+      log("error", error);
+      return { ok: false, error, state: runtimeState };
+    }
     await delay(Math.max(settings.actionDelayMs || 500, 800));
   }
   if (!isActiveAutoRun(runId)) return { ok: true, state: runtimeState };
@@ -1112,6 +1120,12 @@ async function startNextAutoTask(reason) {
     attemptedTaskRecords: (runtimeState.attemptedTaskRecords || [])
       .filter(record => !permanentIgnoredTaskKeysCache.has(record.key)).map(record => ({ ...record }))
   });
+  if (isCurrent() && result?.runnerUnavailable) {
+    runtimeState.running = false;
+    setStage("campaigns_reload_failed");
+    log("error", result.message || "任务执行脚本尚未就绪，未发送接单动作");
+    return { ok: false, error: result.message, state: runtimeState };
+  }
   if (!isActiveAutoRun(runId)) return { ok: true, state: runtimeState };
 
   if (!result || !result.ok) {
@@ -1124,6 +1138,12 @@ async function startNextAutoTask(reason) {
       });
     }
     clearXOpenWatch();
+    if (result?.claimActionAttempted === false && (result.transient || result.refreshRequested)) {
+      // A provisional candidate is not an order. The bound no-click receipt
+      // above has already ruled out protected work before releasing this draft.
+      releaseAttemptedTask(runtimeState.currentTask);
+      runtimeState.currentTask = null;
+    }
     if (result?.refreshRequested) {
       const refreshingState = runtimeState;
       const ownsRefresh = () => runtimeState === refreshingState && runtimeState.runId === runId;
@@ -1133,9 +1153,13 @@ async function startNextAutoTask(reason) {
       refreshingState.marketplaceRefreshInFlight = true;
       let nextReason;
       try {
-        const refreshState = await refreshLighthouseCampaignsTab(tabId, result.message || "任务广场陈旧可做列表刷新后继续下一轮", isCurrentRefresh);
+        const refreshState = await refreshLighthouseCampaignsTab(tabId, result.message || "任务广场陈旧可做列表刷新后继续下一轮", isCurrentRefresh, true);
         if (!isCurrentRefresh() || refreshState.cancelled) return { ok: false, cancelled: true, state: runtimeState };
-        if (refreshState.ok) {
+        if (refreshState.invitationPending) {
+          setStage("selecting_task");
+          log("info", "任务广场出现专属邀请，保留当前页面并继续检测");
+          nextReason = "pending_invitation";
+        } else if (refreshState.ok) {
           // A successful plaza reload starts a new idle interval; ordinary
           // stage transitions must still leave the no-order timer untouched.
           runtimeState.lastProgressAt = Date.now();
@@ -1168,7 +1192,7 @@ async function startNextAutoTask(reason) {
       if (!isCurrent()) return cancelled();
       setStage("task_permanently_ignored");
       log("warn", result.message || result.error || "已永久忽略非评论任务，继续寻找下一条评论/点赞互动任务");
-      await closeLighthouseTaskDetail(tabId, settings, "永久忽略非评论任务后关闭详情面板");
+      await closeLighthouseTaskDetail(tabId, settings, "永久忽略非评论任务后关闭详情面板", isCurrent, true);
       await delay(settings.actionDelayMs * 2);
       if (!isCurrent()) return cancelled();
       return startNextAutoTask("retry_after_permanent_ignore");
@@ -1213,7 +1237,7 @@ async function startNextAutoTask(reason) {
     }
     setStage(deferredRelease ? "task_release_deferred" : "task_select_failed");
     log(transient || deferredRelease ? "info" : "warn", result?.message || result?.error || "任务选择失败，准备尝试下一条");
-    await closeLighthouseTaskDetail(tabId, settings, deferredRelease ? "等待下一批放号，关闭详情继续扫描任务广场" : "任务选择失败后关闭详情面板");
+    await closeLighthouseTaskDetail(tabId, settings, deferredRelease ? "等待下一批放号，关闭详情继续扫描任务广场" : "任务选择失败后关闭详情面板", isCurrent, true);
     if (!isCurrent() || !isActiveAutoRun(runId)) return cancelled();
     if (confirmedCooldown && !batchUnavailable) {
       runtimeState.claimRetryNotBefore = Date.now() + retryAfterMs;
@@ -1221,7 +1245,7 @@ async function startNextAutoTask(reason) {
       if (!isCurrent() || !isActiveAutoRun(runId)) return cancelled();
       if (!await waitForClaimRetryCooldown(runId) || !isCurrent()) return cancelled();
     }
-    const reloaded = await reloadLighthouseCampaignsAfterOrder(tabId, deferredRelease ? "未接到单，重新加载任务广场并按平台倒计时继续检测" : "接单失败，已重新加载任务广场", isCurrent);
+    const reloaded = await reloadLighthouseCampaignsAfterOrder(tabId, deferredRelease ? "未接到单，重新加载任务广场并按平台倒计时继续检测" : "接单失败，已重新加载任务广场", isCurrent, true);
     if (!isCurrent()) return cancelled();
     if (reloaded === false) {
       runtimeState.running = false;
@@ -2685,9 +2709,9 @@ async function recoverAndContinue(message, options = {}) {
     const tab = await getOrCreateLighthouseTab(LIGHTHOUSE_CAMPAIGNS_URL, isCurrent);
     if (!isCurrent()) return cancelled();
     rememberLighthouseTab(tab);
-    await closeLighthouseTaskDetail(tab.id, settings, "异常恢复时关闭任务详情", isCurrent);
+    await closeLighthouseTaskDetail(tab.id, settings, "异常恢复时关闭任务详情", isCurrent, true);
     if (!isCurrent()) return cancelled();
-    const reloaded = await reloadLighthouseCampaignsAfterOrder(tab.id, "接单失败，已重新加载任务广场", isCurrent);
+    const reloaded = await reloadLighthouseCampaignsAfterOrder(tab.id, "接单失败，已重新加载任务广场", isCurrent, true);
     if (!isCurrent()) return cancelled();
     if (reloaded === false) {
       runtimeState.running = false;
@@ -2856,7 +2880,92 @@ async function returnLighthouseToCampaigns(tabId) {
   return true;
 }
 
-async function refreshLighthouseCampaignsTab(tabId, reason = "", isCurrent = () => true) {
+async function checkLighthouseInvitationBeforeRefresh(tabId, isCurrent, stoppedAutoRecovery = false, unclaimedTask = null) {
+  const state = runtimeState;
+  const runId = state.runId;
+  const current = () => isCurrent() && runtimeState === state && state.runId === runId && !state.manuallyStopped;
+  const cancelled = () => ({ ok: false, cancelled: true, message: "流程已变化，取消旧邀请检查" });
+  // Only the watchdog may retain its original unclaimed draft across both
+  // checks. A replacement or newly locked task belongs to a newer action.
+  const hasNoProtectedTask = () => !state.currentTask || (unclaimedTask && state.currentTask === unclaimedTask
+    && !unclaimedTask.invitationAccepted && !unclaimedTask.claimed && !unclaimedTask.seatLocked && !unclaimedTask.seatLockedAt);
+  const mayPreserveInvitation = () => (state.running || stoppedAutoRecovery) && state.mode === "auto"
+    && hasNoProtectedTask() && !state.uncertainAction && !state.lastXResult && !state.completionEvidence;
+  if (!current()) return cancelled();
+  if (state.mode !== "auto") return { ok: true, invitationPending: false };
+  if (!mayPreserveInvitation()) return cancelled();
+  try {
+    const read = () => chrome.tabs.sendMessage(tabId, {
+      type: "CHECK_LIGHTHOUSE_INVITATION", platform: "lighthouse", runId
+    });
+    let result;
+    try { result = await read(); }
+    catch (error) { if (!isReceivingEndMissingError(error)) throw error; }
+    if (!current() || !mayPreserveInvitation()) return cancelled();
+    if (result?.ok !== true || typeof result.invitationPending !== "boolean") {
+      const ready = await ensureLighthouseRunnerReady(tabId, () => current() && mayPreserveInvitation());
+      if (!current() || !mayPreserveInvitation() || ready.cancelled) return cancelled();
+      if (!ready.ok) return ready;
+      result = await read();
+      if (!current() || !mayPreserveInvitation()) return cancelled();
+    }
+    if (result?.ok !== true || typeof result.invitationPending !== "boolean") {
+      return { ok: false, message: result?.message || "无法确认当前邀请状态，保留页面" };
+    }
+    return { ok: true, invitationPending: result.invitationPending };
+  } catch (error) {
+    if (!current() || !mayPreserveInvitation()) return cancelled();
+    return { ok: false, message: `读取邀请状态失败：${error.message || String(error)}` };
+  }
+}
+
+async function ensureLighthouseRunnerReady(tabId, isCurrent = () => true) {
+  const state = runtimeState;
+  const runId = state.runId;
+  const stopEpoch = state.stopEpoch;
+  const running = state.running;
+  const task = state.currentTask;
+  const taskProtection = () => Boolean(task && (task.invitationAccepted || task.claimed || task.seatLocked || task.seatLockedAt));
+  const protectedTask = taskProtection();
+  const lastXResult = state.lastXResult;
+  const completionEvidence = state.completionEvidence;
+  const current = () => isCurrent() && runtimeState === state && state.runId === runId
+    && state.stopEpoch === stopEpoch && state.running === running && !state.manuallyStopped
+    && !state.uncertainAction && state.currentTask === task && taskProtection() === protectedTask
+    && state.lastXResult === lastXResult && state.completionEvidence === completionEvidence;
+  const cancelled = () => ({ ok: false, cancelled: true, message: "流程已变化，取消旧脚本就绪检查" });
+  const failure = message => ({ ok: false, runnerUnavailable: true, message: message || "Lighthouse 主执行脚本未就绪，未发送接单动作" });
+  if (!current()) return cancelled();
+  const version = chrome.runtime.getManifest()?.version || "";
+  const probe = async () => {
+    let timer;
+    try {
+      return await Promise.race([
+        chrome.tabs.sendMessage(tabId, { type: "CHECK_LIGHTHOUSE_RUNNER_READY", platform: "lighthouse" }),
+        new Promise(resolve => { timer = setTimeout(() => resolve(null), 2000); })
+      ]);
+    } catch (_) { return null; }
+    finally { clearTimeout(timer); }
+  };
+  const valid = result => result?.ok === true && result.version === version
+    && typeof result.instanceId === "string" && result.instanceId.length > 0
+    && isLighthouseUrl(result.url) && typeof result.paused === "boolean";
+  let result = await probe();
+  if (!current()) return cancelled();
+  if (valid(result)) return result.paused ? failure("Lighthouse 主执行脚本仍处于暂停状态，未发送接单动作") : { ok: true };
+  if (!await ensureContentScriptInjected(tabId, current)) {
+    if (!current()) return cancelled();
+    return failure();
+  }
+  if (!current()) return cancelled();
+  await delay(300);
+  if (!current()) return cancelled();
+  result = await probe();
+  if (!current()) return cancelled();
+  return valid(result) && !result.paused ? { ok: true } : failure();
+}
+
+async function refreshLighthouseCampaignsTab(tabId, reason = "", isCurrent = () => true, preserveAutoInvitation = false) {
   const cancelled = () => ({ ok: false, cancelled: true, skippedCooldown: false, message: "流程已变化，取消旧任务广场刷新" });
   if (!isCurrent()) return cancelled();
   if (!tabId) {
@@ -2878,6 +2987,12 @@ async function refreshLighthouseCampaignsTab(tabId, reason = "", isCurrent = () 
     if (!isCurrent()) return cancelled();
     if (readyBeforeReload === false && !await waitForCampaignsReloadReadiness(tabId, isCurrent)) throw new Error("刷新前 Lighthouse 页面加载超时");
     if (!isCurrent()) return cancelled();
+    if (preserveAutoInvitation) {
+      const invitation = await checkLighthouseInvitationBeforeRefresh(tabId, isCurrent);
+      if (!isCurrent() || invitation.cancelled) return cancelled();
+      if (!invitation.ok) return { ...invitation, skippedCooldown: false };
+      if (invitation.invitationPending) return { ok: true, invitationPending: true, skippedCooldown: false };
+    }
     log("info", reason || "准备刷新 Lighthouse 任务广场");
     await chrome.tabs.reload(tabId);
     if (!isCurrent()) return cancelled();
@@ -2894,13 +3009,22 @@ async function refreshLighthouseCampaignsTab(tabId, reason = "", isCurrent = () 
   }
 }
 
-async function reloadLighthouseCampaignsAfterOrder(tabId, reason = "", isCurrent = () => true) {
+async function reloadLighthouseCampaignsAfterOrder(tabId, reason = "", isCurrent = () => true, preserveAutoInvitation = false) {
   if (!isCurrent()) return false;
   if (!Number.isInteger(tabId)) {
     log("warn", "订单结束后缺少 Lighthouse 任务广场标签页，无法重新加载");
     return false;
   }
   try {
+    if (preserveAutoInvitation) {
+      const invitation = await checkLighthouseInvitationBeforeRefresh(tabId, isCurrent);
+      if (!isCurrent() || invitation.cancelled) return false;
+      if (!invitation.ok) throw new Error(invitation.message);
+      if (invitation.invitationPending) {
+        log("info", "检测到专属任务邀请，保留当前页面继续扫描");
+        return true;
+      }
+    }
     await chrome.tabs.reload(tabId);
     if (!isCurrent()) return false;
     const loaded = await waitForTabComplete(tabId);
@@ -2947,7 +3071,7 @@ async function closeLighthouseDetailToCampaigns(tabId, settings, reason, isCurre
   return false;
 }
 
-async function closeLighthouseTaskDetail(tabId, settings, reason, isCurrent = () => true) {
+async function closeLighthouseTaskDetail(tabId, settings, reason, isCurrent = () => true, preserveAutoInvitation = false) {
   if (!tabId || !isCurrent()) return false;
   const runId = runtimeState.runId;
   try {
@@ -2966,6 +3090,16 @@ async function closeLighthouseTaskDetail(tabId, settings, reason, isCurrent = ()
       return true;
     }
     log("warn", result?.message || "任务详情关闭未确认");
+    // A new invitation may have appeared while the close receipt was pending.
+    if (preserveAutoInvitation) {
+      const invitation = await checkLighthouseInvitationBeforeRefresh(tabId, isCurrent);
+      if (!isCurrent() || invitation.cancelled) return false;
+      if (!invitation.ok) throw new Error(invitation.message);
+      if (invitation.invitationPending) {
+        log("info", "检测到专属任务邀请，保留当前页面继续扫描");
+        return true;
+      }
+    }
     // A stuck Lighthouse drawer can remain in the DOM after every close
     // gesture. Reloading the campaigns tab is the reliable recovery path.
     await chrome.tabs.reload(tabId);
@@ -3358,6 +3492,36 @@ function isLimitReached(count, limit) {
   return count >= parsedLimit;
 }
 
+function validateLighthouseInvitationCheckpoint(message, state, intent) {
+  const task = message.invitationTask;
+  const tweetUrl = normalizeTweetUrl(task?.tweetUrl);
+  const tweetIdentity = normalizeTweetUrl(task?.tweetUrl, true);
+  const taskKey = tweetIdentity ? `invitation:${tweetIdentity}` : "";
+  if (!["START_LIGHTHOUSE_COMMENT_TASK", "DEBUG_OPEN_FIRST_COMMENT_TASK"].includes(intent.type)
+      || message.operationType !== intent.type || !task || task.source !== "lighthouse_invitation"
+      || !taskKey || task.taskKey !== taskKey || !String(task.taskType || "").trim()
+      || task.invitationAccepted || task.claimed || task.seatLocked || task.seatLockedAt) {
+    return { ok: false, error: "专属邀请身份或操作不匹配，未允许点击" };
+  }
+  if (state.completionEvidence || state.lastXResult || [state.currentTask].some(current => current && (
+      current.invitationAccepted || current.claimed || current.seatLocked || current.seatLockedAt))) {
+    return { ok: false, error: "已有订单或动作结果需要核对，未允许接取专属邀请" };
+  }
+  const sameInvitation = current => current.taskKey === taskKey
+    && normalizeTweetUrl(current.tweetUrl, true) === tweetIdentity;
+  if ((intent.taskKey && intent.taskKey !== taskKey)
+      || (state.currentTask && !sameInvitation(state.currentTask))
+      || (state.selectedTask && !sameInvitation(state.selectedTask))) {
+    return { ok: false, error: "专属邀请与当前订单不同，未覆盖原订单" };
+  }
+  return { ok: true, task: {
+    source: "lighthouse_invitation", taskKey, tweetUrl,
+    taskType: String(task.taskType).trim(),
+    bounty: Number.isFinite(Number(task.bounty)) ? Number(task.bounty) : 0,
+    title: String(task.title || task.candidateTitle || "专属任务邀请")
+  } };
+}
+
 async function recordLighthouseClaimCheckpoint(message, sender) {
   const state = runtimeState;
   const intent = state.uncertainAction;
@@ -3380,10 +3544,23 @@ async function recordLighthouseClaimCheckpoint(message, sender) {
     }
   } else if (message.phase === "before_click" && intent.checkpointVersion === 1
       && intent.contentInstanceId === message.instanceId) {
+    let invitation = Object.hasOwn(message, "invitationTask")
+      ? validateLighthouseInvitationCheckpoint(message, state, intent) : null;
+    if (invitation && !invitation.ok) return invitation;
     const settings = await getSettings();
     if (!ownsIntent()) return { ok: false, cancelled: true };
-    const error = missingAIKeyMessage(settings, state.currentTask || state.selectedTask);
+    if (invitation) {
+      invitation = validateLighthouseInvitationCheckpoint(message, state, intent);
+      if (!invitation.ok) return invitation;
+    }
+    const error = missingAIKeyMessage(settings, invitation?.task || state.currentTask || state.selectedTask);
     if (error) return { ok: false, error };
+    // Bind the invitation identity before permitting either acceptance or the
+    // later lock click in this same operation. Worker recovery needs both.
+    if (invitation) {
+      state.currentTask = mergeTaskPreservingCapturedTweetUrl(state.currentTask, invitation.task);
+      intent.taskKey = invitation.task.taskKey;
+    }
     // Set in memory before yielding, then persist before acknowledging. A
     // refresh during either await must never release an authorized click.
     intent.claimActionAttempted = true;
@@ -3392,6 +3569,10 @@ async function recordLighthouseClaimCheckpoint(message, sender) {
   }
   await persistAutoRunState(true);
   if (!ownsIntent()) return { ok: false, cancelled: true };
+  if (message.phase === "before_click" && Object.hasOwn(message, "invitationTask")) {
+    const invitation = validateLighthouseInvitationCheckpoint(message, state, intent);
+    if (!invitation.ok) return invitation;
+  }
   return { ok: true, checkpointRegistered: true, permitClaimClick: message.phase === "before_click",
     claimIntentId: intent.intentId, instanceId: intent.contentInstanceId };
 }
@@ -3445,6 +3626,15 @@ async function sendToTab(tabId, payload) {
         return { ok: false, uncertain: true, message: "旧动作结果未知，禁止重复执行，请先核对本单" };
       }
       if (claimsOrder && !claimIntent) {
+        if (payload.type !== "RUN_X_WIDGET_CLAIM") {
+          const preparingTask = runtimeState.currentTask;
+          const ready = await ensureLighthouseRunnerReady(tabId, () => !stale() && runtimeState.running && !runtimeState.manuallyStopped);
+          if (!ready.ok) return { ...ready, claimActionAttempted: false };
+          if (stale() || !runtimeState.running || runtimeState.manuallyStopped
+              || runtimeState.uncertainAction || runtimeState.currentTask !== preparingTask) {
+            return { ok: false, cancelled: true, claimActionAttempted: false, message: "流程已变化，未准备旧接单动作" };
+          }
+        }
         claimIntent = { type: payload.type, taskKey: payload.task?.taskKey || "", runId: payload.runId, tabId, intentId: createRunId(),
           checkpointRequired: payload.type !== "RUN_X_WIDGET_CLAIM" };
         payload.claimIntentId = claimIntent.intentId;
@@ -5260,8 +5450,14 @@ async function handleAutoRunKeepaliveTick() {
       try {
         const options = runtimeState.startOptions || {};
         const windowId = getRuntimeWindowId();
-        log("info", `Lighthouse 任务广场连续 5 分钟无活动（${isSelectingTaskStage ? "任务选择阶段" : "流程空闲阶段"}），停止当前运行并重新执行全量检测`);
         const marketplaceTabId = runtimeState.lighthouseTabId;
+        const unclaimedTask = hasUnclaimedTask ? currentTask : null;
+        const invitation = await checkLighthouseInvitationBeforeRefresh(marketplaceTabId, ownsRecovery, false, unclaimedTask);
+        if (!ownsRecovery() || invitation.cancelled) return;
+        if (!invitation.ok) throw new Error(invitation.message);
+        log("info", invitation.invitationPending
+          ? "任务广场出现专属邀请，保留页面并重新检测"
+          : `Lighthouse 任务广场连续 5 分钟无活动（${isSelectingTaskStage ? "任务选择阶段" : "流程空闲阶段"}），停止当前运行并重新执行全量检测`);
         await cancelCurrentRun(ownsRecovery);
         if (!ownsRecovery()) return;
         await clearAutoRunResumeSchedule();
@@ -5270,12 +5466,17 @@ async function handleAutoRunKeepaliveTick() {
         if (!ownsRecovery()) return;
         await clearCampaignsIdleReloadAlarm();
         if (!ownsRecovery()) return;
+        // An invitation can arrive while the old scan is being cancelled.
+        const latestInvitation = await checkLighthouseInvitationBeforeRefresh(marketplaceTabId, ownsRecovery, true, unclaimedTask);
+        if (!ownsRecovery() || latestInvitation.cancelled) return;
+        if (!latestInvitation.ok) throw new Error(latestInvitation.message);
+        const preserveInvitation = invitation.invitationPending || latestInvitation.invitationPending;
         runtimeState.running = false;
         runtimeState.scheduledResumeAt = 0;
         recoveringRunId = runtimeState.runId = createRunId();
         clearXOpenWatch();
         setStage("stopped");
-        if (Number.isInteger(marketplaceTabId)) {
+        if (Number.isInteger(marketplaceTabId) && !preserveInvitation) {
           await chrome.tabs.reload(marketplaceTabId);
           if (!ownsRecovery()) return;
           const reloaded = await waitForTabComplete(marketplaceTabId);

@@ -1,8 +1,19 @@
 "use strict";
 const test=require("node:test"),assert=require("node:assert/strict"),fs=require("node:fs"),path=require("node:path"),Module=require("node:module"),vm=require("node:vm");
 const fixture=path.join(__dirname,"session-api-key.test.cjs"), source=fs.readFileSync(fixture,"utf8"), loaded=new Module(fixture,module);
+const version=JSON.parse(fs.readFileSync(path.join(__dirname,"../manifest.json"),"utf8")).version;
 loaded.filename=fixture;loaded._compile(source.slice(0,source.indexOf('test("legacy key'))+"\nmodule.exports={worker,deferred,flush,SESSION_KEY};",fixture);
-const {worker,deferred,flush,SESSION_KEY}=loaded.exports;
+const {worker:sessionWorker,deferred,flush,SESSION_KEY}=loaded.exports;
+async function worker(...args){
+  const w=await sessionWorker(...args),send=w.chrome.tabs.sendMessage;
+  const manifest=w.chrome.runtime.getManifest();w.chrome.runtime.getManifest=()=>({...manifest,version});
+  w.chrome.tabs.sendMessage=async(id,message)=>{
+    if(message.type!=="CHECK_LIGHTHOUSE_RUNNER_READY")return send(id,message);
+    w.actions.push({id,message:JSON.parse(JSON.stringify(message))});
+    return{ok:true,version:w.chrome.runtime.getManifest().version,instanceId:"fixture-page",url:"https://app.lhdao.top/campaigns",paused:false};
+  };
+  return w;
+}
 const missing=/API Key|会话.*密钥/i;
 const claims=w=>w.actions.filter(x=>/START_LIGHTHOUSE_COMMENT_TASK|LOCK|RUN_X_WIDGET_CLAIM|OPEN_SELECTED/.test(x.message?.type||""));
 

@@ -486,7 +486,7 @@ if (platform === "lighthouse") {
     let reloads = 0;
     let restarts = 0;
     const old = Date.now() - 5 * 60 * 1000 - 1;
-    const context = contextFor(background, ["handleAutoRunKeepaliveTick"], {
+    const context = contextFor(background, ["checkLighthouseInvitationBeforeRefresh", "handleAutoRunKeepaliveTick"], {
       CAMPAIGNS_IDLE_REFRESH_MS: 5 * 60 * 1000,
       runtimeStateReady: Promise.resolve(),
       runtimeState: {
@@ -496,7 +496,13 @@ if (platform === "lighthouse") {
       },
       chrome: {
         runtime: { async getPlatformInfo() {} },
-        tabs: { async reload() { reloads += 1; } }
+        tabs: {
+          async reload() { reloads += 1; },
+          async sendMessage(_tabId, message) {
+            assert.equal(message.type, "CHECK_LIGHTHOUSE_INVITATION");
+            return { ok: true, invitationPending: false };
+          }
+        }
       },
       getRuntimeWindowId: () => 3,
       createRunId: () => "watchdog-run",
@@ -1381,7 +1387,9 @@ if (platform === "xinhuo") {
     let clicks = 0;
     let waits = 0;
     const button = { innerText: "接受邀请" };
-    const c = contextFor(page, ["acceptInvitationIfPresent"], {
+    const c = contextFor(page, ["findStandaloneInvitation", "assertNoStandaloneInvitation", "acceptInvitationIfPresent"], {
+      document: { querySelectorAll: () => [button] },
+      isVisible: () => true,
       findInvitationAcceptButton: () => button,
       clickElement: async (node, options) => {
         assert.equal(node, button);

@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const sourceRoot = process.env.LIGHTHOUSE_TEST_SOURCE_ROOT || path.join(__dirname, "../src");
+const version = JSON.parse(fs.readFileSync(path.join(__dirname, "../manifest.json"), "utf8")).version;
 const STATE_KEY = "lighthouseAutoRunStateV1";
 const KEEPALIVE = "lighthouseAutoRunKeepaliveV1";
 const clone = value => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -21,7 +22,7 @@ async function boot(t, stored) {
   const chrome = {
     runtime: {
       id: "test", getURL: (value) => `chrome-extension://test/${value}`,
-      getManifest: () => ({ version: "test" }), onInstalled: event, onMessage: event,
+      getManifest: () => ({ version }), onInstalled: event, onMessage: event,
       async getPlatformInfo() { calls.browser.push({ type: "getPlatformInfo" }); return { os: "mac" }; },
     },
     storage: { session: require("./session-fixture.cjs")(), local: {
@@ -46,7 +47,14 @@ async function boot(t, stored) {
       async create(options) { calls.browser.push({ type: "createTab", options: clone(options) }); return tab(21); },
       async update(id, options) { calls.browser.push({ type: "updateTab", id, options: clone(options) }); return tab(id); },
       async reload(id) { calls.browser.push({ type: "reloadTab", id }); },
-      async sendMessage(id, payload) { calls.browser.push({ type: "sendMessage", id, payload: clone(payload) }); return { ok: true }; },
+      async sendMessage(id, payload) {
+        calls.browser.push({ type: "sendMessage", id, payload: clone(payload) });
+        if (payload.type === "CHECK_LIGHTHOUSE_RUNNER_READY") {
+          return { ok: true, version, instanceId: "fixture-page", url: tab(id).url, paused: false };
+        }
+        if (payload.type === "CHECK_LIGHTHOUSE_INVITATION") return { ok: true, invitationPending: false };
+        return { ok: true };
+      },
     },
     scripting: { async executeScript(options) { calls.browser.push({ type: "executeScript", options: clone(options) }); return []; } },
   };

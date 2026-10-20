@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const version = JSON.parse(fs.readFileSync(path.join(__dirname, "../manifest.json"), "utf8")).version;
 
 // Keep the real listener, invitation selector/click, task builder and page
 // confirmation loop. Only DOM/navigation adapters and the clock are fixtures.
@@ -98,7 +99,7 @@ async function receiptWorker(responseFactory) {
   let c, intent;
   const chrome = {
     runtime: { id: "test", getURL: (p) => `chrome-extension://test/${p}`,
-      getManifest: () => ({ version: "test" }), onInstalled: event, onMessage: event },
+      getManifest: () => ({ version }), onInstalled: event, onMessage: event },
     storage: { session: require("./session-fixture.cjs")(), local: { setAccessLevel: async () => {},
       get: async (keys) => Object.fromEntries(keys.map((key) => [key, stored[key]])),
       set: async (values, callback) => { Object.assign(stored, copy(values)); callback?.(); }
@@ -106,6 +107,9 @@ async function receiptWorker(responseFactory) {
     alarms: { onAlarm: event, create: async () => {}, clear: async () => {} },
     tabs: { onCreated: event, onUpdated: event, onRemoved: event,
       sendMessage: async (_id, message) => {
+        if (message.type === "CHECK_LIGHTHOUSE_RUNNER_READY") {
+          return { ok: true, version, instanceId: "fixture-page", url: "https://app.lhdao.top/campaigns", paused: false };
+        }
         sent.push(copy(message));
         intent = vm.runInContext("runtimeState.uncertainAction", c);
         return responseFactory(message);

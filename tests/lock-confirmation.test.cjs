@@ -9,6 +9,7 @@ const RUN = "lock-confirmation-run";
 const INTENT = "lock-confirmation-intent";
 const URL_X = "https://x.com/fixture/status/123";
 const source = fs.readFileSync(path.join(process.env.LIGHTHOUSE_TEST_SOURCE_ROOT || path.join(__dirname, "../src"), "content/lighthouse.js"), "utf8");
+const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "../manifest.json"), "utf8"));
 
 function node(text, options = {}) {
   return {
@@ -373,7 +374,7 @@ async function worker(t, p) {
   const tab = { id: 11, windowId: 1, status: "complete", url: "https://app.lhdao.top/campaigns" };
   const chrome = {
     runtime: { id: "test", onInstalled: event, onMessage: event,
-      getURL: value => `chrome-extension://test/${value}`, getManifest: () => ({ version: "test" }) },
+      getURL: value => `chrome-extension://test/${value}`, getManifest: () => manifest },
     storage: { session: require("./session-fixture.cjs")(), local: { async setAccessLevel() {},
       async get(keys) { return Object.fromEntries(keys.map(key => [key, copy(stored[key])])); },
       async set(values, callback) { Object.assign(stored, copy(values)); callback?.(); },
@@ -382,6 +383,8 @@ async function worker(t, p) {
     tabs: { onCreated: event, onUpdated: event, onRemoved: event,
       async get() { return tab; }, async query() { return [tab]; },
       async sendMessage(_id, message) {
+        // Keep readiness on the real content listener, outside the action log.
+        if (message.type === "CHECK_LIGHTHOUSE_RUNNER_READY") return p.dispatch(message.type, message);
         effects.push(message.type);
         return p.dispatch(message.type);
       },

@@ -9,6 +9,7 @@ const vm = require("node:vm");
 // older checkout. All browser APIs are local fixtures; no site is contacted.
 const sourceRoot = process.env.LIGHTHOUSE_TEST_SOURCE_ROOT || path.join(__dirname, "../src");
 const read = (file) => fs.readFileSync(path.join(sourceRoot, file), "utf8");
+const manifest = JSON.parse(fs.readFileSync(path.join(sourceRoot, "../manifest.json"), "utf8"));
 const clone = (value) => JSON.parse(JSON.stringify(value));
 const deferred = () => { let resolve; const promise = new Promise((yes) => { resolve = yes; }); return { promise, resolve }; };
 const event = { addListener() {} };
@@ -20,7 +21,7 @@ const noNetwork = async () => { throw Error("Network forbidden in manual takeove
 async function worker() {
   const stored = {}, sent = [], hooks = {};
   const chrome = {
-    runtime: { id: "test", getURL: (p) => `chrome-extension://test/${p}`, getManifest: () => ({ version: "test" }),
+    runtime: { id: "test", getURL: (p) => `chrome-extension://test/${p}`, getManifest: () => manifest,
       onInstalled: event, onMessage: event },
     storage: { session: require("./session-fixture.cjs")(), local: { setAccessLevel: async () => {},
       async get(keys) { return Object.fromEntries(keys.filter(key => Object.hasOwn(stored, key)).map((key) => [key, stored[key]])); },

@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.113";
+  const SCRIPT_VERSION = "0.7.115";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -18,8 +18,8 @@
   };
 
   const DETAIL_BUTTON_TEXTS = ["查看详情", "详情", "评论留言", "去完成", "开始任务", "领取任务", "查看推文", "前往目标", "打开目标"];
-  const INVITATION_MARKERS = ["邀请接单", "邀请任务", "接单邀请", "受邀任务", "邀请单", "被邀请"];
-  const INVITATION_ACCEPT_BUTTON_TEXTS = ["接受邀请", "确认邀请", "同意接单", "接受接单", "立即接单"];
+  const INVITATION_MARKERS = ["邀请接单", "邀请任务", "接单邀请", "受邀任务", "邀请单", "被邀请", "专属任务邀请"];
+  const INVITATION_ACCEPT_BUTTON_TEXTS = ["接受邀请", "确认邀请", "同意接单", "接受接单", "立即接单", "接受并开始"];
   const LOCK_BUTTON_TEXTS = ["锁定席位", "锁定名额", "抢占席位", "领取任务", "开始任务", "去评论"];
   const DONE_BUTTON_TEXTS = ["我已评论", "提交验证", "提交验证任务", "我已完成", "已完成", "完成任务", "提交任务", "验证任务", "领取奖励"];
   const COMMENT_MARKERS = ["评论留言", "评论", "回复"];
@@ -109,12 +109,23 @@
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!isCurrentInstance()) return false;
+    if (message.type === "CHECK_LIGHTHOUSE_RUNNER_READY") {
+      sendResponse({ ok: message.platform === "lighthouse", version: SCRIPT_VERSION,
+        instanceId: INSTANCE_ID, url: location.href, paused: automationPaused });
+      return true;
+    }
     // Order reconciliation is observational. It must also work after the run
     // was cancelled or the worker restarted, without reviving that run.
     if (message.type === "CHECK_LIGHTHOUSE_ORDER_OUTCOME") {
       const outcome = message.platform === "lighthouse" ? readBoundOrderOutcome(message.task) : { outcome: "unknown" };
       sendResponse({ ok: message.platform === "lighthouse", ...outcome,
         runId: message.runId, claimIntentId: message.claimIntentId });
+      return true;
+    }
+    if (message.type === "CHECK_LIGHTHOUSE_INVITATION") {
+      const pending = message.platform === "lighthouse" && Boolean(findStandaloneInvitation());
+      sendResponse({ ok: message.platform === "lighthouse",
+        pending, invitationPending: pending });
       return true;
     }
     if (message.type === "AUTOMATION_PAUSE_CHANGED") {
@@ -155,7 +166,8 @@
       CONFIRM_LIGHTHOUSE_LOCKED_TASK_NOTICE: () => confirmLockedTaskNotice(message),
       BEGIN_LIGHTHOUSE_COMPLETION_WATCH: () => beginCompletionWatch(message),
       CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION: () => checkOfficialCompletion(message),
-      DEBUG_LOCK_SEAT_AND_EXTRACT: () => debugLockSeatAndExtract(message.settings),
+      DEBUG_LOCK_SEAT_AND_EXTRACT: () => debugLockSeatAndExtract(message.settings,
+        message.task?.source === "lighthouse_invitation" ? message.task : null),
       DEBUG_CLICK_I_DONE: () => debugClickDone(message.settings),
       WAIT_LIGHTHOUSE_COMPLETION_RETURN: () => waitForTaskCompletionAndReturn(message.settings, message),
       READ_LIGHTHOUSE_TODAY_INCOME: () => readPlazaTodayIncome(),
@@ -190,6 +202,7 @@
       type: message.type,
       claimIntentId: message.claimIntentId || "",
       checkpointRequired: message.claimCheckpointRequired === true,
+      boundTask: message.task || message.selectedTask || null,
       claimActionAttempted: false
     } : null;
     if (operation) claimOperation = operation;
@@ -326,7 +339,8 @@
     assertActiveRun(runId);
     let lockResult;
     try {
-      lockResult = await debugLockSeatAndExtract(settings);
+      lockResult = await debugLockSeatAndExtract(settings,
+        openResult.task?.source === "lighthouse_invitation" ? openResult.task : null);
     } catch (error) {
       // Detail text and its taskKey can change with the countdown. Preserve
       // the selected list identity so deferred retries exclude the same card.
@@ -353,16 +367,24 @@
   async function debugOpenFirstCommentTask(settings, message = {}) {
     const runId = activeRunId;
     report("info", "准备打开评论或点赞互动任务");
+    let invitation = findStandaloneInvitation();
+    if (invitation) return await openStandaloneInvitation(settings, invitation)
+      || debugOpenFirstCommentTask(settings, message);
     await ensureCampaignsPage(settings);
     assertActiveRun(runId);
-    await confirmPagePhase(["campaigns"], settings, "打开评论任务前");
+    await confirmPagePhase(["campaigns"], settings, "打开评论任务前", { allowInvitation: true });
     assertActiveRun(runId);
+    invitation = findStandaloneInvitation();
+    if (invitation) return await openStandaloneInvitation(settings, invitation)
+      || debugOpenFirstCommentTask(settings, message);
     await ensureAllTaskFilter(settings);
     assertActiveRun(runId);
-    await confirmPagePhase(["campaigns"], settings, "全部筛选后");
+    await confirmPagePhase(["campaigns"], settings, "全部筛选后", { allowInvitation: true });
 
     const selection = await selectNextCommentTask(settings, message.attemptedTaskKeys || [], message.attemptedTaskRecords || []);
     assertActiveRun(runId);
+    if (selection?.invitation) return await openStandaloneInvitation(settings, selection.invitation)
+      || debugOpenFirstCommentTask(settings, message);
     if (!selection || !selection.target) {
       throw new Error("未找到可执行或可等待的评论或点赞互动任务");
     }
@@ -943,11 +965,19 @@
     return score;
   }
 
-  async function debugLockSeatAndExtract(settings) {
+  async function debugLockSeatAndExtract(settings, expectedInvitation = null) {
     report("info", "详情页已加载，检查是否可立即锁定席位");
     await confirmPagePhase(["detail_ready"], settings, "锁定席位前");
 
-    const taskBeforeClick = buildTask(settings);
+    let taskBeforeClick = buildTask(settings);
+    if (expectedInvitation) {
+      assertInvitationTarget(expectedInvitation);
+      // Candidate messages also update the worker. Keep the persisted invitation
+      // identity through both candidate reports and the later lock checkpoint.
+      taskBeforeClick = { ...taskBeforeClick, ...expectedInvitation,
+        taskType: mergeTaskTypes(expectedInvitation.taskType, taskBeforeClick.taskType),
+        detailText: taskBeforeClick.detailText };
+    }
     if (taskBeforeClick.tweetUrl) {
       sendRuntimeMessage({ type: "DEBUG_TASK_CANDIDATE", runId: activeRunId, task: taskBeforeClick });
     }
@@ -981,8 +1011,9 @@
     }
 
     lockButton.scrollIntoView({ block: "center", inline: "center" });
+    if (expectedInvitation) assertInvitationTarget(expectedInvitation);
     const lockObservation = observeLockAttempt(taskBeforeClick);
-    await clickAndVerifyLock(lockButton, settings, lockObservation);
+    await clickAndVerifyLock(lockButton, settings, lockObservation, expectedInvitation);
     await confirmPagePhase(["detail_ready"], settings, "锁定席位后", { timeoutMs: 2500 });
     if (!isSameLockDetail(lockObservation)) {
       const error = new Error("锁位确认期间任务详情已变化，未确认当前订单状态，请核对本单");
@@ -1045,6 +1076,7 @@
   }
 
   async function ensureAllTaskFilter(settings) {
+    if (findStandaloneInvitation()) return;
     const allButton = findClickableByText("全部", true) || findVisibleControlByText("全部", true);
     if (!allButton) {
       report("warn", "未找到全部筛选按钮，继续从当前列表识别评论/点赞互动任务");
@@ -1056,7 +1088,8 @@
     }
     allButton.scrollIntoView({ block: "center", inline: "center" });
     await wait(settings.actionDelayMs);
-    await clickElement(allButton);
+    if (findStandaloneInvitation()) return;
+    await clickElement(allButton, { beforeClick: assertNoStandaloneInvitation });
     await verifyAllFilterAccepted(settings);
   }
 
@@ -1075,6 +1108,8 @@
 
     while (true) {
       assertActiveRun(runId);
+      const invitation = findStandaloneInvitation();
+      if (invitation) return { invitation };
       if (isTaskDetailOrRecoverableOverlayOpen()) {
         if (!overlaySince) overlaySince = Date.now();
         if (Date.now() - overlaySince > getDetailOverlayStaleMs(settings)) {
@@ -1457,7 +1492,135 @@
       }) || null;
   }
 
+  function findStandaloneInvitation() {
+    const prompts = [];
+    const buttons = Array.from(document.querySelectorAll?.("button,a,[role='button'],input[type='button'],input[type='submit']") || [])
+      .filter((node) => isVisible(node) && buttonText(node).replace(/[→↗]/g, "").trim() === "接受并开始");
+    for (const button of buttons) {
+      let root = button.parentElement;
+      for (let depth = 0; root && depth < 12; depth += 1, root = root.parentElement) {
+        if (root === document.body || root === document.documentElement) break;
+        const rawText = root.innerText || root.textContent || "";
+        if (!normalize(rawText).includes("专属任务邀请")) continue;
+        const overlay = root.closest?.("[role='dialog'],[role='alertdialog'],[aria-modal='true']");
+        if (!overlay && getComputedStyle(root).position !== "fixed") continue;
+        const links = Array.from(root.querySelectorAll?.("a[href]") || []);
+        const targetLinks = links.filter(node => /查看目标推文|目标推文/.test(buttonText(node)));
+        const targetUrls = (targetLinks.length ? targetLinks : links)
+          .map(node => normalizeTweetUrl(node.href || node.getAttribute("href") || "")).filter(Boolean);
+        const targets = [...new Set(targetUrls.map(url => normalizeTweetUrl(url, true)))];
+        const tweetUrl = targets.length === 1 ? targetUrls[0] : "";
+        const header = rawText.split(/目标推文|TARGET TWEET/i)[0];
+        const nodes = Array.from(root.querySelectorAll("*"));
+        const targetIndex = nodes.findIndex(node => targetLinks.includes(node)
+          || /^(?:查看)?目标推文$|^TARGET TWEET$/i.test(buttonText(node)));
+        const badges = nodes.slice(0, Math.max(targetIndex, 0)).filter(isVisible)
+          .map(node => buttonText(node)).filter(text => text.length <= 32);
+        const taskType = detectScopedTaskType([...header.split(/\n+/), ...badges]
+          .map(detectScopedTaskType).filter(Boolean).join("+"));
+        const task = {
+          source: "lighthouse_invitation", title: extractTitle(root),
+          taskKey: tweetUrl ? `invitation:${targets[0]}` : "", tweetUrl, taskType,
+          bounty: parseCandidateBounty(header), handle: extractHandle(rawText),
+          detailText: normalize(rawText).slice(0, 1800), createdAt: new Date().toISOString()
+        };
+        if (!prompts.some(prompt => prompt.root === root)) prompts.push({ root, button, task });
+        break;
+      }
+    }
+    if (prompts.length > 1) return { ...prompts[0], ambiguous: true };
+    return prompts[0] || null;
+  }
+
+  function assertNoStandaloneInvitation() {
+    if (!findStandaloneInvitation()) return;
+    const error = new Error("专属任务邀请已出现，保留弹窗并重新识别，不操作底层任务");
+    error.transient = true;
+    throw error;
+  }
+
+  function assertInvitationTarget(task) {
+    const root = findTaskDetailRoot();
+    if (findStandaloneInvitation() || !root || root === document.body
+        || !task.tweetUrl || normalizeTweetUrl(extractTweetUrl(root), true) !== normalizeTweetUrl(task.tweetUrl, true)) {
+      const error = new Error("邀请接单后的目标任务不匹配，已保留本单等待核对");
+      error.task = task;
+      throw error;
+    }
+  }
+
+  async function openStandaloneInvitation(settings, invitation) {
+    const runId = activeRunId;
+    const operation = claimOperation;
+    const task = invitation.task;
+    const fail = (message) => {
+      const error = new Error(message);
+      error.task = task;
+      throw error;
+    };
+    if (!operation || !["START_LIGHTHOUSE_COMMENT_TASK", "DEBUG_OPEN_FIRST_COMMENT_TASK"].includes(operation.type)
+        || operation.claimActionAttempted || operation.invitationTask || operation.boundTask) {
+      fail("当前接单操作已绑定其他任务，未接受新的专属邀请");
+    }
+    const isSamePrompt = () => {
+      assertActiveRun(runId);
+      const current = findStandaloneInvitation();
+      if (claimOperation !== operation || !current || current.ambiguous
+          || current.root !== invitation.root || current.button !== invitation.button
+          || current.task.taskKey !== task.taskKey || current.task.taskType !== task.taskType
+          || current.task.bounty !== task.bounty) fail("专属任务邀请已变化，未操作旧邀请");
+      if (Array.from(current.root.querySelectorAll("p,span,div,[role='status'],[role='alert']"))
+          .filter(isVisible).some(node => /^(?:(?:本次|该)?(?:专属|任务)?邀请|任务邀请)(?:已|已经)?(?:过期|失效|结束|撤销)(?:[，。！!\s]|$)/
+            .test(normalize(node.innerText || node.textContent || "")))) {
+        fail("专属任务邀请已失效，未点击接受");
+      }
+      return current;
+    };
+    const minBounty = await getLiveAutoMinTaskBounty(settings);
+    const current = isSamePrompt();
+    if (invitation.ambiguous || !task.taskKey || !task.tweetUrl) fail("专属任务邀请缺少唯一目标推文，未接受任务");
+    const restriction = getEligibilityBlockReason(normalize(current.root.innerText || ""));
+    const blocked = restriction || (!isAutomatableTaskType(task.taskType) ? "任务类型不支持自动执行" : "")
+      || (hasUnsupportedCommentGuidance(current.root.innerText || "") ? "任务要求人工提供内容" : "")
+      || (isBelowMinTaskBounty(task.bounty, minBounty) ? "低于设置的最低赏金" : "");
+    if (blocked) {
+      const skip = Array.from(current.root.querySelectorAll("button,[role='button']"))
+        .find(node => isVisible(node) && !isDisabled(node) && buttonText(node) === "跳过");
+      if (!skip) fail(`专属任务邀请${blocked}，未接受任务`);
+      await clickElement(skip, { randomDelay: false, beforeClick: () => { isSamePrompt(); } });
+      await wait(Math.max(150, settings.actionDelayMs || 150));
+      assertActiveRun(runId);
+      if (findStandaloneInvitation()?.root === invitation.root) fail("跳过邀请后弹窗仍存在，未重复操作");
+      report("info", `已跳过专属任务邀请：${blocked}`);
+      return null;
+    }
+    if (isDisabled(current.button)) fail("专属任务邀请的接受按钮尚不可用，未重复操作");
+    operation.invitationTask = task;
+    await clickElement(current.button, { randomDelay: false, claimAction: true, beforeClick: () => {
+      const fresh = isSamePrompt();
+      if (isDisabled(fresh.button) || getEligibilityBlockReason(normalize(fresh.root.innerText || ""))
+          || hasUnsupportedCommentGuidance(fresh.root.innerText || "")) {
+        fail("专属任务邀请已不可接受，未点击");
+      }
+    } });
+    report("info", "已点击接受专属任务邀请，核对同一任务后继续执行");
+    const started = Date.now();
+    while (Date.now() - started < Math.min(getPageWaitMs(settings), 30000)) {
+      assertActiveRun(runId);
+      if (!findInvitationAcceptButton({ includeDisabled: true }) && isTaskDetailOpen()) {
+        assertInvitationTarget(task);
+        const detail = buildTask(settings, task.taskType);
+        assertSupportedDetailTask(detail, settings);
+        return { ok: true, detailConfirmed: true, message: "已接受专属邀请并核对本单详情",
+          task: { ...detail, ...task, detailText: detail.detailText } };
+      }
+      await wait(Math.min(Math.max(settings.cooldownPollMs || 250, 100), 500));
+    }
+    fail("专属任务邀请接受结果尚未确认，已保留本单，不重复接受");
+  }
+
   async function acceptInvitationIfPresent(settings = {}) {
+    assertNoStandaloneInvitation();
     const invitationButton = findInvitationAcceptButton();
     if (!invitationButton) return false;
     await clickElement(invitationButton, { randomDelay: false, claimAction: true });
@@ -1557,6 +1720,7 @@
 
   async function openTaskDetailOrFail(selection, settings) {
     const runId = activeRunId;
+    assertNoStandaloneInvitation();
     assertCardAvailable(selection.card);
     const targets = getOpenTargetsInCard(selection.card, selection.target);
     if (!targets.length) throw new Error("未找到任务卡片入口");
@@ -1569,6 +1733,7 @@
         report("info", "已打开选中任务详情，开始查找在 X 打开/前往目标控件");
         return;
       } catch (error) {
+        if (findStandaloneInvitation()) throw error;
         if (error.taskUnavailable) throw error;
         lastError = error.message || String(error);
         if (isTaskDetailOpen()) {
@@ -1599,6 +1764,7 @@
     let loadingReported = false;
     while (Date.now() - started < timeoutMs) {
       assertActiveRun(runId);
+      assertNoStandaloneInvitation();
       if (hasTaskUnavailableError()) {
         throw new Error("任务暂时无法打开，已跳过本条任务");
       }
@@ -1623,7 +1789,10 @@
         // a fallback card's prose can mention these words without claiming.
         const entryLabels = [buttonText(target), target.getAttribute?.("aria-label")].map(normalize);
         const claimAction = entryLabels.some((label) => INVITATION_ACCEPT_BUTTON_TEXTS.includes(label) || LOCK_BUTTON_TEXTS.includes(label));
-        await clickElement(target, { claimAction, beforeClick: () => assertCardAvailable(card) });
+        await clickElement(target, { claimAction, beforeClick: () => {
+          assertNoStandaloneInvitation();
+          assertCardAvailable(card);
+        } });
         report("info", `已点击任务入口，第 ${clickCount} 次，等待点击后复核`);
         await wait(250);
         continue;
@@ -1844,63 +2013,73 @@
 
   async function closeTaskDetailPanel(settings = {}) {
     const runId = activeRunId;
-    assertActiveRun(runId);
-    const completionReturnButton = findCompletionReturnToCampaignsButton();
-    if (completionReturnButton) {
-      completionReturnButton.scrollIntoView({ block: "center", inline: "center" });
-      await wait(settings.actionDelayMs || 500);
-      await clickElement(completionReturnButton);
-      if (await waitForCampaignsReturnAfterCompletion(settings)) {
-        return { ok: true, message: "任务已完成，已点击打开任务广场并确认列表已恢复" };
+    const invitationPending = Symbol("invitationPending");
+    const assertCanClose = () => {
+      assertActiveRun(runId);
+      if (findStandaloneInvitation()) throw invitationPending;
+    };
+    try {
+      assertCanClose();
+      const completionReturnButton = findCompletionReturnToCampaignsButton();
+      if (completionReturnButton) {
+        completionReturnButton.scrollIntoView({ block: "center", inline: "center" });
+        await wait(settings.actionDelayMs || 500);
+        await clickElement(completionReturnButton, { beforeClick: assertCanClose });
+        if (await waitForCampaignsReturnAfterCompletion(settings, assertCanClose)) {
+          return { ok: true, message: "任务已完成，已点击打开任务广场并确认列表已恢复" };
+        }
       }
-    }
 
-    assertActiveRun(runId);
-    const unavailableReturnButton = findUnavailableReturnToCampaignsButton();
-    if (unavailableReturnButton) {
-      unavailableReturnButton.scrollIntoView({ block: "center", inline: "center" });
-      await wait(settings.actionDelayMs || 500);
-      await clickElement(unavailableReturnButton);
-      if (await waitForTaskPanelClosed(settings, "任务不可打开提示的返回任务广场按钮")) {
-        return { ok: true, message: "任务详情无法打开，已返回任务广场" };
+      assertCanClose();
+      const unavailableReturnButton = findUnavailableReturnToCampaignsButton();
+      if (unavailableReturnButton) {
+        unavailableReturnButton.scrollIntoView({ block: "center", inline: "center" });
+        await wait(settings.actionDelayMs || 500);
+        await clickElement(unavailableReturnButton, { beforeClick: assertCanClose });
+        if (await waitForTaskPanelClosed(settings, "任务不可打开提示的返回任务广场按钮", assertCanClose)) {
+          return { ok: true, message: "任务详情无法打开，已返回任务广场" };
+        }
       }
-    }
 
-    assertActiveRun(runId);
-    if (!isTaskDetailOrRecoverableOverlayOpen()) {
-      return { ok: true, message: "未检测到任务详情弹层，保持当前页面继续" };
-    }
-
-    const closeButton = findTaskDetailCloseButton();
-    if (closeButton) {
-      closeButton.scrollIntoView({ block: "center", inline: "center" });
-      await wait(settings.actionDelayMs || 500);
-      await clickElement(closeButton);
-      if (await waitForTaskPanelClosed(settings, "右上角关闭按钮")) {
-        return { ok: true, message: "已通过右上角关闭任务详情" };
+      assertCanClose();
+      if (!isTaskDetailOrRecoverableOverlayOpen()) {
+        return { ok: true, message: "未检测到任务详情弹层，保持当前页面继续" };
       }
-    }
 
-    assertActiveRun(runId);
-    document.dispatchEvent(new KeyboardEvent("keydown", {
-      key: "Escape",
-      code: "Escape",
-      keyCode: 27,
-      which: 27,
-      bubbles: true,
-      cancelable: true
-    }));
-    if (await waitForTaskPanelClosed(settings, "Esc")) {
-      return { ok: true, message: "已通过 Esc 关闭任务详情" };
-    }
+      const closeButton = findTaskDetailCloseButton();
+      if (closeButton) {
+        closeButton.scrollIntoView({ block: "center", inline: "center" });
+        await wait(settings.actionDelayMs || 500);
+        await clickElement(closeButton, { beforeClick: assertCanClose });
+        if (await waitForTaskPanelClosed(settings, "右上角关闭按钮", assertCanClose)) {
+          return { ok: true, message: "已通过右上角关闭任务详情" };
+        }
+      }
 
-    assertActiveRun(runId);
-    await clickTaskPanelOutside();
-    if (await waitForTaskPanelClosed(settings, "左侧空白区域")) {
-      return { ok: true, message: "已通过点击左侧空白区域关闭任务详情" };
-    }
+      assertCanClose();
+      document.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "Escape",
+        code: "Escape",
+        keyCode: 27,
+        which: 27,
+        bubbles: true,
+        cancelable: true
+      }));
+      if (await waitForTaskPanelClosed(settings, "Esc", assertCanClose)) {
+        return { ok: true, message: "已通过 Esc 关闭任务详情" };
+      }
 
-    return { ok: false, message: "任务详情关闭复核失败，仍停留在详情页" };
+      assertCanClose();
+      await clickTaskPanelOutside(assertCanClose);
+      if (await waitForTaskPanelClosed(settings, "左侧空白区域", assertCanClose)) {
+        return { ok: true, message: "已通过点击左侧空白区域关闭任务详情" };
+      }
+
+      return { ok: false, message: "任务详情关闭复核失败，仍停留在详情页" };
+    } catch (error) {
+      if (error !== invitationPending) throw error;
+      return { ok: true, invitationPending: true, message: "保留专属任务邀请，等待接单流程识别" };
+    }
   }
 
   function beginCompletionWatch(message) {
@@ -2079,13 +2258,15 @@
       .find((node) => labels.test(buttonText(node))) || null;
   }
 
-  async function waitForCampaignsReturnAfterCompletion(settings = {}) {
+  async function waitForCampaignsReturnAfterCompletion(settings = {}, beforeCheck) {
     const started = Date.now();
     const timeoutMs = Math.min(Math.max((settings.actionDelayMs || 500) * 8, 4000), 10000);
     while (Date.now() - started < timeoutMs) {
+      beforeCheck?.();
       if (isCampaignsListOpen()) return true;
       await wait(250);
     }
+    beforeCheck?.();
     report("warn", "点击打开任务广场后未确认列表恢复");
     return false;
   }
@@ -2110,18 +2291,20 @@
     return candidates[0]?.node || null;
   }
 
-  async function waitForTaskPanelClosed(settings, actionName) {
+  async function waitForTaskPanelClosed(settings, actionName, beforeCheck) {
     const started = Date.now();
     const timeoutMs = Math.min(Math.max((settings.actionDelayMs || 500) * 4, 2000), 5000);
     while (Date.now() - started < timeoutMs) {
+      beforeCheck?.();
       if (!isTaskDetailOrRecoverableOverlayOpen() && isCampaignsListOpen()) return true;
       await wait(250);
     }
+    beforeCheck?.();
     report("warn", `${actionName} 后仍未确认任务详情关闭`);
     return false;
   }
 
-  async function clickTaskPanelOutside() {
+  async function clickTaskPanelOutside(beforeClick) {
     const runId = activeRunId;
     assertActiveRun(runId);
     const x = Math.max(24, Math.floor(window.innerWidth * 0.12));
@@ -2130,6 +2313,7 @@
     await randomClickDelay();
     assertActiveRun(runId);
     for (const type of ["pointerdown", "mousedown", "mouseup", "click"]) {
+      beforeClick?.();
       target.dispatchEvent(new MouseEvent(type, {
         bubbles: true,
         cancelable: true,
@@ -2327,7 +2511,7 @@
     return null;
   }
 
-  async function clickAndVerifyLock(button, settings, observation) {
+  async function clickAndVerifyLock(button, settings, observation, expectedInvitation = null) {
     const runId = activeRunId;
     const seen = new Map(readLockFeedback().map(item => [item.node, item.text]));
     observation.feedback = [];
@@ -2346,7 +2530,16 @@
     const watcher = typeof MutationObserver === "function" ? new MutationObserver(observation.collectFeedback) : null;
     watcher?.observe(document.body, { childList: true, subtree: true, characterData: true });
     try {
-      await clickElement(button, { randomDelay: false, claimAction: true });
+      await clickElement(button, { randomDelay: false, claimAction: true,
+        beforeClick: expectedInvitation ? () => {
+          assertInvitationTarget(expectedInvitation);
+          if (!isSameLockDetail(observation) || button.isConnected === false
+              || isDisabled(button) || findLockButton() !== button) {
+            const error = new Error("邀请任务或锁位按钮已变化，保留本单，未继续锁位");
+            error.task = expectedInvitation;
+            throw error;
+          }
+        } : undefined });
       report("info", "已点击锁定席位，等待本单锁位结果");
       observation.collectFeedback();
       await confirmLighthouseGuidanceBeforeClaim(observation);
@@ -2638,6 +2831,7 @@
     let lastReportAt = 0;
     while (Date.now() - started < timeoutMs) {
       assertActiveRun(runId);
+      if (findStandaloneInvitation()) return true;
       const text = document.body?.innerText || "";
       const hasCampaignShell = location.pathname.includes("/campaigns");
       const hasTaskList = COMMENT_MARKERS.concat(COMMENT_EQUIVALENT_MARKERS).some((marker) => text.includes(marker)) || text.includes("任务广场") || text.includes("Task Hall");
@@ -3012,7 +3206,8 @@
     const receipt = await chrome.runtime.sendMessage({
       type: "LIGHTHOUSE_CLAIM_CHECKPOINT", version: 1, phase,
       runId: operation.runId, operationType: operation.type,
-      claimIntentId: operation.claimIntentId, instanceId: INSTANCE_ID
+      claimIntentId: operation.claimIntentId, instanceId: INSTANCE_ID,
+      ...(phase === "before_click" && operation.invitationTask ? { invitationTask: operation.invitationTask } : {})
     });
     assertActiveRun(operation.runId);
     if (claimOperation !== operation || receipt?.ok !== true || receipt.checkpointRegistered !== true
@@ -3066,6 +3261,7 @@
 
     while (Date.now() - started < timeoutMs) {
       assertActiveRun(runId);
+      if (options.allowInvitation && findStandaloneInvitation()) return { phase: "invitation_pending" };
       let snapshot = getLighthousePageSnapshot();
       if (options.requireInvitationResolved && snapshot.phase === "detail_ready"
           && findInvitationAcceptButton({ includeDisabled: true })) {
