@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.115";
+  const SCRIPT_VERSION = "0.7.116";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -123,9 +123,10 @@
       return true;
     }
     if (message.type === "CHECK_LIGHTHOUSE_INVITATION") {
-      const pending = message.platform === "lighthouse" && Boolean(findStandaloneInvitation());
+      const invitationState = message.platform === "lighthouse" ? getStandaloneInvitationState() : "absent";
+      const pending = !["absent", "expired"].includes(invitationState);
       sendResponse({ ok: message.platform === "lighthouse",
-        pending, invitationPending: pending });
+        pending, invitationPending: pending, invitationState });
       return true;
     }
     if (message.type === "AUTOMATION_PAUSE_CHANGED") {
@@ -1532,6 +1533,19 @@
     return prompts[0] || null;
   }
 
+  function getStandaloneInvitationState(invitation = findStandaloneInvitation(), protectClaim = true) {
+    if (!invitation) return "absent";
+    if (invitation.ambiguous) return "unknown";
+    // A visible expiry must never undo an already permitted acceptance.
+    if (protectClaim && claimOperation?.claimActionAttempted) return "result_unknown";
+    const expired = Array.from(invitation.root.querySelectorAll("p,span,div,[role='status'],[role='alert']"))
+      .filter(isVisible).some(node => /^(?:(?:本次|该)?(?:专属|任务)?邀请|任务邀请)(?:已|已经)?(?:过期|失效|结束|撤销)(?:[，。！!\s]|$)/
+        .test(normalize(node.innerText || node.textContent || "")));
+    if (expired) return "expired";
+    if (!invitation.task.taskKey || !invitation.task.tweetUrl) return "unknown";
+    return isDisabled(invitation.button) ? "waiting" : "ready";
+  }
+
   function assertNoStandaloneInvitation() {
     if (!findStandaloneInvitation()) return;
     const error = new Error("专属任务邀请已出现，保留弹窗并重新识别，不操作底层任务");
@@ -1553,8 +1567,9 @@
     const runId = activeRunId;
     const operation = claimOperation;
     const task = invitation.task;
-    const fail = (message) => {
+    const fail = (message, details = {}) => {
       const error = new Error(message);
+      Object.assign(error, details);
       error.task = task;
       throw error;
     };
@@ -1562,22 +1577,40 @@
         || operation.claimActionAttempted || operation.invitationTask || operation.boundTask) {
       fail("当前接单操作已绑定其他任务，未接受新的专属邀请");
     }
-    const isSamePrompt = () => {
+    const isSamePrompt = (allowExpired = false) => {
       assertActiveRun(runId);
       const current = findStandaloneInvitation();
       if (claimOperation !== operation || !current || current.ambiguous
           || current.root !== invitation.root || current.button !== invitation.button
           || current.task.taskKey !== task.taskKey || current.task.taskType !== task.taskType
           || current.task.bounty !== task.bounty) fail("专属任务邀请已变化，未操作旧邀请");
-      if (Array.from(current.root.querySelectorAll("p,span,div,[role='status'],[role='alert']"))
-          .filter(isVisible).some(node => /^(?:(?:本次|该)?(?:专属|任务)?邀请|任务邀请)(?:已|已经)?(?:过期|失效|结束|撤销)(?:[，。！!\s]|$)/
-            .test(normalize(node.innerText || node.textContent || "")))) {
+      if (!allowExpired && getStandaloneInvitationState(current, false) === "expired") {
         fail("专属任务邀请已失效，未点击接受");
       }
       return current;
     };
     const minBounty = await getLiveAutoMinTaskBounty(settings);
-    const current = isSamePrompt();
+    const current = isSamePrompt(true);
+    if (getStandaloneInvitationState(current) === "expired") {
+      const dismiss = Array.from(current.root.querySelectorAll("button,[role='button']"))
+        .find(node => isVisible(node) && !isDisabled(node) && buttonText(node) === "跳过")
+        || Array.from(current.root.querySelectorAll("button,[role='button']"))
+          .find(node => isVisible(node) && !isDisabled(node)
+            && /^(?:关闭|关闭邀请)$/.test(buttonText(node) || node.getAttribute("aria-label") || ""));
+      if (!dismiss) fail("过期邀请没有可用关闭入口，等待安全刷新任务广场", { refreshRequested: true });
+      await clickElement(dismiss, { randomDelay: false, beforeClick: () => {
+        const fresh = isSamePrompt(true);
+        if (operation.claimActionAttempted || getStandaloneInvitationState(fresh) !== "expired"
+            || !fresh.root.contains(dismiss) || dismiss.isConnected === false || isDisabled(dismiss)) {
+          fail("邀请状态已变化，保留页面重新核对");
+        }
+      } });
+      await wait(Math.max(150, settings.actionDelayMs || 150));
+      assertActiveRun(runId);
+      if (findStandaloneInvitation()?.root === invitation.root) fail("过期邀请关闭尚未确认，等待安全刷新", { refreshRequested: true });
+      report("info", "已关闭明确过期且未接受的邀请，继续扫描任务广场");
+      return null;
+    }
     if (invitation.ambiguous || !task.taskKey || !task.tweetUrl) fail("专属任务邀请缺少唯一目标推文，未接受任务");
     const restriction = getEligibilityBlockReason(normalize(current.root.innerText || ""));
     const blocked = restriction || (!isAutomatableTaskType(task.taskType) ? "任务类型不支持自动执行" : "")
@@ -2014,9 +2047,12 @@
   async function closeTaskDetailPanel(settings = {}) {
     const runId = activeRunId;
     const invitationPending = Symbol("invitationPending");
+    const expiredInvitation = Symbol("expiredInvitation");
     const assertCanClose = () => {
       assertActiveRun(runId);
-      if (findStandaloneInvitation()) throw invitationPending;
+      const state = getStandaloneInvitationState();
+      if (state === "expired") throw expiredInvitation;
+      if (state !== "absent") throw invitationPending;
     };
     try {
       assertCanClose();
@@ -2077,6 +2113,8 @@
 
       return { ok: false, message: "任务详情关闭复核失败，仍停留在详情页" };
     } catch (error) {
+      if (error === expiredInvitation) return { ok: false, expiredInvitation: true,
+        message: "邀请已明确过期且尚未接受，允许后台核对后刷新广场" };
       if (error !== invitationPending) throw error;
       return { ok: true, invitationPending: true, message: "保留专属任务邀请，等待接单流程识别" };
     }
