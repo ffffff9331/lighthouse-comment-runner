@@ -15,6 +15,7 @@ async function worker(outcome="completed") {
       if(m.type==="CHECK_X_TASK_WIDGET_COMPLETION") return outcome==="completed" ? {ok:true,completed:true,evidence:{source:"lighthouse_x_widget",runId:m.runId,taskKey:task.taskKey,tweetUrl:task.tweetUrl}} : {ok:true,completed:false};
       if(m.type==="CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION")return {ok:true,completed:false};
       if(m.type==="BEGIN_LIGHTHOUSE_COMPLETION_WATCH")return {ok:true};
+      if(m.type==="CHECK_LIGHTHOUSE_EXECUTION_STATE")return {ok:true,present:false};
       throw Error("Unexpected action "+m.type);
     }}};
   const c=vm.createContext({chrome,Date:Clock,URL,AbortController,console,importScripts(){},setTimeout,clearTimeout,

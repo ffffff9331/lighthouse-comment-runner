@@ -38,6 +38,7 @@ async function worker() {
         }
         if (message.type.startsWith("CANCEL_")) return { ok: true };
         if (message.type === "BEGIN_LIGHTHOUSE_COMPLETION_WATCH") return { ok: true };
+        if (message.type === "CHECK_LIGHTHOUSE_EXECUTION_STATE" && !hooks.page) return { ok: true, present: false };
         if (["RUN_X_REPLY", "COMPLETE_X_TASK_WIDGET"].includes(message.type)) {
           await hooks.beforeReply?.(message);
           return { ok: true, message: "fixture reply completed" };

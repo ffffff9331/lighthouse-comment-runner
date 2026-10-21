@@ -67,6 +67,7 @@ async function worker(options = {}) {
           runId: payload.runId, claimIntentId: payload.claimIntentId, taskKey: order.taskKey, tweetUrl: order.tweetUrl };
         if (payload.type === "CLOSE_LIGHTHOUSE_TASK_DETAIL") return { ok: true, message: "已关闭详情" };
         if (payload.type === "BEGIN_LIGHTHOUSE_COMPLETION_WATCH") return { ok: true };
+        if (payload.type === "CHECK_LIGHTHOUSE_EXECUTION_STATE") return { ok: true, present: false };
         if (payload.type === "READ_LIGHTHOUSE_TODAY_INCOME") return { ok: true, income: 0 };
         if (payload.type === "RUN_X_REPLY") {
           if (options.replyDisconnect) throw Error("message channel closed");

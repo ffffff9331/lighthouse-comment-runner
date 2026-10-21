@@ -191,3 +191,79 @@ for (const kind of ["no-x-result", "stop-after-read", "new-order-after-read", "s
     }
   });
 }
+
+// Review regressions: exercise adjacent states with the same production
+// worker/content pair. Keep failures visible until the implementation is fixed.
+function showOfficialCompletion(e) {
+  e.region.replaceChildren(new Element("h2", "验证成功"), new Element("strong", "0.10 LUX"),
+    new Element("a", "查看原推文", [], { href: TARGET }));
+}
+
+test("review: STOP while focusing Lighthouse prevents verification", async t => {
+  const { w, e } = await executionWorker(t);
+  const update = w.chrome.tabs.update;
+  w.chrome.tabs.update = async (...args) => {
+    const result = await update(...args);
+    Object.assign(w.state(), { running: false, manuallyStopped: true });
+    return result;
+  };
+  const result = await w.c.completeXTaskWidgetLifecycle(22, w.state().runId, autoSettings);
+  assert.equal(result.cancelled, true);
+  assert.equal(e.verify.clicks, 0);
+  assert.equal(w.messages("SUBMIT_LIGHTHOUSE_EXECUTION_VERIFICATION").length, 0);
+});
+
+for (const boundary of ["before-execution-read", "while-focusing"]) {
+  test(`review: matching official completion ${boundary} finishes without resubmission`, async t => {
+    const { w, e, task } = await executionWorker(t);
+    const runId = w.state().runId;
+    assert.equal((await w.c.sendToTab(11, { type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId, task })).ok, true);
+    if (boundary === "before-execution-read") showOfficialCompletion(e);
+    else {
+      const update = w.chrome.tabs.update;
+      w.chrome.tabs.update = async (...args) => { const result = await update(...args); showOfficialCompletion(e); return result; };
+    }
+    const result = await w.c.completeXTaskWidgetLifecycle(22, runId, autoSettings);
+    const official = await w.c.sendToTab(11, { type: "CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION", runId, task });
+    assert.equal(official.completed, true, "the production completion reader proves this exact order is done");
+    assert.equal(e.verify.clicks, 0);
+    assert.equal(result.ok, true, result.message);
+    assert.equal(w.c.hasLatchedLighthouseCompletion(runId), true);
+  });
+}
+
+test("review: an already bound target tab still advances the claimed execution dialog", async t => {
+  const { w, p, task } = await executionWorker(t);
+  const e = installExecution(p, { phase: "claimed" });
+  const get = w.chrome.tabs.get;
+  w.chrome.tabs.get = async id => id === 22
+    ? { id: 22, windowId: 1, status: "complete", url: TARGET } : get(id);
+  const adopted = await w.c.waitForLighthouseOpenedTweet(task, 11, "auto", { timeoutMs: 2000 });
+  assert.equal(adopted, true);
+  const result = await w.c.completeXTaskWidgetLifecycle(22, w.state().runId, autoSettings);
+  assert.equal(e.open.clicks, 1, "reusing X must not skip the site's claimed-to-working transition");
+  assert.equal(result.ok, true, result.message);
+  assert.equal(e.verify.clicks, 1);
+});
+
+test("review: a filled but unsent reply is not completion evidence after settings change to post", async t => {
+  const { w, e } = await executionWorker(t);
+  w.state().lastXResult = { ok: true, mode: "fill", replyText: "unsent draft", tweet: { url: TARGET } };
+  const result = await w.c.completeXTaskWidgetLifecycle(22, w.state().runId, autoSettings);
+  assert.equal(e.verify.clicks, 0, "current settings cannot turn the previous draft into a posted reply");
+  assert.notEqual(result.ok, true);
+  assert.equal(w.messages("COMPLETE_X_TASK_WIDGET").length, 0);
+});
+
+for (const failure of ["not-ok", "missing-response"]) {
+  test(`review: ${failure} execution read cannot fall through to an X submission`, async t => {
+    const { w, e } = await executionWorker(t);
+    const send = w.chrome.tabs.sendMessage;
+    w.chrome.tabs.sendMessage = async (id, message) => message.type === "CHECK_LIGHTHOUSE_EXECUTION_STATE"
+      ? (failure === "not-ok" ? { ok: false, message: "execution state unavailable" } : undefined) : send(id, message);
+    const result = await w.c.completeXTaskWidgetLifecycle(22, w.state().runId, autoSettings);
+    assert.equal(w.messages("COMPLETE_X_TASK_WIDGET").length, 0, "unknown execution state is not an absent dialog");
+    assert.equal(e.verify.clicks, 0);
+    assert.notEqual(result.ok, true);
+  });
+}

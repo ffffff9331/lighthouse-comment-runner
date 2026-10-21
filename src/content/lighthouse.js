@@ -2806,7 +2806,14 @@
   }
 
   async function confirmLockedTaskNotice(message) {
-    if (findExecutionDialog().present) return performExecutionAction(message, "open");
+    const execution = findExecutionDialog();
+    if (execution.present) {
+      if (message.targetAlreadyOpen && execution.phase === "working") {
+        assertActiveRun(message.runId);
+        return { ...readExecutionState(message), noticePresent: true, noticeClicked: false };
+      }
+      return performExecutionAction(message, "open");
+    }
     const runId = message.runId;
     assertActiveRun(runId);
     const receipt = { runId, taskKey: message.task?.taskKey || "",

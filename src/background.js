@@ -2314,10 +2314,23 @@ async function completeXTaskWidgetLifecycle(tabId, runId, settings, stillCurrent
     });
     if (!ownsTask()) return cancelled();
     if (execution?.present) {
+      const readOfficialCompletion = async () => {
+        const official = await sendToTab(runtimeState.lighthouseTabId, {
+          type: "CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION", runId, task
+        });
+        if (!ownsTask()) return cancelled();
+        if (!official?.ok || !official.completed || !latchLighthouseCompletion(official.evidence, runId)) return null;
+        await persistAutoRunState(true);
+        if (!ownsTask()) return cancelled();
+        return { ok: true, officialCompletion: true, message: "本单官网已确认完成，无需再次提交验证" };
+      };
       if (!execution.ok || execution.runId !== runId || execution.taskKey !== taskKey
           || !target || normalizeTweetUrl(execution.tweetUrl, true) !== target
           || runtimeState.lastXResult?.ok !== true
+          || runtimeState.lastXResult.mode === "fill"
           || settings.replyMode !== "post" || settings.autoSubmitLighthouse !== true) {
+        const completed = await readOfficialCompletion();
+        if (completed) return completed;
         return { ok: false, message: "邀请执行页或 X 动作尚未确认，保留本单，未提交验证" };
       }
       // This site's execution dialog owns invitation verification. Waiting
@@ -2330,12 +2343,17 @@ async function completeXTaskWidgetLifecycle(tabId, runId, settings, stillCurrent
       if (!ownsTask()) return cancelled();
       if (!submitted?.ok || submitted.runId !== runId || submitted.taskKey !== taskKey
           || normalizeTweetUrl(submitted.tweetUrl, true) !== target || !submitted.submitted) {
+        const completed = await readOfficialCompletion();
+        if (completed) return completed;
         return { ok: false, message: submitted?.message || "邀请验证提交尚未确认，已保留本单" };
       }
       setStage("lighthouse_verification_pending");
       log("info", "已在灯塔点击本单我已完成，开始验证；等待官方结果");
       return { ok: true, submitted: true, executionDialog: true,
         message: "已提交邀请任务验证，尚未确认完成或到账" };
+    }
+    if (execution?.ok !== true || execution.present !== false) {
+      return { ok: false, message: "尚未读清本单执行状态，保留订单，未提交验证" };
     }
   }
   setStage("x_task_completion_waiting");
@@ -4492,13 +4510,7 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
     const currentExpectedUrl = normalizeTweetUrl(runtimeState.currentTask?.tweetUrl || expectedTweetUrl);
     const boundTab = await getBoundMatchingTaskXTab(currentExpectedUrl, isCurrent);
     if (!isCurrent()) return false;
-    if (boundTab) {
-      runtimeState.mode = mode || runtimeState.mode;
-      if (lighthouseTabId) await rememberLighthouseTabById(lighthouseTabId, isCurrent);
-      if (!isCurrent()) return false;
-      return true;
-    }
-    const candidate = consumeXOpenCandidate(lighthouseTabId, currentExpectedUrl)
+    const candidate = boundTab ? null : consumeXOpenCandidate(lighthouseTabId, currentExpectedUrl)
       || await findRecentTweetTab(startedAt, lighthouseTabId, lighthouseWindowId, currentExpectedUrl);
     if (!isCurrent()) return false;
     if (candidate && candidate.id === lighthouseTabId) {
@@ -4510,20 +4522,15 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
       await delay(500);
       continue;
     }
-    if (candidate) {
-      adoptCurrentXTab(candidate, task, "site");
-      runtimeState.mode = mode || runtimeState.mode;
-      if (lighthouseTabId) await rememberLighthouseTabById(lighthouseTabId, isCurrent);
-      if (!isCurrent()) return false;
-      return true;
-    }
     const noticeTask = runtimeState.currentTask;
-    if (!runtimeState.uncertainAction && noticeTask?.seatLocked === true && !noticeTask.claimRejected && !noticeTask.lockFailed
+    if ((!noticeClickedAt || (!boundTab && !candidate)) && !runtimeState.uncertainAction
+        && noticeTask?.seatLocked === true && !noticeTask.claimRejected && !noticeTask.lockFailed
         && noticeTask.taskKey && normalizeTweetUrl(noticeTask.tweetUrl)) {
       const noticeTaskKey = noticeTask.taskKey;
       const noticeTarget = normalizeTweetUrl(noticeTask.tweetUrl, true);
       const notice = await sendToTab(lighthouseTabId, {
-        type: "CONFIRM_LIGHTHOUSE_LOCKED_TASK_NOTICE", runId, task: noticeTask
+        type: "CONFIRM_LIGHTHOUSE_LOCKED_TASK_NOTICE", runId, task: noticeTask,
+        targetAlreadyOpen: Boolean(boundTab || candidate)
       });
       const currentTask = runtimeState.currentTask;
       if (!isCurrent() || currentTask?.taskKey !== noticeTaskKey || currentTask.seatLocked !== true
@@ -4549,6 +4556,15 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
             || normalizeTweetUrl(afterWaitTask.tweetUrl, true) !== noticeTarget) return false;
         continue;
       }
+    }
+    // A matching X tab does not prove that the website entered its working
+    // phase. Complete the same-order entrance before reusing that tab.
+    if (boundTab || candidate) {
+      if (candidate) adoptCurrentXTab(candidate, task, "site");
+      runtimeState.mode = mode || runtimeState.mode;
+      if (lighthouseTabId) await rememberLighthouseTabById(lighthouseTabId, isCurrent);
+      if (!isCurrent()) return false;
+      return true;
     }
     const lockFailure = await checkLighthouseLockFailure(lighthouseTabId);
     if (!isCurrent()) return false;
