@@ -1542,6 +1542,7 @@ async function debugFastXClaimReplyVerify(selectedTask = null, windowId = null) 
     return { ok: false, result: replyResult, state: runtimeState };
   }
 
+  runtimeState.lastXResult = replyResult;
   await recordReplyHistory(replyResult);
   if (!isCurrent()) return cancelled();
   const completionResult = await completeXTaskWidgetLifecycle(tabId, runId, settings, isCurrent);
@@ -2303,6 +2304,39 @@ async function completeXTaskWidgetLifecycle(tabId, runId, settings, stillCurrent
     });
     if (!isCurrent()) return cancelled();
     if (!watch?.ok) return { ok: false, message: "本单完成监测未就绪，保留订单，尚未提交 X 验证" };
+    const task = runtimeState.currentTask;
+    const taskKey = task.taskKey;
+    const target = normalizeTweetUrl(task.tweetUrl, true);
+    const ownsTask = () => isCurrent() && runtimeState.currentTask?.taskKey === taskKey
+      && normalizeTweetUrl(runtimeState.currentTask?.tweetUrl, true) === target;
+    const execution = await sendToTab(runtimeState.lighthouseTabId, {
+      type: "CHECK_LIGHTHOUSE_EXECUTION_STATE", runId, task
+    });
+    if (!ownsTask()) return cancelled();
+    if (execution?.present) {
+      if (!execution.ok || execution.runId !== runId || execution.taskKey !== taskKey
+          || !target || normalizeTweetUrl(execution.tweetUrl, true) !== target
+          || runtimeState.lastXResult?.ok !== true
+          || settings.replyMode !== "post" || settings.autoSubmitLighthouse !== true) {
+        return { ok: false, message: "邀请执行页或 X 动作尚未确认，保留本单，未提交验证" };
+      }
+      // This site's execution dialog owns invitation verification. Waiting
+      // for the X widget first deadlocks on a result this button must start.
+      await chrome.tabs.update(runtimeState.lighthouseTabId, { active: true });
+      if (!ownsTask()) return cancelled();
+      const submitted = await sendToTab(runtimeState.lighthouseTabId, {
+        type: "SUBMIT_LIGHTHOUSE_EXECUTION_VERIFICATION", runId, task, settings, xActionsCompleted: true
+      });
+      if (!ownsTask()) return cancelled();
+      if (!submitted?.ok || submitted.runId !== runId || submitted.taskKey !== taskKey
+          || normalizeTweetUrl(submitted.tweetUrl, true) !== target || !submitted.submitted) {
+        return { ok: false, message: submitted?.message || "邀请验证提交尚未确认，已保留本单" };
+      }
+      setStage("lighthouse_verification_pending");
+      log("info", "已在灯塔点击本单我已完成，开始验证；等待官方结果");
+      return { ok: true, submitted: true, executionDialog: true,
+        message: "已提交邀请任务验证，尚未确认完成或到账" };
+    }
   }
   setStage("x_task_completion_waiting");
   log("info", "X 动作已完成，按任务实际停留进度等待控件解锁提交");
@@ -3650,7 +3684,7 @@ async function sendToTab(tabId, payload) {
           return { ok: false, cancelled: true, message: "流程已停止，未发送接单动作" };
         }
       }
-      const irreversible = ["RUN_X_REPLY", "RUN_X_WIDGET_CLAIM", "COMPLETE_X_TASK_WIDGET", "CLICK_X_TASK_VERIFY", "DEBUG_CLICK_I_DONE", "COMPLETE_LIGHTHOUSE_COMMENT_TASK"].includes(payload.type);
+      const irreversible = ["RUN_X_REPLY", "RUN_X_WIDGET_CLAIM", "COMPLETE_X_TASK_WIDGET", "CLICK_X_TASK_VERIFY", "DEBUG_CLICK_I_DONE", "COMPLETE_LIGHTHOUSE_COMMENT_TASK", "SUBMIT_LIGHTHOUSE_EXECUTION_VERIFICATION"].includes(payload.type);
       if (irreversible && !claimIntent && !actionIntent) {
         // The worker can disappear while the page is executing. Persist the
         // intent before sending, not only after a channel error is reported.

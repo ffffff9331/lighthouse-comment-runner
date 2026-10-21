@@ -157,6 +157,11 @@ for (const item of cases) for (const restart of [false, true]) {
 
 test("fast command can finish normally while it owns the current run", async () => {
   const w = fixture("debugFastXClaimReplyVerify", "unused");
+  const complete = w.c.completeXTaskWidgetLifecycle;
+  w.c.completeXTaskWidgetLifecycle = async (...args) => {
+    assert.equal(w.c.runtimeState.lastXResult?.ok, true, "verification requires this run's confirmed X reply");
+    return complete(...args);
+  };
   assert.equal((await w.c.debugFastXClaimReplyVerify()).ok, true);
   assert.equal(w.c.runtimeState.completed, 1);
   assert.equal(w.c.runtimeState.stage, "fast_flow_done");

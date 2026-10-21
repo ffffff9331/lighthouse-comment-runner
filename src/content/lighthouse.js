@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.116";
+  const SCRIPT_VERSION = "0.7.117";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -164,6 +164,8 @@
       ),
       WAIT_SELECTED_COUNTDOWN_AND_LOCK: () => waitSelectedCountdownAndLock(message.settings, message.selectedTask),
       CHECK_LIGHTHOUSE_LOCK_FAILURE: () => checkLighthouseLockFailure(message),
+      CHECK_LIGHTHOUSE_EXECUTION_STATE: () => readExecutionState(message),
+      SUBMIT_LIGHTHOUSE_EXECUTION_VERIFICATION: () => performExecutionAction(message, "verify"),
       CONFIRM_LIGHTHOUSE_LOCKED_TASK_NOTICE: () => confirmLockedTaskNotice(message),
       BEGIN_LIGHTHOUSE_COMPLETION_WATCH: () => beginCompletionWatch(message),
       CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION: () => checkOfficialCompletion(message),
@@ -1937,6 +1939,8 @@
   }
 
   function isTaskDetailOpen() {
+    const execution = findExecutionDialog();
+    if (execution.present) return Boolean(execution.root);
     const text = normalize(document.body?.innerText || "");
     if (!text) return false;
     const hasDetailMarker = DETAIL_MARKERS.some((marker) => text.includes(marker));
@@ -2484,6 +2488,9 @@
     const target = normalizeTweetUrl(extractTweetUrl(root), true);
     const expected = normalizeTweetUrl(expectedTweetUrl, true);
     if (!target || (expectedTweetUrl && !expected) || (expected && target !== expected)) return false;
+    const execution = findExecutionDialog();
+    if (execution.present) return execution.root === root && execution.locked
+      && normalizeTweetUrl(execution.tweetUrl, true) === target;
     // A disabled claim button can be a request still in flight. Its presence
     // must block this fallback just as an enabled claim button does.
     const claimControls = Array.from(root.querySelectorAll("button,a,[role='button'],input[type='button'],input[type='submit']"))
@@ -2799,6 +2806,7 @@
   }
 
   async function confirmLockedTaskNotice(message) {
+    if (findExecutionDialog().present) return performExecutionAction(message, "open");
     const runId = message.runId;
     assertActiveRun(runId);
     const receipt = { runId, taskKey: message.task?.taskKey || "",
@@ -2907,7 +2915,103 @@
     };
   }
 
+  function findExecutionDialog() {
+    const roots = Array.from(document.querySelectorAll("[role='dialog']"))
+      .filter(root => root.getAttribute?.("role") === "dialog" && isVisible(root))
+      .filter(root => Array.from(root.querySelectorAll("h1,h2,h3,[role='heading']"))
+        .some(node => isVisible(node) && normalize(buttonText(node)) === "任务执行与验证"));
+    if (!roots.length) return { present: false };
+    if (roots.length !== 1) return { present: true, ambiguous: true };
+    const root = roots[0];
+    const labels = Array.from(root.querySelectorAll("h1,h2,h3,p,[role='status']"))
+      .filter(isVisible).map(node => normalize(buttonText(node)));
+    const phase = labels.includes("接单成功，开始任务吧") ? "claimed"
+      : labels.includes("完成任务后，回来验证") ? "working" : "unknown";
+    const targets = Array.from(root.querySelectorAll("a[href]"))
+      .filter(node => isVisible(node) && normalize(node.getAttribute("aria-label") || buttonText(node)) === "查看目标推文")
+      .map(node => normalizeTweetUrl(node.href || node.getAttribute("href")));
+    const tweetUrl = targets.length && targets.every(Boolean)
+      && new Set(targets.map(url => normalizeTweetUrl(url, true))).size === 1 ? targets[0] : "";
+    const controls = Array.from(root.querySelectorAll("button,[role='button']")).filter(isVisible);
+    const exactControls = pattern => controls.filter(node => pattern.test(normalize(buttonText(node)).replace(/[↗→]/g, "").trim()));
+    const open = exactControls(/^(?:去完成任务|打开目标推文)$/);
+    const verify = exactControls(/^我已完成[，,]开始验证$/);
+    const claimControl = controls.some(node => /^(?:锁定席位|锁定名额|抢占席位|领取任务|开始任务|接受并开始)(?:\s|·|$)/.test(normalize(buttonText(node))));
+    const locked = Boolean(tweetUrl && ["claimed", "working"].includes(phase) && !claimControl
+      && labels.some(text => /^席位已锁定[，,]\s*请使用绑定的\s*X\s*账号完成任务[。.]?$/.test(text)));
+    return { present: true, root, phase, tweetUrl, locked,
+      open: open.length === 1 ? open[0] : null, verify: verify.length === 1 ? verify[0] : null };
+  }
+
+  function readExecutionState(message) {
+    const execution = findExecutionDialog();
+    const expected = normalizeTweetUrl(message.task?.tweetUrl, true);
+    const matches = Boolean(message.task?.taskKey && expected
+      && normalizeTweetUrl(execution.tweetUrl, true) === expected);
+    return { ok: !execution.present || (matches && execution.locked), present: execution.present,
+      runId: message.runId, taskKey: message.task?.taskKey || "", tweetUrl: execution.tweetUrl || "",
+      phase: execution.phase || "unknown", locked: execution.locked === true,
+      canVerify: Boolean(matches && execution.locked && execution.phase === "working"
+        && execution.verify && !isDisabled(execution.verify)),
+      message: execution.present && (!matches || !execution.locked) ? "执行弹窗尚未确认本单目标和锁位，保留订单" : "" };
+  }
+
+  async function performExecutionAction(message, action) {
+    const runId = message.runId;
+    const task = message.task;
+    const target = normalizeTweetUrl(task?.tweetUrl, true);
+    const receipt = { runId, taskKey: task?.taskKey || "", tweetUrl: task?.tweetUrl || "",
+      noticePresent: action === "open", noticeClicked: false, actionAttempted: false };
+    assertActiveRun(runId);
+    if (!task?.taskKey || !target || (action === "open" && task.seatLocked !== true)
+        || (action === "verify" && (message.xActionsCompleted !== true
+          || message.settings?.autoSubmitLighthouse !== true || message.settings?.replyMode !== "post"))) {
+      return { ...receipt, ok: false, message: "缺少本单动作完成凭据，未操作执行弹窗" };
+    }
+    const key = JSON.stringify(["execution", action, runId, task.taskKey, target]);
+    const previous = lockedTaskNotices.get(key);
+    if (previous?.clicked) return { ...receipt, ok: true, alreadyConfirmed: true,
+      submitted: action === "verify", actionAttempted: true };
+    if (previous?.promise) return previous.promise;
+    const initial = findExecutionDialog();
+    const matches = current => current.root && current.root === initial.root && current.locked
+      && normalizeTweetUrl(current.tweetUrl, true) === target;
+    if (!matches(initial) || (action === "verify" && initial.phase !== "working")) {
+      return { ...receipt, ok: false, message: "执行弹窗状态或目标不匹配，未操作其他订单" };
+    }
+    const state = { clicked: false, promise: null };
+    lockedTaskNotices.set(key, state);
+    if (lockedTaskNotices.size > 40) lockedTaskNotices.delete(lockedTaskNotices.keys().next().value);
+    state.promise = (async () => {
+      await wait(150);
+      assertActiveRun(runId);
+      const current = findExecutionDialog();
+      const button = current[action];
+      if (!matches(current) || !button || isDisabled(button)
+          || (action === "verify" && current.phase !== "working")) {
+        return { ...receipt, ok: false, message: "本单执行按钮尚不可用或页面已变化，未点击" };
+      }
+      await clickElement(button, { randomDelay: false, beforeClick: () => {
+        const fresh = findExecutionDialog();
+        assertActiveRun(runId);
+        if (!matches(fresh) || fresh[action] !== button || isDisabled(button)
+            || (action === "verify" && fresh.phase !== "working")) throw new Error("本单执行页面已变化，取消旧按钮操作");
+        state.clicked = true;
+      } });
+      report("info", action === "open" ? "已点击本单去完成任务，等待官网打开目标 X"
+        : "已点击本单我已完成，开始验证；等待官网结果，不重复提交");
+      return { ...receipt, ok: true, actionAttempted: true, noticeClicked: action === "open", submitted: action === "verify" };
+    })();
+    try { return await state.promise; }
+    finally {
+      state.promise = null;
+      if (!state.clicked && lockedTaskNotices.get(key) === state) lockedTaskNotices.delete(key);
+    }
+  }
+
   function findTaskDetailRoot() {
+    const execution = findExecutionDialog();
+    if (execution.present) return execution.root || null;
     const closeButton = findTaskDetailCloseButton();
     if (closeButton) {
       let current = closeButton;
@@ -2930,6 +3034,14 @@
   }
 
   function extractTweetUrl(root = document) {
+    // In the execution dialog the target is an icon link, labelled through
+    // aria-label. Do not pick another status link from the tweet's prose.
+    const labelled = Array.from(root.querySelectorAll?.("a[href]") || [])
+      .filter(node => isVisible(node) && normalize(node.getAttribute("aria-label") || buttonText(node)) === "查看目标推文");
+    if (labelled.length) {
+      const urls = labelled.map(node => normalizeTweetUrl(node.href || node.getAttribute("href")));
+      return urls.every(Boolean) && new Set(urls.map(url => normalizeTweetUrl(url, true))).size === 1 ? urls[0] : "";
+    }
     const anchorUrl = Array.from(root.querySelectorAll?.("a[href]") || [])
       .map((anchor) => normalizeTweetUrl(anchor.href))
       .find(Boolean);

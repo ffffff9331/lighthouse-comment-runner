@@ -65,22 +65,24 @@ function worker(onWatch) {
   const state = { running: true, runId: "resumed", lighthouseTabId: 11,
     currentTask: { taskKey: "order", tweetUrl: "https://x.com/fixture/status/123" } };
   const c = load("background.js", "completeXTaskWidgetLifecycle", {
-    runtimeState: state, setStage() {}, log() {},
+    runtimeState: state, URL, setStage() {}, log() {},
     async sendToTab(id, message) {
       sent.push({ id, type: message.type, runId: message.runId, task: message.task });
       if (message.type === "BEGIN_LIGHTHOUSE_COMPLETION_WATCH") return onWatch ? onWatch(state) : { ok: true };
+      if (message.type === "CHECK_LIGHTHOUSE_EXECUTION_STATE") return { ok: true, present: false };
       if (message.type === "COMPLETE_X_TASK_WIDGET") return { ok: true, submitted: true };
       throw Error("Unexpected message " + message.type);
     },
     waitForOfficialLighthouseCompletionDuringXSubmission: async () => null
   });
+  load("background.js", "normalizeTweetUrl", c);
   return { sent, state, c, run: () => c.completeXTaskWidgetLifecycle(12, "resumed", {}) };
 }
 
 test("a resumed run arms its current-order completion watch before X submission", async () => {
   const w = worker();
   assert.equal((await w.run()).ok, true);
-  assert.deepEqual(w.sent.map(e => e.type), ["BEGIN_LIGHTHOUSE_COMPLETION_WATCH", "COMPLETE_X_TASK_WIDGET"]);
+  assert.deepEqual(w.sent.map(e => e.type), ["BEGIN_LIGHTHOUSE_COMPLETION_WATCH", "CHECK_LIGHTHOUSE_EXECUTION_STATE", "COMPLETE_X_TASK_WIDGET"]);
   assert.equal(w.sent[0].runId, "resumed");
   assert.equal(w.sent[0].task.taskKey, "order");
 });
