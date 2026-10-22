@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.117";
+  const SCRIPT_VERSION = "0.7.120";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -122,6 +122,41 @@
         runId: message.runId, claimIntentId: message.claimIntentId });
       return true;
     }
+    if (message.type === "CHECK_LIGHTHOUSE_RECOVERY_STATE") {
+      const counters = Array.from(document.querySelectorAll("button[data-tab='ongoing']"));
+      const counter = counters.length === 1 ? counters[0] : null;
+      const countText = counter && isVisible(counter) ? normalize(counter.innerText || "") : "";
+      const count = hasLoadedCampaignListShell() ? countText.match(/^进行中\s*(\d+)$/) : null;
+      const outcome = readBoundOrderOutcome(message.task);
+      const execution = findExecutionDialog();
+      const detail = findTaskDetailRoot();
+      // The plaza count can lag behind a successful lock. A detail receipt or
+      // an in-flight lock must protect the order even without a known target.
+      const protectedDetail = detail && (hasPositiveClaimState(normalize(detail.innerText || ""), detail)
+        || Array.from(detail.querySelectorAll("button,[role='button']")).some(node =>
+          isVisible(node) && isDisabled(node) && /正在(?:预定|锁定)席位/.test(buttonText(node))));
+      const listedCount = count ? Number(count[1]) : null;
+      const orders = readRecoveryEscrowOrders(counter, listedCount);
+      sendResponse({ ok: message.platform === "lighthouse" && location.pathname === "/campaigns",
+        ...outcome, runId: message.runId, recoveryId: message.recoveryId, instanceId: INSTANCE_ID,
+        listedCount: orders.listedCount ?? listedCount,
+        activeCount: orders.pendingOnly ? 0 : orders.listedCount ?? listedCount,
+        ongoingReady: orders.ready,
+        executionPresent: execution.present || Boolean(protectedDetail),
+        invitationPending: !["absent", "expired"].includes(getStandaloneInvitationState()) });
+      return true;
+    }
+    if (message.type === "OPEN_LIGHTHOUSE_RECOVERY_ORDERS") {
+      const buttons = Array.from(document.querySelectorAll("button[data-tab='ongoing']")).filter(isVisible);
+      const allowed = message.platform === "lighthouse" && location.pathname === "/campaigns"
+        && message.runId && message.recoveryId === message.runId && message.instanceId === INSTANCE_ID
+        && !automationPaused && !findTaskDetailRoot() && !findExecutionDialog().present
+        && ["absent", "expired"].includes(getStandaloneInvitationState())
+        && buttons.length === 1;
+      if (allowed && !buttons[0].classList.contains("on")) buttons[0].click();
+      sendResponse({ ok: Boolean(allowed), runId: message.runId, recoveryId: message.recoveryId, instanceId: INSTANCE_ID });
+      return true;
+    }
     if (message.type === "CHECK_LIGHTHOUSE_INVITATION") {
       const invitationState = message.platform === "lighthouse" ? getStandaloneInvitationState() : "absent";
       const pending = !["absent", "expired"].includes(invitationState);
@@ -235,7 +270,7 @@
             seatLockedAt: receipt.task.seatLockedAt,
             detailSignature: claimDetailSignature(root),
             rejectionAbsent: !hasHardFailure(text),
-            positiveStateAbsent: !hasPositiveClaimState(text) && !lockConfirmationEvidence(root).length
+            positiveStateAbsent: !hasPositiveClaimState(text, root) && !lockConfirmationEvidence(root).length
           };
         }
         if (detailConfirmed === true && receipt.ok === true && receipt.task?.taskKey
@@ -679,7 +714,22 @@
     throw new Error("选中任务详情加载超时");
   }
 
-  function hasPositiveClaimState(text) {
+  function hasPositiveClaimState(text, root = null) {
+    // The target tweet is third-party content, not an order receipt. Exclude
+    // only its semantic section; keep all status text elsewhere in the detail.
+    const previews = new Set(Array.from(root?.querySelectorAll?.("section") || []).filter(section =>
+      Array.from(section.querySelectorAll?.("h2") || []).some(heading =>
+        heading.closest?.("section") === section
+        && /^(?:TARGET TWEET(?:\s+LIVE)?|目标推文)$/.test(normalize(heading.innerText || "")))));
+    if (previews.size && root?.childNodes) {
+      const read = node => {
+        if (previews.has(node)) return "";
+        if (node.nodeType === 3) return node.nodeValue || "";
+        if (node.childNodes?.length) return Array.from(node.childNodes).map(read).join("");
+        return node.innerText || node.textContent || "";
+      };
+      text = normalize(read(root));
+    }
     // These are pre-claim instructions, not a receipt for this order.
     const stateText = text.replace(/验证通过\s*(?:即到账|LUX\s*即时到账)/g, "");
     return /已锁定|已领取|进行中|已完成|已提交|验证通过|验证成功|奖励到账|任务完成/.test(stateText);
@@ -713,7 +763,7 @@
         || !observation.detailSignature || observation.detailSignature !== claimDetailSignature(root))
       return { ok: true, failed: false };
     const text = normalize(root.innerText || "");
-    if (!hasHardFailure(text) || hasPositiveClaimState(text)) return { ok: true, failed: false };
+    if (!hasHardFailure(text) || hasPositiveClaimState(text, root)) return { ok: true, failed: false };
     return {
       ok: true,
       failed: true,
@@ -2048,6 +2098,31 @@
       && controls.some((text) => /^进行中\s*\d+$/.test(text));
   }
 
+  function readRecoveryEscrowOrders(counter, listedCount) {
+    const unknown = { ready: false, pendingOnly: false };
+    if (!counter?.classList?.contains("on") || hasPageLoadingState()) return unknown;
+    const heading = Array.from(document.querySelectorAll("h1,h2,[role='heading']"))
+      .some(node => isVisible(node) && normalize(node.innerText || "") === "我的进行中任务");
+    const filters = Array.from(document.querySelectorAll("main [role='combobox'],main select")).filter(isVisible);
+    const filterText = filters.length === 1 ? normalize(filters[0].selectedOptions?.[0]?.textContent || filters[0].innerText || "") : "";
+    if (!heading || filterText !== "全部") return unknown;
+    const count = normalize(counter.innerText || "").match(/^进行中\s*(\d+)$/);
+    const total = count ? Number(count[1]) : listedCount;
+    const cards = Array.from(document.querySelectorAll("main article[role='button']")).filter(isVisible);
+    // The total includes verified 24-hour escrow payouts. Only an exhaustive,
+    // unfiltered list may prove that none still needs an action or submission.
+    if (!Number.isInteger(total) || total <= 0 || cards.length !== total) return unknown;
+    const pendingOnly = cards.every(card => {
+      const text = normalize(card.innerText || "");
+      const labels = Array.from(card.querySelectorAll("span,p,div")).filter(isVisible).map(node => normalize(node.innerText || ""));
+      const controls = Array.from(card.querySelectorAll("button")).filter(isVisible).map(buttonText);
+      return /^待到账\s/.test(text) && labels.includes("待到账奖励") && labels.includes("预计到账时间")
+        && /预计到账时间\s+\d{4}\/\d{1,2}\/\d{1,2}\s+GMT\+8\s+\d{1,2}:\d{2}:\d{2}\s+查看进度$/.test(text)
+        && controls.length === 1 && controls[0] === "查看进度";
+    });
+    return { ready: true, pendingOnly, listedCount: total };
+  }
+
   async function closeTaskDetailPanel(settings = {}) {
     const runId = activeRunId;
     const invitationPending = Symbol("invitationPending");
@@ -2479,7 +2554,7 @@
       priorClaimAttempted: Boolean(claimOperation?.claimActionAttempted),
       detailSignature: claimDetailSignature(root),
       rejectionAbsent: !hasHardFailure(normalize(root?.innerText || "")),
-      positiveStateAbsent: !hasPositiveClaimState(normalize(root?.innerText || "")),
+      positiveStateAbsent: !hasPositiveClaimState(normalize(root?.innerText || ""), root),
     };
   }
 
@@ -2634,7 +2709,7 @@
           // A new refusal may release this click only when no earlier claim,
           // success evidence or unrelated detail change can explain it.
           if (!observation.priorClaimAttempted && observation.rejectionAbsent
-              && observation.positiveStateAbsent && !hasPositiveClaimState(text)
+              && observation.positiveStateAbsent && !hasPositiveClaimState(text, observation.root)
               && !observation.evidence.length && !evidence.length
               && observation.detailSignature && observation.detailSignature === claimDetailSignature(observation.root)) {
             error.confirmedClaimRejection = true;
@@ -2652,7 +2727,7 @@
         if (evidence.some(value => !observation.evidence.includes(value))) return true;
         const refusal = observation.feedback?.find(item => item.sameDetail && item.refusal);
         if (refusal && !observation.priorClaimAttempted && observation.rejectionAbsent
-            && observation.positiveStateAbsent && !hasPositiveClaimState(text)
+            && observation.positiveStateAbsent && !hasPositiveClaimState(text, observation.root)
             && findLockButton() && !observation.evidence.some(value => value.startsWith("status:"))) {
           const error = new Error(`平台明确拒绝本次锁位：${refusal.text}`);
           error.confirmedClaimRejection = true;

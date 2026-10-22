@@ -10,6 +10,9 @@ const AUTO_RUN_STATE_KEY = "lighthouseAutoRunStateV1";
 // auto run on the next tick.
 const AUTO_RUN_KEEPALIVE_ALARM = "lighthouseAutoRunKeepaliveV1";
 const CAMPAIGNS_IDLE_RELOAD_ALARM = "lighthouseCampaignsIdleReloadV1";
+const AUTO_RECOVERY_ALARM = "lighthouseAutoRecoveryV1";
+const AUTO_RECOVERY_TIMEOUT_MS = 20 * 60 * 1000;
+const AUTO_RECOVERY_RECHECK_MS = 60 * 1000;
 const SITE_X_OPEN_WAIT_MS = 5000;
 const LIGHTHOUSE_PREVIOUS_DEFAULT_AI_SYSTEM_PROMPT = "根据原推文写一句自然的中文回复。像真实用户刷到后随手留下的感受，简短、有一点具体反应，不必完整表达观点。10到15个汉字为主，可保留必要的英文词。避免宣传腔、总结腔、夸张吹捧、复述原文和模板化感叹。只输出回复。";
 const LIGHTHOUSE_DEFAULT_AI_SYSTEM_PROMPT = "根据原推文写一句自然的中文回复。像真实用户刷到后随手留下的感受，简短、有一点具体反应，不必完整表达观点。5到20个汉字为主，可保留必要的英文词。避免宣传腔、总结腔、夸张吹捧、复述原文和模板化感叹。只输出回复。";
@@ -93,6 +96,7 @@ let claimReconciliation = null;
 let lastClaimReconciliation = { intent: null, at: 0 };
 let settingsOperationTail = Promise.resolve();
 let settingsOperationRevision = 0;
+let autoRecoveryInFlight = null;
 
 async function buildLighthouseMonitorSnapshot(reason = "update") {
   const task = runtimeState.currentTask || {};
@@ -194,7 +198,7 @@ chrome.runtime.onInstalled.addListener(async () => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === AUTO_RUN_KEEPALIVE_ALARM || alarm.name === CAMPAIGNS_IDLE_RELOAD_ALARM) {
+  if ([AUTO_RUN_KEEPALIVE_ALARM, CAMPAIGNS_IDLE_RELOAD_ALARM, AUTO_RECOVERY_ALARM].includes(alarm.name)) {
     const alarmState = runtimeState;
     void handleAutoRunKeepaliveTick().catch((error) => {
       if (runtimeState !== alarmState) return;
@@ -540,6 +544,10 @@ async function stopAndClearRun() {
   if (!ownsStop()) return { ok: false, cancelled: true, state: runtimeState };
   await clearCampaignsIdleReloadAlarm();
   if (!ownsStop()) return { ok: false, cancelled: true, state: runtimeState };
+  if (previousRun.autoRecovery) {
+    await chrome.alarms.clear(AUTO_RECOVERY_ALARM);
+    if (!ownsStop()) return { ok: false, cancelled: true, state: runtimeState };
+  }
   await broadcastAutomationPause(true, ownsStop, [previousRun.lighthouseTabId, previousRun.xTabId, previousRun.uncertainAction?.tabId]);
   if (!ownsStop()) return { ok: false, cancelled: true, state: runtimeState };
   runtimeState.runId = createRunId();
@@ -1005,7 +1013,7 @@ async function startAutoRun(options, windowId = null, manualRestart = false) {
   if (!isCurrent()) return cancelled();
   // Armed only once every preflight check has passed; a blocked start must
   // not leave a keepalive alarm ticking.
-  await ensureAutoRunKeepalive();
+  await ensureAutoRunKeepalive(true);
   if (!isCurrent()) return cancelled();
   await armCampaignsIdleReloadAlarm();
   if (!isCurrent()) return cancelled();
@@ -1071,6 +1079,11 @@ async function startNextAutoTask(reason) {
     setStage("attempt_limit_reached");
     log("warn", "已达到任务尝试上限，停止正式模式");
     return { ok: true, state: runtimeState };
+  }
+
+  if (!runtimeState.autoRecovery || reason === "after_success") {
+    await resetAutoRecoveryDeadline();
+    if (!isCurrent()) return cancelled();
   }
 
   const tab = await getOrCreateLighthouseTab(LIGHTHOUSE_CAMPAIGNS_URL, isCurrent);
@@ -3605,7 +3618,14 @@ async function recordLighthouseClaimCheckpoint(message, sender) {
       invitation = validateLighthouseInvitationCheckpoint(message, state, intent);
       if (!invitation.ok) return invitation;
     }
-    const error = missingAIKeyMessage(settings, invitation?.task || state.currentTask || state.selectedTask);
+    const claimTask = invitation?.task || state.currentTask || state.selectedTask;
+    const recoveredKeys = new Set((state.attemptedTaskRecords || [])
+      .filter(record => record.timeoutRecovery && record.expiresAt > Date.now()).map(record => record.key));
+    const claimKeys = [...getTaskDedupeKeys(claimTask || {}), normalizeTweetUrl(claimTask?.tweetUrl, true)];
+    if (claimKeys.some(key => key && recoveredKeys.has(key))) {
+      return { ok: false, error: "该订单已超时恢复并保留记录，未重复接取" };
+    }
+    const error = missingAIKeyMessage(settings, claimTask);
     if (error) return { ok: false, error };
     // Bind the invitation identity before permitting either acceptance or the
     // later lock click in this same operation. Worker recovery needs both.
@@ -3616,6 +3636,8 @@ async function recordLighthouseClaimCheckpoint(message, sender) {
     // Set in memory before yielding, then persist before acknowledging. A
     // refresh during either await must never release an authorized click.
     intent.claimActionAttempted = true;
+    if (state.mode === "auto") await resetAutoRecoveryDeadline();
+    if (!ownsIntent()) return { ok: false, cancelled: true };
   } else {
     return { ok: false, error: "接单检查点未就绪，未允许点击" };
   }
@@ -3781,7 +3803,8 @@ async function sendToTab(tabId, payload) {
               return { ok: true, task: runtimeState.currentTask, message: "本单锁位已核对，继续自动流程" };
             }
           }
-          log("error", `接单动作 ${payload.type} 未确认订单状态，已停止并保留执行意图；不会自动重试，请先核对本单${result?.message ? `。页面回执：${result.message}` : ""}`);
+          log("error", `接单动作 ${payload.type} 未确认订单状态，已停止并保留执行意图；${runtimeState.autoRecovery
+            ? "20 分钟截止时自动重启流程，不立即重复接单" : "不会自动重试，请先核对本单"}${result?.message ? `。页面回执：${result.message}` : ""}`);
           return { ok: false, uncertain: true, message: result?.message || "接单回执未确认订单状态，已保留执行意图，请先核对本单" };
         }
         if (safelyUnclaimed && !claimedTask && result?.claimed !== true
@@ -4378,6 +4401,7 @@ function createInitialState() {
     attemptedTaskKeys: [],
     attemptedTaskRecords: [],
     lastProgressAt: Date.now(),
+    autoRecovery: null,
     runId: createRunId(),
     logs: []
   };
@@ -5331,6 +5355,10 @@ function normalizeForLogFilter(text) {
 function setStage(stage) {
   if (runtimeState.manuallyStopped) return;
   runtimeState.stage = stage;
+  if (runtimeState.autoRecovery && isPlannedAutoStop(stage)) {
+    runtimeState.autoRecovery = null;
+    void chrome.alarms.clear(AUTO_RECOVERY_ALARM);
+  }
   persistAutoRunState();
   publishLighthouseMonitorSnapshot("stage");
 }
@@ -5396,8 +5424,8 @@ async function restoreAutoRunState() {
       // Older releases cached unclaimed tasks and even treated a batch
       // estimate as an account-wide wait. The plaza is authoritative for
       // unclaimed availability; permanent tier exclusions live separately.
-      runtimeState.attemptedTaskRecords = [];
-      runtimeState.attemptedTaskKeys = [];
+      runtimeState.attemptedTaskRecords = (runtimeState.attemptedTaskRecords || []).filter(record => record.timeoutRecovery === true);
+      pruneAttemptedTasks();
       const refusal = runtimeState.logs.find(entry => /^(?:\[详情页\]\s*)?平台明确拒绝本次锁位：/.test(entry.text || ""));
       const batch = String(refusal?.text || "").replace(/\s+/g, "")
         .match(/^(?:\[详情页\])?平台明确拒绝本次锁位：本批名额暂不可领取，请约([1-9]\d{0,3})分钟后重试[。.]?$/);
@@ -5416,12 +5444,14 @@ async function restoreAutoRunState() {
       log("warn", mayResume ? "Chrome 后台恢复了中断的 Lighthouse 状态，等待保活闹钟自动续跑（先核对订单）" : "已恢复 Lighthouse 订单记录，保持停止状态");
     }
     if (mayResume) await ensureAutoRunKeepalive();
+    if (runtimeState.autoRecovery) await ensureAutoRecoveryAlarm();
   } catch (_) {
     // A corrupt or stale snapshot must never prevent a fresh run.
   }
 }
 
-async function ensureAutoRunKeepalive() {
+async function ensureAutoRunKeepalive(startRecoveryDeadline = false) {
+  if (startRecoveryDeadline) await resetAutoRecoveryDeadline();
   try {
     if (typeof chrome === "undefined" || !chrome.alarms) return;
     await chrome.alarms.create(AUTO_RUN_KEEPALIVE_ALARM, {
@@ -5458,14 +5488,164 @@ async function clearCampaignsIdleReloadAlarm() {
   } catch (_) {}
 }
 
+function isPlannedAutoStop(stage) {
+  return ["finished", "attempt_limit_reached", "selected_flow_done", "auto_waiting_schedule",
+    "ai_key_required", "auto_blocked", "settings_error"].includes(stage);
+}
+
+async function ensureAutoRecoveryAlarm() {
+  const recovery = runtimeState.autoRecovery;
+  if (runtimeState.manuallyStopped || !recovery || !Number.isFinite(recovery.deadlineAt)) return;
+  await chrome.alarms.create(AUTO_RECOVERY_ALARM, {
+    when: Math.max(Date.now() + 1000, recovery.deadlineAt, Number(recovery.nextAttemptAt) || 0)
+  });
+}
+
+async function resetAutoRecoveryDeadline() {
+  if (runtimeState.manuallyStopped || !runtimeState.running || runtimeState.mode !== "auto") return;
+  const state = runtimeState;
+  const runId = state.runId;
+  runtimeState.autoRecovery = { mode: "auto", deadlineAt: Date.now() + AUTO_RECOVERY_TIMEOUT_MS };
+  await persistAutoRunState(true);
+  if (runtimeState !== state || state.runId !== runId || state.manuallyStopped) { await persistAutoRunState(true); return; }
+  await ensureAutoRecoveryAlarm();
+}
+
+async function readAutoRecoveryMessage(tabId, payload) {
+  let timer;
+  try {
+    return await Promise.race([chrome.tabs.sendMessage(tabId, payload),
+      new Promise(resolve => { timer = setTimeout(() => resolve(null), 2500); })]);
+  } catch (_) { return null; }
+  finally { clearTimeout(timer); }
+}
+
+function retainTimedOutOrder(state, prior) {
+  const task = prior.currentTask || prior.selectedTask;
+  const intent = prior.uncertainAction;
+  const keys = new Set([...getTaskDedupeKeys(task || {}), normalizeTweetUrl(task?.tweetUrl, true), intent?.taskKey].filter(Boolean));
+  // Preserve the old action separately; elapsed time is never completion
+  // evidence and must not authorize replaying that action in the new run.
+  state.lastAutoRecovery = { at: Date.now(), reason: "twenty_minute_timeout",
+    taskKey: task?.taskKey || intent?.taskKey || "", tweetUrl: task?.tweetUrl || "",
+    task, uncertainAction: intent, lastXResult: prior.lastXResult,
+    completionEvidence: prior.completionEvidence, previousRunId: prior.runId };
+  state.attemptedTaskRecords = (state.attemptedTaskRecords || []).filter(record => !keys.has(record.key));
+  state.attemptedTaskRecords.push(...Array.from(keys, key => ({ key,
+    expiresAt: Date.now() + MAX_DEFERRED_TASK_DEDUPE_MS, timeoutRecovery: true })));
+  pruneAttemptedTasks();
+}
+
+async function recoverTimedOutAutoRun() {
+  if (autoRecoveryInFlight) { await autoRecoveryInFlight; return true; }
+  const prior = runtimeState;
+  const recovery = prior.autoRecovery;
+  if (prior.manuallyStopped || recovery?.mode !== "auto" || isPlannedAutoStop(prior.stage)
+      || !Number.isFinite(recovery?.deadlineAt) || Date.now() < recovery.deadlineAt) return false;
+  if (Date.now() < Number(recovery.nextAttemptAt || 0)) return true;
+  const operation = (async () => {
+    // Invalidate every old continuation before yielding. The persisted
+    // deadline, rather than a website verification receipt, owns recovery.
+    const state = runtimeState = { ...prior, running: false, runId: createRunId(),
+      stage: "auto_timeout_reconciling", autoRecovery: { ...recovery, nextAttemptAt: Date.now() + AUTO_RECOVERY_RECHECK_MS } };
+    const recoveryRunId = state.runId;
+    const current = () => runtimeState === state && state.runId === recoveryRunId && !state.manuallyStopped;
+    const task = state.currentTask;
+    const intent = state.uncertainAction;
+    // These promises belong to the abandoned run. Their guarded callbacks may
+    // settle later, but a new flow must never await the old worker's promise.
+    capturedTargetRecoveryPromise = null;
+    directTweetOpenPromise = null;
+    claimReconciliation = null;
+    try {
+      retainTimedOutOrder(state, prior);
+      await persistAutoRunState(true);
+      if (!current()) { await persistAutoRunState(true); return; }
+      await ensureAutoRecoveryAlarm();
+      if (!current()) return;
+      for (const controller of activeAIRequests) controller.abort(new Error("20 分钟自动恢复"));
+      clearXOpenWatch();
+      log("warn", "自动流程超过 20 分钟，作废旧流程并重新加载页面恢复；不等待官网验证或进行中计数");
+      const targets = new Map([[prior.lighthouseTabId, "CANCEL_LIGHTHOUSE_RUN"], [prior.xTabId, "CANCEL_X_RUN"]]);
+      if (Number.isInteger(intent?.tabId)) targets.set(intent.tabId, /^(?:RUN_X_|COMPLETE_X_|CLICK_X_)/.test(intent.type) ? "CANCEL_X_RUN" : "CANCEL_LIGHTHOUSE_RUN");
+      for (const [tabId, type] of targets) {
+        if (!Number.isInteger(tabId)) continue;
+        // Best effort only: a frozen content script cannot acknowledge CANCEL.
+        // Unloading its document below is the definitive cancellation.
+        await readAutoRecoveryMessage(tabId, {type, platform:"lighthouse", runId: intent?.tabId === tabId ? intent.runId : prior.runId});
+        if (!current()) return;
+        if (type !== "CANCEL_X_RUN") continue;
+        let xTab;
+        try { xTab = await chrome.tabs.get(tabId); }
+        catch (error) { if (/No tab with id|Tab not found/i.test(error.message || "")) continue; throw error; }
+        if (!current()) return;
+        const expected = normalizeTweetUrl(task?.tweetUrl || "", true);
+        const actual = normalizeTweetUrl(xTab.pendingUrl || xTab.url || "", true);
+        if (isTabInRuntimeWindow(xTab) && actual && (!expected || actual === expected)) {
+          await chrome.tabs.reload(tabId);
+          if (!current()) return;
+        }
+      }
+      const tab = await getOrCreateLighthouseTab(LIGHTHOUSE_CAMPAIGNS_URL, current);
+      if (!current()) return;
+      if (!tab || !isLighthouseUrl(tab.pendingUrl || tab.url) || !isTabInRuntimeWindow(tab)) throw new Error("恢复页面或窗口不匹配");
+      rememberLighthouseTab(tab);
+      if (tab.url === LIGHTHOUSE_CAMPAIGNS_URL && !tab.pendingUrl) await chrome.tabs.reload(tab.id);
+      else await chrome.tabs.update(tab.id, {url: LIGHTHOUSE_CAMPAIGNS_URL});
+      if (!current()) return;
+      if (await waitForTabComplete(tab.id) === false) throw new Error("恢复页面加载超时");
+      if (!current()) return;
+      const injected = await ensureContentScriptInjected(tab.id, current);
+      if (!current()) return;
+      if (!injected) throw new Error("恢复页面脚本未连接");
+      state.currentTask = null; state.selectedTask = null; state.uncertainAction = null;
+      state.lastXResult = null; state.completionEvidence = null;
+      state.xTabId = null; state.xTabWindowId = null;
+      state.marketplaceRefreshInFlight = false; state.running = true; state.mode = "auto";
+      state.lastProgressAt = Date.now();
+      try { await resetAutoRecoveryDeadline(); }
+      catch (error) {
+        if (current()) { state.running=false;state.currentTask=task;state.uncertainAction=intent;state.lastXResult=prior.lastXResult;state.completionEvidence=prior.completionEvidence;state.xTabId=prior.xTabId; }
+        throw error;
+      }
+      if (!current()) return;
+      setStage("auto_timeout_recovered");
+      log("info", "20 分钟自动恢复完成：旧单记录已保留并去重，重新扫描任务广场；未补发评论或补交验证");
+      await ensureAutoRunKeepalive();
+      if (!current()) return;
+      void startNextAutoTask("after_twenty_minute_recovery").then(result => {
+        if (current() && result?.ok === false && !result.cancelled) throw new Error(result.error || result.message || "流程未能接续");
+      }).catch(error => {
+        if (!current()) return;
+        state.running = false;
+        setStage("auto_timeout_recovery_failed");
+        log("error", `恢复扫描失败，按恢复计时再次尝试：${error.message || error}`);
+        void ensureAutoRecoveryAlarm().catch(() => {});
+      });
+    } catch (error) {
+      if (!current()) return;
+      state.running = false;
+      state.autoRecovery = {...recovery,nextAttemptAt:Date.now()+AUTO_RECOVERY_RECHECK_MS};
+      setStage("auto_timeout_recovery_waiting");
+      log("warn", `20 分钟恢复暂未完成，一分钟后重试：${error.message || error}`);
+      await ensureAutoRecoveryAlarm();
+    }
+  })();
+  autoRecoveryInFlight = operation;
+  try { await operation; return true; }
+  finally { if (autoRecoveryInFlight === operation) autoRecoveryInFlight = null; }
+}
+
 async function handleAutoRunKeepaliveTick() {
   await runtimeStateReady;
   if (runtimeState.manuallyStopped) {
     const stoppedState = runtimeState;
     await clearAutoRunKeepalive();
     if (runtimeState === stoppedState && runtimeState.manuallyStopped) await clearCampaignsIdleReloadAlarm();
+    if (runtimeState === stoppedState && runtimeState.manuallyStopped && runtimeState.autoRecovery) await chrome.alarms.clear(AUTO_RECOVERY_ALARM);
     return;
   }
+  if (runtimeState.autoRecovery && await recoverTimedOutAutoRun()) return;
   const tickState = runtimeState;
   const tickRunId = runtimeState.runId;
   const tickStopEpoch = runtimeState.stopEpoch;

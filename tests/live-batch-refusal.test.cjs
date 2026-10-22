@@ -49,10 +49,20 @@ function page(options = {}) {
   } });
   const guide = options.withGuide === false ? [] : GUIDE.map(text => node(text));
   fixture.nodes.push(button, ...guide, node("在 X 打开", { control: true }), ...(options.initialNodes || []));
+  if (options.previewText) {
+    const heading = node(options.previewHeading || "TARGET TWEET\nLIVE", { closest: () => fixture.preview });
+    fixture.preview = node(`TARGET TWEET LIVE 在 X 打开 ${options.previewText}`, {
+      querySelectorAll: selector => selector === "h2" ? [heading] : [],
+    });
+    fixture.nodes.push(fixture.preview);
+    fixture.wrapper = { childNodes: fixture.nodes, querySelectorAll: selector => selector === "h2" ? [heading] : [] };
+  }
   fixture.root = {
     title: "把行为数据化成链上资产", isConnected: true, visible: true,
+    get childNodes() { return options.nestedSection ? [fixture.wrapper] : fixture.nodes; },
     get innerText() { return `${this.title} 评论任务 0.1 LUX 当前可抢 3 席 ${fixture.nodes.map(n => n.innerText).join(" ")}`; },
     querySelectorAll(selector) {
+      if (selector === "section") return fixture.preview ? (options.nestedSection ? [fixture.wrapper, fixture.preview] : [fixture.preview]) : [];
       if (selector === "a[href]") return fixture.nodes.filter(n => n.href);
       if (selector.includes("h1,h2,h3")) return [node(this.title)];
       return fixture.nodes;
@@ -143,6 +153,25 @@ function assertUncertain(result, p) {
 // The user explicitly restored the conservative contract: even fresh refusal
 // feedback cannot release a claim until the lock control is clickable again.
 for (const route of ["DEBUG_LOCK_SEAT_AND_EXTRACT", "WAIT_SELECTED_COUNTDOWN_AND_LOCK", "START_LIGHTHOUSE_COMMENT_TASK"]) {
+  test(`${route}: target tweet completion wording cannot hide a fresh batch refusal`, async () => {
+    const p = page({ previewText: "手机性能在线时长任务完成情况都会影响奖励", onClick(f) { f.notify(REFUSAL); } });
+    assertRejected(await p.dispatch(route), p, route);
+  });
+  test(`${route}: a real status outside the target preview still protects an uncertain order`, async () => {
+    const p = page({ previewText: "手机性能在线时长任务完成情况都会影响奖励",
+      initialNodes: [node("已提交")], onClick(f) { f.notify(REFUSAL); } });
+    assertUncertain(await p.dispatch(route), p);
+  });
+  test(`${route}: nested preview sections cannot hide a split real completion label`, async () => {
+    const p = page({ previewText: "手机性能在线时长任务完成情况都会影响奖励", nestedSection: true,
+      initialNodes: [node("已提交", { childNodes: [{ nodeType: 3, nodeValue: "已" }, { nodeType: 3, nodeValue: "提交" }] })],
+      onClick(f) { f.notify(REFUSAL); } });
+    assertUncertain(await p.dispatch(route), p);
+  });
+  test(`${route}: unknown preview structure retains conservative state protection`, async () => {
+    const p = page({ previewText: "任务完成", previewHeading: "其他区域", onClick(f) { f.notify(REFUSAL); } });
+    assertUncertain(await p.dispatch(route), p);
+  });
   test(`${route}: real static guidance and fresh batch refusal release a clickable lock`, async () => {
     const p = page({ onClick(f) {
       f.notify(REFUSAL);
