@@ -97,7 +97,7 @@ test("an uncertain automatic run restarts at twenty minutes without waiting for 
   assert.notEqual(w.state().runId,"old-run");assert.equal(w.state().completed,0);
   assert.equal(w.sent.some(m=>m.type.startsWith("CHECK_")||m.type.startsWith("OPEN_")),false);
   assert.equal(w.state().lastAutoRecovery.taskKey,task.taskKey);
-  assert.ok(w.c.getActiveAttemptedTaskKeys().includes(task.taskKey));
+  assert.equal(w.c.getActiveAttemptedTaskKeys().includes(task.taskKey),false);
   assert.equal(w.sent.some(m=>/REPLY|VERIFY|SUBMIT/.test(m.type)),false);
   assert.equal(w.stored[KEY].uncertainAction,null);
 });
@@ -132,10 +132,10 @@ test("timeout recovery does not invent a verified completion from an elapsed tim
   const w=await worker({outcome:"completed"});w.advance(LIMIT);await w.tick();assert.equal(w.done.length,0);assert.equal(w.reloads.length,1);
   assert.equal(w.state().completionEvidence,null);assert.equal(w.state().completed,0);
 });
-test("a twenty-minute-old lock is excluded instead of replaying its original order",async()=>{
-  const w=await worker({outcome:"locked",activeCount:1});w.advance(LIMIT);await w.tick();assert.deepEqual(w.scans,["after_twenty_minute_recovery"]);assert.equal(w.reloads.length,1);assert.ok(w.c.getActiveAttemptedTaskKeys().includes(task.taskKey));
+test("a platform-expired order is archived without a new local exclusion",async()=>{
+  const w=await worker({outcome:"locked",activeCount:1});w.advance(LIMIT);await w.tick();assert.deepEqual(w.scans,["after_twenty_minute_recovery"]);assert.equal(w.reloads.length,1);assert.equal(w.c.getActiveAttemptedTaskKeys().includes(task.taskKey),false);
 });
-test("an unknown X post is archived and excluded while scanning resumes",async()=>{
+test("an unknown X post is archived without replay while scanning resumes",async()=>{
   const w=await worker({outcome:"locked",activeCount:1});w.state().uncertainAction.type="RUN_X_REPLY";w.state().uncertainAction.tabId=22;w.state().xTabId=22;w.advance(LIMIT);await w.tick();assert.equal(w.scans.length,1);assert.deepEqual(w.reloads,[22,11]);assert.equal(w.state().lastAutoRecovery.uncertainAction.type,"RUN_X_REPLY");assert.equal(w.sent.some(m=>/^(RUN_X_|COMPLETE_|SUBMIT_)/.test(m.type)),false);
 });
 test("concurrent alarms share one recovery and one marketplace restart",async()=>{
@@ -205,10 +205,10 @@ for (const options of [{loadOk:false},{injectOk:false}]) {
     assert.equal(w.alarms.get(ALARM).when,w.state().autoRecovery.nextAttemptAt);
   });
 }
-test("timeout dedupe survives a worker restart even after the old task is detached",async()=>{
+test("archived timeout evidence survives worker restart without excluding the task",async()=>{
   const w=await worker();w.advance(LIMIT);await w.tick();
   const restored=await worker({saved:clone(w.state())});
-  assert.ok(restored.c.getActiveAttemptedTaskKeys().includes(task.taskKey));
+  assert.equal(restored.c.getActiveAttemptedTaskKeys().includes(task.taskKey),false);
   assert.equal(restored.state().lastAutoRecovery.taskKey,task.taskKey);
 });
 test("recovery refresh failures cannot lose the original action identity",async()=>{
@@ -248,27 +248,43 @@ async function nextClaim(w, claimTask, invitation = false) {
   if(invitation)message.invitationTask=claimTask;
   return w.c.recordLighthouseClaimCheckpoint(message,{tab:{id:11},frameId:0});
 }
-test("a normal claim for the timeout task is rejected before its click checkpoint",async()=>{
+test("a newly available task is not blocked by the expired prior order",async()=>{
   const w=await worker();w.advance(LIMIT);await w.tick();
-  const result=await nextClaim(w,task);assert.equal(result.ok,false);assert.equal(w.state().uncertainAction.claimActionAttempted,false);
+  const result=await nextClaim(w,task);assert.equal(result.ok,true);assert.equal(w.state().uncertainAction.claimActionAttempted,true);
 });
-test("a repeated invitation using the canonical X URL cannot bypass timeout dedupe",async()=>{
+test("a newly offered invitation is not blocked by an expired prior order URL",async()=>{
   const w=await worker();w.advance(LIMIT);await w.tick();
   const url=w.c.normalizeTweetUrl(target,true);
   const result=await nextClaim(w,{source:"lighthouse_invitation",taskKey:`invitation:${url}`,tweetUrl:url,taskType:"评论",title:"Another title"},true);
-  assert.equal(result.ok,false);assert.equal(w.state().uncertainAction.claimActionAttempted,false);
+  assert.equal(result.ok,true);assert.equal(w.state().uncertainAction.claimActionAttempted,true);
 });
 test("a different new order remains claimable after timeout recovery",async()=>{
   const w=await worker();w.advance(LIMIT);await w.tick();
   const result=await nextClaim(w,{taskKey:"order-456",tweetUrl:"https://x.com/new/status/456",title:"New order"});
   assert.equal(result.ok,true);assert.equal(result.permitClaimClick,true);
 });
-test("timeout exclusions expire after their recorded protection window",async()=>{
-  const w=await worker();w.advance(LIMIT);await w.tick();w.advance(6*60*60*1000+1);
-  const result=await nextClaim(w,task);assert.equal(result.ok,true);
+test("old timeout exclusions are removed immediately after an upgrade",async()=>{
+  const old=await worker();old.state().attemptedTaskRecords=[{key:task.taskKey,expiresAt:1000000+6*60*60*1000,timeoutRecovery:true}];
+  old.state().attemptedTaskKeys=[task.taskKey];
+  const w=await worker({saved:clone(old.state())});
+  assert.equal(w.c.getActiveAttemptedTaskKeys().includes(task.taskKey),false);
+  assert.equal(w.state().attemptedTaskRecords.some(record=>record.timeoutRecovery),false);
 });
 test("timeout restart retains earlier pending verification records for the user",async()=>{
   const w=await worker();const records=[{taskKey:"earlier-pending",tweetUrl:"https://x.com/old/status/987"}];
   w.state().pendingVerifications=clone(records);w.advance(LIMIT);await w.tick();
   assert.deepEqual(clone(w.state().pendingVerifications),records);assert.equal(w.scans.length,1);
+});
+
+test("removing legacy timeout exclusions preserves ordinary active-order dedupe",async()=>{
+  const w=await worker();w.state().attemptedTaskRecords=[
+    {key:"old-timeout",expiresAt:1000000+6*60*60*1000,timeoutRecovery:true},
+    {key:"active-order",expiresAt:1000000+60000}
+  ];
+  assert.deepEqual(clone(w.c.getActiveAttemptedTaskKeys()),["active-order"]);
+});
+test("deadline recovery releases the expired task's existing local exclusion",async()=>{
+  const w=await worker();w.state().attemptedTaskRecords=[{key:task.taskKey,expiresAt:1000000+LIMIT+60000}];
+  w.advance(LIMIT);await w.tick();assert.equal(w.c.getActiveAttemptedTaskKeys().includes(task.taskKey),false);
+  assert.equal(w.state().lastAutoRecovery.taskKey,task.taskKey);
 });

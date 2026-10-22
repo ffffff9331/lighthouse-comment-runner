@@ -3618,14 +3618,7 @@ async function recordLighthouseClaimCheckpoint(message, sender) {
       invitation = validateLighthouseInvitationCheckpoint(message, state, intent);
       if (!invitation.ok) return invitation;
     }
-    const claimTask = invitation?.task || state.currentTask || state.selectedTask;
-    const recoveredKeys = new Set((state.attemptedTaskRecords || [])
-      .filter(record => record.timeoutRecovery && record.expiresAt > Date.now()).map(record => record.key));
-    const claimKeys = [...getTaskDedupeKeys(claimTask || {}), normalizeTweetUrl(claimTask?.tweetUrl, true)];
-    if (claimKeys.some(key => key && recoveredKeys.has(key))) {
-      return { ok: false, error: "该订单已超时恢复并保留记录，未重复接取" };
-    }
-    const error = missingAIKeyMessage(settings, claimTask);
+    const error = missingAIKeyMessage(settings, invitation?.task || state.currentTask || state.selectedTask);
     if (error) return { ok: false, error };
     // Bind the invitation identity before permitting either acceptance or the
     // later lock click in this same operation. Worker recovery needs both.
@@ -5257,6 +5250,9 @@ function pruneAttemptedTasks() {
     : (runtimeState.attemptedTaskKeys || []).map((key) => ({ key, expiresAt: now + ATTEMPTED_TASK_DEDUPE_MS }));
   const seen = new Set();
   runtimeState.attemptedTaskRecords = records
+    // 0.7.120 added six-hour timeout exclusions. Platform orders expire after
+    // twenty minutes; that extra local exclusion must not survive an upgrade.
+    .filter((record) => record?.timeoutRecovery !== true)
     .filter((record) => record && record.key && Number(record.expiresAt || 0) > now)
     .filter((record) => {
       if (seen.has(record.key)) return false;
@@ -5424,8 +5420,8 @@ async function restoreAutoRunState() {
       // Older releases cached unclaimed tasks and even treated a batch
       // estimate as an account-wide wait. The plaza is authoritative for
       // unclaimed availability; permanent tier exclusions live separately.
-      runtimeState.attemptedTaskRecords = (runtimeState.attemptedTaskRecords || []).filter(record => record.timeoutRecovery === true);
-      pruneAttemptedTasks();
+      runtimeState.attemptedTaskRecords = [];
+      runtimeState.attemptedTaskKeys = [];
       const refusal = runtimeState.logs.find(entry => /^(?:\[详情页\]\s*)?平台明确拒绝本次锁位：/.test(entry.text || ""));
       const batch = String(refusal?.text || "").replace(/\s+/g, "")
         .match(/^(?:\[详情页\])?平台明确拒绝本次锁位：本批名额暂不可领取，请约([1-9]\d{0,3})分钟后重试[。.]?$/);
@@ -5523,16 +5519,15 @@ async function readAutoRecoveryMessage(tabId, payload) {
 function retainTimedOutOrder(state, prior) {
   const task = prior.currentTask || prior.selectedTask;
   const intent = prior.uncertainAction;
-  const keys = new Set([...getTaskDedupeKeys(task || {}), normalizeTweetUrl(task?.tweetUrl, true), intent?.taskKey].filter(Boolean));
   // Preserve the old action separately; elapsed time is never completion
   // evidence and must not authorize replaying that action in the new run.
   state.lastAutoRecovery = { at: Date.now(), reason: "twenty_minute_timeout",
     taskKey: task?.taskKey || intent?.taskKey || "", tweetUrl: task?.tweetUrl || "",
     task, uncertainAction: intent, lastXResult: prior.lastXResult,
     completionEvidence: prior.completionEvidence, previousRunId: prior.runId };
-  state.attemptedTaskRecords = (state.attemptedTaskRecords || []).filter(record => !keys.has(record.key));
-  state.attemptedTaskRecords.push(...Array.from(keys, key => ({ key,
-    expiresAt: Date.now() + MAX_DEFERRED_TASK_DEDUPE_MS, timeoutRecovery: true })));
+  // The platform releases uncompleted orders at twenty minutes. Keep the
+  // evidence without turning the expired order into a new local blacklist.
+  releaseAttemptedTask(task);
   pruneAttemptedTasks();
 }
 
@@ -5610,7 +5605,7 @@ async function recoverTimedOutAutoRun() {
       }
       if (!current()) return;
       setStage("auto_timeout_recovered");
-      log("info", "20 分钟自动恢复完成：旧单记录已保留并去重，重新扫描任务广场；未补发评论或补交验证");
+      log("info", "20 分钟自动恢复完成：旧单记录已保留，重新扫描任务广场；未补发评论或补交验证");
       await ensureAutoRunKeepalive();
       if (!current()) return;
       void startNextAutoTask("after_twenty_minute_recovery").then(result => {
