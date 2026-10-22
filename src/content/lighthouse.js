@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.121";
+  const SCRIPT_VERSION = "0.7.122";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -1605,10 +1605,15 @@
     throw error;
   }
 
-  function assertInvitationTarget(task) {
+  function hasMatchingInvitationTarget(task) {
     const root = findTaskDetailRoot();
-    if (findStandaloneInvitation() || !root || root === document.body
-        || !task.tweetUrl || normalizeTweetUrl(extractTweetUrl(root), true) !== normalizeTweetUrl(task.tweetUrl, true)) {
+    const expected = normalizeTweetUrl(task.tweetUrl, true);
+    return Boolean(!findStandaloneInvitation() && root && root !== document.body
+      && expected && normalizeTweetUrl(extractTweetUrl(root), true) === expected);
+  }
+
+  function assertInvitationTarget(task) {
+    if (!hasMatchingInvitationTarget(task)) {
       const error = new Error("邀请接单后的目标任务不匹配，已保留本单等待核对");
       error.task = task;
       throw error;
@@ -1692,7 +1697,11 @@
     const started = Date.now();
     while (Date.now() - started < Math.min(getPageWaitMs(settings), 30000)) {
       assertActiveRun(runId);
-      if (!findInvitationAcceptButton({ includeDisabled: true }) && isTaskDetailOpen()) {
+      // The execution shell can render before its target, or briefly retain
+      // the previous detail. Wait within this claim's existing deadline so
+      // the original flow can continue once the same-order receipt arrives.
+      if (!findInvitationAcceptButton({ includeDisabled: true }) && isTaskDetailOpen()
+          && hasMatchingInvitationTarget(task)) {
         assertInvitationTarget(task);
         const detail = buildTask(settings, task.taskType);
         assertSupportedDetailTask(detail, settings);

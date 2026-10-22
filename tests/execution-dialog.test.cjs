@@ -61,6 +61,65 @@ test("accepted invitation recognizes the real success dialog without visible tar
   assert.equal(execution.open.clicks, 1, "opening the same order is idempotent");
 });
 
+for (const transition of ["missing-target", "previous-target", "previous-detail"]) {
+  test(`invitation waits for ${transition} to settle before opening the same claimed task`, async t => {
+    const { w, p } = await connected(t, { popup: true });
+    let execution, elapsed = 0;
+    p.f.accept.onClick = () => {
+      if (transition === "previous-detail") p.f.installDetail(OTHER);
+      else execution = installExecution(p, { target: transition === "missing-target" ? "" : OTHER });
+    };
+    p.f.beforeWait = ms => {
+      if (!p.f.accept.clicks) return;
+      elapsed += ms;
+      if (elapsed >= 5000 && !execution?.settled) {
+        if (transition === "previous-detail") execution = installExecution(p);
+        else execution.link.href = TARGET;
+        execution.settled = true;
+      }
+    };
+    const runId = w.state().runId;
+    const result = await w.c.sendToTab(11, { type: "START_LIGHTHOUSE_COMMENT_TASK", runId,
+      settings: { actionDelayMs: 150, cooldownPollMs: 250, lockSeatTimeoutMs: 5000 } });
+    assert.equal(result.ok, true, result.message);
+    assert.equal(result.task.seatLocked, true);
+    assert.equal(result.task.tweetUrl, TARGET);
+    assert.equal(w.state().running, true, "the original auto flow must remain active");
+    assert.ok(!w.state().uncertainAction);
+    assert.equal(p.f.accept.clicks, 1);
+    assert.equal(p.f.lock?.clicks || 0, 0);
+    assert.equal(p.action.clicks, 0);
+    const message = { type: "CONFIRM_LIGHTHOUSE_LOCKED_TASK_NOTICE", runId, task: result.task };
+    const opened = await w.c.sendToTab(11, message);
+    assert.equal(opened.ok, true, opened.message);
+    await w.c.sendToTab(11, message);
+    assert.equal(execution.open.clicks, 1);
+    assert.equal(execution.verify.clicks, 0);
+  });
+}
+
+for (const failure of ["wrong-target", "missing-target", "manual-stop"]) {
+  test(`invitation ${failure} during execution transition preserves the order without opening or re-claiming`, async () => {
+    const p = page(); let execution, interrupted = false;
+    p.f.accept.onClick = () => { execution = installExecution(p, { target: failure === "missing-target" ? "" : OTHER }); };
+    p.f.beforeWait = async () => {
+      if (failure === "manual-stop" && p.f.accept.clicks && !interrupted) {
+        interrupted = true;
+        await p.pause();
+        execution.link.href = TARGET;
+      }
+    };
+    const result = await p.run();
+    assert.equal(result.ok, false);
+    assert.equal(result.claimActionAttempted, true);
+    assert.equal(p.f.accept.clicks, 1);
+    assert.equal(p.action.clicks, 0);
+    assert.equal(p.f.lock?.clicks || 0, 0);
+    assert.equal(execution.open.clicks + execution.verify.clicks, 0);
+    if (failure === "manual-stop") assert.equal(interrupted, true);
+  });
+}
+
 test("working execution dialog remains the bound locked order with no LUX amount", async () => {
   const p = page({ popup: false }); const e = installExecution(p, { phase: "working" });
   const task = { taskKey: "execution-order", tweetUrl: TARGET };
@@ -131,7 +190,8 @@ async function executionWorker(t) {
   w.chrome.tabs.sendMessage = async (id, message) => {
     if (id === 22) {
       w.effects.push({ type: "message", id, message: structuredClone(message) });
-      return { ok: true, completed: false };
+      return message.type === "COMPLETE_X_TASK_WIDGET"
+        ? { ok: true, submitted: true } : { ok: true, completed: false };
     }
     return send(id, message);
   };
@@ -139,10 +199,19 @@ async function executionWorker(t) {
 }
 const autoSettings = { replyMode: "post", autoSubmitLighthouse: true, actionDelayMs: 150 };
 
-test("real worker persists verification intent, clicks the website once and waits for official completion", async t => {
+test("real worker submits X before Lighthouse, persists each intent and waits for official completion", async t => {
   const { w, p, e, task } = await executionWorker(t);
+  const send = w.chrome.tabs.sendMessage;
+  w.chrome.tabs.sendMessage = async (id, message) => {
+    if (message.type === "COMPLETE_X_TASK_WIDGET") {
+      assert.equal(w.stored.lighthouseAutoRunStateV1.uncertainAction.type, "COMPLETE_X_TASK_WIDGET");
+      assert.equal(e.verify.clicks, 0);
+    }
+    return send(id, message);
+  };
   e.verify.onClick = () => {
     assert.equal(w.stored.lighthouseAutoRunStateV1.uncertainAction.type, "SUBMIT_LIGHTHOUSE_EXECUTION_VERIFICATION");
+    assert.equal(w.messages("COMPLETE_X_TASK_WIDGET").length, 1, "X verification must precede the Lighthouse click");
     e.region.replaceChildren(new Element("h2", "验证成功"), new Element("strong", "0.10 LUX"),
       new Element("a", "查看原推文", [], { href: TARGET }));
   };
@@ -151,7 +220,10 @@ test("real worker persists verification intent, clicks the website once and wait
   assert.equal(result.executionDialog, true);
   assert.equal(result.completed, undefined, "submission alone is not completion");
   assert.equal(e.verify.clicks, 1);
-  assert.equal(w.messages("COMPLETE_X_TASK_WIDGET").length, 0, "no circular wait on the X widget");
+  assert.equal(w.messages("COMPLETE_X_TASK_WIDGET").length, 1);
+  assert.deepEqual(w.effects.filter(effect => effect.type === "message")
+    .map(effect => effect.message.type).filter(type => ["COMPLETE_X_TASK_WIDGET", "SUBMIT_LIGHTHOUSE_EXECUTION_VERIFICATION"].includes(type)),
+  ["COMPLETE_X_TASK_WIDGET", "SUBMIT_LIGHTHOUSE_EXECUTION_VERIFICATION"]);
   assert.equal(w.state().uncertainAction, undefined);
   const official = await w.c.waitForPassiveTaskCompletion(w.state().runId, autoSettings, 11, () => true);
   assert.equal(official.completed, true);
@@ -182,7 +254,7 @@ for (const kind of ["no-x-result", "stop-after-read", "new-order-after-read", "s
     const result = await w.c.completeXTaskWidgetLifecycle(22, w.state().runId, autoSettings);
     assert.equal(result.ok, false);
     assert.equal(e.verify.clicks, kind === "lost-response" ? 1 : 0);
-    assert.equal(w.messages("COMPLETE_X_TASK_WIDGET").length, 0);
+    assert.equal(w.messages("COMPLETE_X_TASK_WIDGET").length, ["storage-failure", "lost-response"].includes(kind) ? 1 : 0);
     if (kind === "lost-response" || kind === "storage-failure") {
       assert.equal(w.state().uncertainAction.type, "SUBMIT_LIGHTHOUSE_EXECUTION_VERIFICATION");
       assert.equal(w.state().running, false);
@@ -192,11 +264,111 @@ for (const kind of ["no-x-result", "stop-after-read", "new-order-after-read", "s
   });
 }
 
+for (const failure of ["failed", "missing", "no-submission", "lost-receipt", "stop", "changed-task"]) {
+  test(`X verification ${failure} prevents Lighthouse verification and any next order`, async t => {
+    const { w, e, task } = await executionWorker(t);
+    const send = w.chrome.tabs.sendMessage;
+    w.chrome.tabs.sendMessage = async (id, message) => {
+      if (message.type !== "COMPLETE_X_TASK_WIDGET") return send(id, message);
+      w.effects.push({ type: "message", id, message: structuredClone(message) });
+      if (failure === "lost-receipt") throw Error("The message port closed before a response was received");
+      if (failure === "stop") Object.assign(w.state(), { running: false, manuallyStopped: true });
+      if (failure === "changed-task") w.state().currentTask = { taskKey: "replacement", tweetUrl: OTHER };
+      if (failure === "missing") return undefined;
+      if (failure === "failed") return { ok: false, message: "X verify button is disabled" };
+      return failure === "no-submission" ? { ok: true } : { ok: true, submitted: true };
+    };
+    const result = await w.c.completeXTaskWidgetLifecycle(22, w.state().runId, autoSettings);
+    assert.equal(result.ok, false);
+    assert.equal(w.messages("COMPLETE_X_TASK_WIDGET").length, 1);
+    assert.equal(w.messages("SUBMIT_LIGHTHOUSE_EXECUTION_VERIFICATION").length, 0);
+    assert.equal(e.verify.clicks, 0);
+    assert.equal(w.reloads().length, 0);
+    assert.equal(w.messages("START_LIGHTHOUSE_COMMENT_TASK").length, 0);
+    assert.equal(w.messages("RUN_X_REPLY").length, 0);
+    if (failure !== "changed-task") assert.equal(w.state().currentTask.taskKey, task.taskKey);
+    if (failure === "lost-receipt") assert.equal(w.state().uncertainAction.type, "COMPLETE_X_TASK_WIDGET");
+  });
+}
+
+test("an attempted X verification with no final website result continues to the separate Lighthouse verification", async t => {
+  const { w, e } = await executionWorker(t);
+  const send = w.chrome.tabs.sendMessage;
+  w.chrome.tabs.sendMessage = async (id, message) => message.type === "COMPLETE_X_TASK_WIDGET"
+    ? { ok: true, submitted: false, submissionAttempted: true } : send(id, message);
+  const result = await w.c.completeXTaskWidgetLifecycle(22, w.state().runId, autoSettings);
+  assert.equal(result.ok, true, result.message);
+  assert.equal(e.verify.clicks, 1);
+  assert.ok(!w.state().completionEvidence, "a button click is not completion evidence");
+});
+
 // Review regressions: exercise adjacent states with the same production
 // worker/content pair. Keep failures visible until the implementation is fixed.
 function showOfficialCompletion(e) {
   e.region.replaceChildren(new Element("h2", "验证成功"), new Element("strong", "0.10 LUX"),
     new Element("a", "查看原推文", [], { href: TARGET }));
+}
+
+for (const officialCompleted of [true, false]) {
+  test(`invitation flow preserves the complete click order and refreshes only after official completion=${officialCompleted}`, async t => {
+    const { w, p } = await connected(t, { popup: true });
+    const sequence = []; let e;
+    p.f.accept.onClick = () => {
+      sequence.push("accept-invitation");
+      e = installExecution(p);
+      const open = e.open.onClick;
+      e.open.onClick = () => { sequence.push("go-complete"); open(); };
+      e.verify.onClick = () => {
+        sequence.push("lighthouse-verify");
+        if (officialCompleted) showOfficialCompletion(e);
+      };
+    };
+    const get = w.chrome.tabs.get;
+    w.chrome.tabs.get = async id => id === 22
+      ? { id: 22, windowId: 1, status: "complete", url: TARGET } : get(id);
+    const send = w.chrome.tabs.sendMessage;
+    w.chrome.tabs.sendMessage = async (id, message) => {
+      if (id === 22) {
+        w.effects.push({ type: "message", id, message: structuredClone(message) });
+        if (message.type === "RUN_X_REPLY") {
+          sequence.push("reply");
+          return { ok: true, mode: "post", posted: true, replyText: "offline fixture reply" };
+        }
+        if (message.type === "COMPLETE_X_TASK_WIDGET") {
+          sequence.push("x-verify");
+          return { ok: true, submitted: true };
+        }
+        return { ok: true, completed: false };
+      }
+      const result = await send(id, message);
+      if (message.type === "CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION" && result.completed) sequence.push("official-completed");
+      return result;
+    };
+    w.c.getSettingsForRun = async () => ({ ...autoSettings, maxTasksPerRun: 5 });
+    w.c.recordReplyHistory = async () => {};
+    w.c.closeLighthouseDetailToCampaigns = async () => {
+      assert.equal(w.c.hasLatchedLighthouseCompletion(w.state().runId), true);
+      return true;
+    };
+    w.chrome.tabs.reload = async () => { sequence.push("reload"); };
+    w.c.startNextAutoTask = async () => { sequence.push("next-order"); return { ok: true }; };
+    const runId = w.state().runId;
+    const claim = await w.c.sendToTab(11, { type: "START_LIGHTHOUSE_COMMENT_TASK", runId,
+      settings: { actionDelayMs: 150, cooldownPollMs: 250 } });
+    assert.equal(claim.ok, true, claim.message);
+    Object.assign(w.state(), { xTabId: 22, xTabWindowId: 1 });
+    assert.equal(await w.c.waitForLighthouseOpenedTweet(claim.task, 11, "auto", { timeoutMs: 2000 }), true);
+    const reply = await w.c.sendToTab(22, { type: "RUN_X_REPLY", runId, task: claim.task, settings: autoSettings });
+    const result = await w.c.handleXReplyResult(reply, { runId });
+    assert.deepEqual(sequence, ["accept-invitation", "go-complete", "reply", "x-verify", "lighthouse-verify",
+      ...(officialCompleted ? ["official-completed", "reload", "next-order"] : [])]);
+    assert.equal(result.ok, officialCompleted);
+    assert.equal(w.state().completed, officialCompleted ? 1 : 0);
+    if (!officialCompleted) {
+      assert.equal(w.state().running, false);
+      assert.equal(w.state().currentTask.taskKey, claim.task.taskKey);
+    }
+  });
 }
 
 test("review: STOP while focusing Lighthouse prevents verification", async t => {

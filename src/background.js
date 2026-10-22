@@ -2346,8 +2346,21 @@ async function completeXTaskWidgetLifecycle(tabId, runId, settings, stillCurrent
         if (completed) return completed;
         return { ok: false, message: "邀请执行页或 X 动作尚未确认，保留本单，未提交验证" };
       }
-      // This site's execution dialog owns invitation verification. Waiting
-      // for the X widget first deadlocks on a result this button must start.
+      // Invitation orders require both submissions, in this order. The X
+      // step returns after its click/receipt; it does not wait for the later
+      // Lighthouse verification to complete the order.
+      setStage("x_task_completion_waiting");
+      log("info", "X 动作已完成，先点击 X 页验证发奖，再回灯塔提交本单验证");
+      const xSubmitted = await sendToTab(tabId, {
+        type: "COMPLETE_X_TASK_WIDGET", runId, task, settings
+      });
+      if (!ownsTask()) return cancelled();
+      if (!xSubmitted?.ok || xSubmitted.submissionResultUnknown
+          || (xSubmitted.submitted !== true && xSubmitted.submissionAttempted !== true)) {
+        const completed = await readOfficialCompletion();
+        if (completed) return completed;
+        return { ok: false, message: xSubmitted?.message || "X 页验证发奖尚未确认点击，保留本单，未跳到灯塔验证" };
+      }
       await chrome.tabs.update(runtimeState.lighthouseTabId, { active: true });
       if (!ownsTask()) return cancelled();
       const submitted = await sendToTab(runtimeState.lighthouseTabId, {
