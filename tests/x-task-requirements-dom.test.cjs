@@ -117,10 +117,21 @@ test("author and comment guidance wording cannot add duplicate current-task head
   assertComposite(infer(officialPanel({ author: "当前任务", guide: "你要完成的事是什么？请在评论中解释当前任务。" })));
 });
 test("known unsupported actions remain explicit instead of silently becoming pure-like", () => {
-  const result = infer(officialPanel({ rows: [row("转发"), row("点赞", "已完成")] }));
+  const result = infer(officialPanel({ rows: [row("引用"), row("点赞", "已完成")] }));
   assert.equal(result.complete, true);
-  assert.deepEqual(Array.from(result.unsupported), ["转发"]);
+  assert.deepEqual(Array.from(result.unsupported), ["引用"]);
 });
+
+for (const label of ['转发', '转发互动', '转推', '转帖', 'Repost', 'Retweet']) {
+  test(`official semantic DOM preserves ${label} as a repost requirement`, () => {
+    const result = infer(officialPanel({rows: [row(label), row('点赞', '已完成')]}));
+    assert.equal(result.complete, true);
+    assert.equal(result.needsRepost, true);
+    assert.equal(result.needsLike, true);
+    assert.equal(result.needsComment, false);
+    assert.deepEqual(Array.from(result.unsupported), []);
+  });
+}
 
 for (const invalid of ["missing label", "missing badge", "loading status", "unknown action", "duplicate label", "duplicate badge", "wrapped row", "hidden row", "non-row child", "empty list", "two lists", "missing list class", "two dwell rows", "two dwell values", "invalid dwell", "missing dwell value", "two rewards", "invalid reward"]) {
   test(`recognized official panel fails closed for ${invalid}`, () => {

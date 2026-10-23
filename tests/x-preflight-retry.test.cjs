@@ -104,7 +104,7 @@ test("normal composite requirements execute each required action once and retain
 for (const [name, panelText, taskType, error] of [
   ["timeout", "当前任务 加载中", "点赞", /任务要求超时/],
   ["declared requirement conflict", LIKE, "评论+点赞", /任务要求冲突/],
-  ["unsupported action", LIKE.replace("点赞 待完成", "转发 待完成"), "转发", /尚未支持的动作/],
+  ["unsupported action", LIKE.replace("点赞 待完成", "引用 待完成"), "引用", /尚未支持的动作/],
 ]) {
   test(`proven ${name} before actions can reread requirements on the same run`, async () => {
     const p = page({ panelText, taskType });

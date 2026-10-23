@@ -92,3 +92,50 @@ test("selected run shares the read-only submission recovery used by full scannin
   assert.equal(w.state().uncertainAction,null);
   assert.equal(w.effects.includes("scan"),false);
 });
+
+test("repost-only selections need no AI key and stay eligible in the worker", async () => {
+  const w = await worker();
+  for (const taskType of ["转发", "转发互动", "转推", "转帖", "Repost", "Retweet", "点赞+转发"]) {
+    assert.equal(w.c.missingAIKeyMessage({}, {taskType}), "");
+    assert.equal(w.c.isIgnoredNonCommentTask({taskType}), false);
+  }
+  assert.equal(w.c.isIgnoredNonCommentTask({title: "转发互动任务"}), false);
+  assert.notEqual(w.c.missingAIKeyMessage({}, {taskType: "评论+转发"}), "");
+  assert.equal(w.c.isIgnoredNonCommentTask({taskType: "引用"}), true);
+  assert.equal(w.c.isIgnoredNonCommentTask({taskType: "原创推文"}), true);
+});
+
+test("upgrading repost eligibility leaves V4 history intact and rechecks exclusions under the new policy", async () => {
+  const w = await worker();
+  const legacy = ["stable|转发|2.55|@yapmarkets|转发互动", task.tweetUrl, "text|old unsupported task"];
+  w.stored.permanentIgnoredTaskKeysV4 = [...legacy];
+  vm.runInContext("permanentIgnoredTaskKeysLoaded = false", w.c);
+  assert.equal((await w.c.ensurePermanentIgnoredTaskKeysLoaded()).size, 0);
+  assert.deepEqual(w.stored.permanentIgnoredTaskKeysV4, legacy);
+  await w.c.markPermanentIgnoredTask({taskKey: "original-order", taskType: "原创推文"});
+  vm.runInContext("permanentIgnoredTaskKeysLoaded = false", w.c);
+  assert.equal((await w.c.ensurePermanentIgnoredTaskKeysLoaded()).has("original-order"), true);
+  assert.deepEqual(w.stored.permanentIgnoredTaskKeysV4, legacy);
+});
+
+test("confirmed repost uses the existing same-order submission recovery and resumes scanning", async () => {
+  const w = await worker();
+  w.state().currentTask.taskType = "转发";
+  await w.c.handleXReplyResult({ok: true, mode: "repost", repost: {ok: true, status: "reposted"}}, {runId: "run"});
+  assert.equal(w.state().completed, 1);
+  assert.equal(w.sent.filter(type => type === "COMPLETE_X_TASK_WIDGET").length, 1);
+  assert.equal(w.sent.includes("RUN_X_REPLY"), false);
+  assert.ok(w.effects.includes("scan"));
+});
+
+test("unconfirmed repost keeps its locked order without submitting or opening the next task", async () => {
+  const w = await worker("pending");
+  w.state().currentTask.taskType = "转发";
+  await w.c.handleXReplyResult({ok: false, mode: "repost", message: "转发结果未确认"}, {runId: "run"});
+  assert.equal(w.state().completed, 0);
+  assert.equal(w.state().running, false);
+  assert.equal(w.state().currentTask.taskKey, task.taskKey);
+  assert.equal(w.sent.includes("COMPLETE_X_TASK_WIDGET"), false);
+  assert.equal(w.sent.includes("RUN_X_REPLY"), false);
+  assert.deepEqual(w.effects, []);
+});

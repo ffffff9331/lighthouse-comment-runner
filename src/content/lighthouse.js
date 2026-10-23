@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.122";
+  const SCRIPT_VERSION = "0.7.123";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -209,7 +209,7 @@
       DEBUG_CLICK_I_DONE: () => debugClickDone(message.settings),
       WAIT_LIGHTHOUSE_COMPLETION_RETURN: () => waitForTaskCompletionAndReturn(message.settings, message),
       READ_LIGHTHOUSE_TODAY_INCOME: () => readPlazaTodayIncome(),
-      CLOSE_LIGHTHOUSE_TASK_DETAIL: () => closeTaskDetailPanel(message.settings)
+      CLOSE_LIGHTHOUSE_TASK_DETAIL: () => closeTaskDetailPanel(message.settings, message)
     };
 
     const handler = routes[message.type];
@@ -404,7 +404,7 @@
 
   async function debugOpenFirstCommentTask(settings, message = {}) {
     const runId = activeRunId;
-    report("info", "准备打开评论或点赞互动任务");
+    report("info", "准备打开评论、点赞或转发任务");
     let invitation = findStandaloneInvitation();
     if (invitation) return await openStandaloneInvitation(settings, invitation)
       || debugOpenFirstCommentTask(settings, message);
@@ -424,7 +424,7 @@
     if (selection?.invitation) return await openStandaloneInvitation(settings, selection.invitation)
       || debugOpenFirstCommentTask(settings, message);
     if (!selection || !selection.target) {
-      throw new Error("未找到可执行或可等待的评论或点赞互动任务");
+      throw new Error("未找到可执行或可等待的评论、点赞或转发任务");
     }
 
     const task = {
@@ -486,8 +486,8 @@
       ok: true,
       detailConfirmed: true,
       message: selection.cooldownSniping
-        ? "已在任务广场等待到可执行评论或点赞互动任务并打开详情"
-        : "已打开第一个可执行评论或点赞互动任务详情",
+        ? "已在任务广场等待到可执行评论、点赞或转发任务并打开详情"
+        : "已打开第一个可执行评论、点赞或转发任务详情",
       task
     };
   }
@@ -585,7 +585,7 @@
         .slice(0, 3)
         .map((entry) => formatCandidateMatchDebug(entry.candidate, entry.score))
         .join(" / ");
-      throw new Error(`未严格匹配到选中评论或点赞互动任务：${selectedTask.title || selectedTask.taskType || "未知任务"}；已排除非回复候选 ${ignoredCount} 条；候选=${top || "无"}`);
+      throw new Error(`未严格匹配到选中评论、点赞或转发任务：${selectedTask.title || selectedTask.taskType || "未知任务"}；已排除不支持候选 ${ignoredCount} 条；候选=${top || "无"}`);
     }
 
     report("info", `选中任务匹配成功：${formatCandidateMatchDebug(ranked[0].candidate, ranked[0].score)}`);
@@ -596,8 +596,7 @@
     return Boolean(candidate
       && candidate.target
       && candidate.isAutomatable
-      && !candidate.isOriginalTweet
-      && !candidate.isRetweet);
+      && !candidate.isOriginalTweet);
   }
 
   function canonicalSupportedTaskType(taskType) {
@@ -608,8 +607,15 @@
   function mergeTaskTypes(selectedType, detailType) {
     const selected = canonicalSupportedTaskType(selectedType || "");
     const detail = canonicalSupportedTaskType(detailType || "");
-    const unsupported = [selected, detail].find((type) => ["原创推文", "转发", "关注"].includes(type));
+    const unsupported = [selected, detail].find((type) => ["原创推文", "引用", "关注"].includes(type));
     if (unsupported) return unsupported;
+    // Only a bare detail comment can be the legacy fallback. Preserve explicit
+    // list requirements and detail composites when either view adds a repost.
+    if (selected.includes("转发") || detail.includes("转发")) {
+      const explicit = [selected, detail === "评论" ? "" : detail];
+      return [explicit.some(type => type.includes("评论")) && "评论",
+        explicit.some(type => type.includes("点赞")) && "点赞", "转发"].filter(Boolean).join("+");
+    }
     if (selected === "评论+点赞" || detail === "评论+点赞") return "评论+点赞";
     // A later detail read may only carry buildTask's legacy comment default.
     // Keep the selected explicit type unless either view proves a composite.
@@ -1191,14 +1197,14 @@
         || !Number.isFinite(expiryByKey.get(key)) || expiryByKey.get(key) > Date.now());
       const candidates = collectTaskCandidates(activeAttemptedKeys, settings);
       const lowBountyCandidates = candidates.filter((candidate) => candidate.isAutomatable && isBelowMinTaskBounty(candidate.bounty, minTaskBounty));
-      const ignoredNonCommentCandidates = candidates.filter((candidate) => (candidate.isOriginalTweet || candidate.isRetweet) && !candidate.isBlocked);
+      const ignoredNonCommentCandidates = candidates.filter((candidate) => !candidate.isAutomatable && !candidate.isBlocked);
       if (ignoredNonCommentCandidates.length && Date.now() - lastOriginalSkipReportAt > 15000) {
         lastOriginalSkipReportAt = Date.now();
-        report("info", `已忽略非回复任务 ${ignoredNonCommentCandidates.length} 条，只等待评论或点赞互动任务`);
+        report("info", `已忽略不支持任务 ${ignoredNonCommentCandidates.length} 条，只等待评论、点赞或转发任务`);
       }
       if (lowBountyCandidates.length && Date.now() - lastLowBountyReportAt > 15000) {
         lastLowBountyReportAt = Date.now();
-        report("info", `已按赏金阈值过滤 ${lowBountyCandidates.length} 条低于 ${minTaskBounty.toFixed(1)}LUX 的评论或点赞互动任务`);
+        report("info", `已按赏金阈值过滤 ${lowBountyCandidates.length} 条低于 ${minTaskBounty.toFixed(1)}LUX 的评论、点赞或转发任务`);
       }
       const visibleReadyCandidates = candidates
         .filter((candidate) => candidate.isAutomatable && !candidate.isBlocked && candidate.cooldownMs <= AUTO_DETAIL_PRELOAD_MS && candidate.target)
@@ -1249,7 +1255,7 @@
         if (staleReadyHitCount >= STALE_READY_REFRESH_HITS) {
           const lowBountyReadyCount = visibleReadyCandidates.filter((candidate) => isBelowMinTaskBounty(candidate.bounty, minTaskBounty)).length;
           const dedupedReadyCount = visibleReadyCandidates.filter((candidate) => candidate.attempted).length;
-          throw buildCampaignsRefreshRequestError(`任务广场连续 ${staleReadyHitCount} 轮出现 ${visibleReadyCandidates.length} 条可做评论或点赞互动任务，但当前都无法进入自动执行（去重 ${dedupedReadyCount} 条，低赏金 ${lowBountyReadyCount} 条），请求刷新任务广场`);
+          throw buildCampaignsRefreshRequestError(`任务广场连续 ${staleReadyHitCount} 轮出现 ${visibleReadyCandidates.length} 条可做评论、点赞或转发任务，但当前都无法进入自动执行（去重 ${dedupedReadyCount} 条，低赏金 ${lowBountyReadyCount} 条），请求刷新任务广场`);
         }
       } else {
         staleReadyHitCount = 0;
@@ -1261,7 +1267,7 @@
         .sort((a, b) => a.cooldownMs - b.cooldownMs);
 
       if (!settings.enableCooldownSniping) {
-        throw new Error("当前没有可做评论或点赞互动任务，且未启用任务广场等待");
+        throw new Error("当前没有可做评论、点赞或转发任务，且未启用任务广场等待");
       }
 
       const shortest = cooldownCandidates.find((candidate) => !candidate.attempted) || cooldownCandidates[0];
@@ -1270,11 +1276,11 @@
         if (visibleReadyCandidates.length > 0 && !ready) {
           const lowBountyReadyCount = visibleReadyCandidates.filter((candidate) => isBelowMinTaskBounty(candidate.bounty, minTaskBounty)).length;
           const dedupedReadyCount = visibleReadyCandidates.filter((candidate) => candidate.attempted).length;
-          report("info", `当前可做评论或点赞互动任务共有 ${visibleReadyCandidates.length} 条，但暂无可执行候选（去重 ${dedupedReadyCount} 条，低赏金 ${lowBountyReadyCount} 条），跳过并等待新任务`);
+          report("info", `当前可做评论、点赞或转发任务共有 ${visibleReadyCandidates.length} 条，但暂无可执行候选（去重 ${dedupedReadyCount} 条，低赏金 ${lowBountyReadyCount} 条），跳过并等待新任务`);
         } else if (shortest) {
           report("info", `任务广场最近任务仍在冷却：${formatDuration(shortest.cooldownMs)}，到可抢后再打开详情`);
         } else {
-          report("info", "任务广场暂无可识别评论或点赞互动任务，继续等待列表刷新");
+          report("info", "任务广场暂无可识别评论、点赞或转发任务，继续等待列表刷新");
         }
       }
 
@@ -1481,14 +1487,16 @@
   function detectScopedTaskType(text) {
     const value = normalize(text).replace(/\s+/g, "");
     if (!value) return "";
-    const labels = value.match(/原创推文|原创建推文|原创内容|发布推文|创建推文|发一条推文|CreateTweet|PostTweet|OriginalPost|发推|转发|转推|Repost|Retweet|关注|Follow|评论留言|评论|回复|Comment|Reply|点赞互动|点赞|Like|赞/gi) || [];
-    const remainder = value.replace(/原创推文|原创建推文|原创内容|发布推文|创建推文|发一条推文|CreateTweet|PostTweet|OriginalPost|发推|转发|转推|Repost|Retweet|关注|Follow|评论留言|评论|回复|Comment|Reply|点赞互动|点赞|Like|赞/gi, "").replace(/任务|[+＋&＆、,/／·|与和]/g, "");
+    const labels = value.match(/原创推文|原创建推文|原创内容|发布推文|创建推文|发一条推文|CreateTweet|PostTweet|OriginalPost|发推|引用转发|引用转推|引用推文|引用|Quote(?:Post|Tweet)?|转发互动|转发|转推|转帖|Repost|Retweet|关注|Follow|评论留言|评论|回复|Comment|Reply|点赞互动|点赞|Like|赞/gi) || [];
+    const remainder = value.replace(/原创推文|原创建推文|原创内容|发布推文|创建推文|发一条推文|CreateTweet|PostTweet|OriginalPost|发推|引用转发|引用转推|引用推文|引用|Quote(?:Post|Tweet)?|转发互动|转发|转推|转帖|Repost|Retweet|关注|Follow|评论留言|评论|回复|Comment|Reply|点赞互动|点赞|Like|赞/gi, "").replace(/任务|[+＋&＆、,/／·|与和]/g, "");
     if (remainder || !labels.length) return "";
     if (labels.some((label) => /原创|发推|发布推文|创建推文|发一条推文|CreateTweet|PostTweet|OriginalPost/i.test(label))) return "原创推文";
-    if (labels.some((label) => /转发|转推|Repost|Retweet/i.test(label))) return "转发";
+    if (labels.some((label) => /引用|Quote/i.test(label))) return "引用";
     if (labels.some((label) => /关注|Follow/i.test(label))) return "关注";
     const comment = labels.some((label) => /评论|回复|Comment|Reply/i.test(label));
     const like = labels.some((label) => /赞|Like/i.test(label));
+    const repost = labels.some((label) => /转发|转推|转帖|Repost|Retweet/i.test(label));
+    if (repost) return [comment && "评论", like && "点赞", "转发"].filter(Boolean).join("+");
     return comment && like ? "评论+点赞" : comment ? "评论" : like ? "点赞互动" : "";
   }
 
@@ -1730,7 +1738,8 @@
 
   function isAutomatableTaskType(taskType) {
     const value = normalize(taskType);
-    return isCommentEquivalentTaskType(value);
+    return isCommentEquivalentTaskType(value)
+      || /^(?:(?:评论(?:\+点赞)?|点赞)\+)?(?:转发(?:互动)?|转推|转帖|Repost|Retweet)$/i.test(value);
   }
 
   function assertSupportedDetailTask(task, settings = {}) {
@@ -1745,7 +1754,8 @@
       throw error;
     }
     const unsupportedGuidance = hasUnsupportedCommentGuidance(detailText);
-    if (!unsupportedGuidance && ["评论", "评论+点赞", "评论+赞", "点赞互动", "点赞"].includes(taskType)) return;
+    if (!unsupportedGuidance && (["评论", "评论+点赞", "评论+赞", "点赞互动", "点赞"].includes(taskType)
+      || /^(?:(?:评论(?:\+点赞)?|点赞)\+)?(?:转发(?:互动)?|转推|转帖|Repost|Retweet)$/i.test(taskType))) return;
     const reason = unsupportedGuidance ? "任务备注要求人工提供内容" : `已识别为${taskType || "非回复"}任务`;
     const error = new Error(`${reason}，永久忽略不再打开`);
     error.permanentIgnore = true;
@@ -2000,7 +2010,7 @@
   function isTaskDetailOpen() {
     const execution = findExecutionDialog();
     if (execution.present) return Boolean(execution.root);
-    const text = normalize(document.body?.innerText || "");
+    const text = normalize(findTaskDetailRoot()?.innerText || "");
     if (!text) return false;
     const hasDetailMarker = DETAIL_MARKERS.some((marker) => text.includes(marker));
     const hasTaskMarker = DETAIL_TASK_MARKERS.some((marker) => text.includes(marker));
@@ -2132,25 +2142,32 @@
     return { ready: true, pendingOnly, listedCount: total };
   }
 
-  async function closeTaskDetailPanel(settings = {}) {
+  async function closeTaskDetailPanel(settings = {}, message = {}) {
     const runId = activeRunId;
     const invitationPending = Symbol("invitationPending");
     const expiredInvitation = Symbol("expiredInvitation");
+    const completionChanged = Symbol("completionChanged");
     const assertCanClose = () => {
       assertActiveRun(runId);
+      if (!isCompletionCloseCurrent(message)) throw completionChanged;
       const state = getStandaloneInvitationState();
       if (state === "expired") throw expiredInvitation;
       if (state !== "absent") throw invitationPending;
     };
     try {
       assertCanClose();
-      const completionReturnButton = findCompletionReturnToCampaignsButton();
+      const completionReturnButton = findCompletionReturnToCampaignsButton(message);
       if (completionReturnButton) {
         completionReturnButton.scrollIntoView({ block: "center", inline: "center" });
         await wait(settings.actionDelayMs || 500);
-        await clickElement(completionReturnButton, { beforeClick: assertCanClose });
+        await clickElement(completionReturnButton, { beforeClick: () => {
+          assertCanClose();
+          if (findCompletionReturnToCampaignsButton(message) !== completionReturnButton) {
+            throw completionChanged;
+          }
+        } });
         if (await waitForCampaignsReturnAfterCompletion(settings, assertCanClose)) {
-          return { ok: true, message: "任务已完成，已点击打开任务广场并确认列表已恢复" };
+          return { ok: true, message: "已关闭任务完成结果，并确认任务广场列表已恢复" };
         }
       }
 
@@ -2199,8 +2216,11 @@
         return { ok: true, message: "已通过点击左侧空白区域关闭任务详情" };
       }
 
+      assertCanClose();
       return { ok: false, message: "任务详情关闭复核失败，仍停留在详情页" };
     } catch (error) {
+      if (error === completionChanged) return { ok: false, cancelled: true,
+        message: "完成结果或关闭按钮已变化，已取消收尾并保留当前页面" };
       if (error === expiredInvitation) return { ok: false, expiredInvitation: true,
         message: "邀请已明确过期且尚未接受，允许后台核对后刷新广场" };
       if (error !== invitationPending) throw error;
@@ -2210,7 +2230,12 @@
 
   function beginCompletionWatch(message) {
     if (!message.runId || !message.task?.taskKey) return { ok: false, message: "缺少完成监测的订单身份" };
-    if (completionContext?.runId === message.runId && completionContext.taskKey === message.task.taskKey) return { ok: true };
+    if (completionContext?.runId === message.runId && completionContext.taskKey === message.task.taskKey) {
+      if (!completionContext.navigationBinding && message.task.seatLocked === true) {
+        completionContext.navigationBinding = createLockedNavigationBinding(message.task);
+      }
+      return { ok: true };
+    }
     const baselineRoots = findOfficialCompletionRoots();
     completionContext = {
       runId: message.runId,
@@ -2242,6 +2267,13 @@
     if (originalTweetLinks.length && (!targetIdentity || !originalTweetLinks.every((url) => url === targetIdentity))) {
       return { ok: true, completed: false };
     }
+    // The new dispatch receipt removes its target link. It is attributable
+    // only when this exact dialog was observed locked to the watched order.
+    if (identityScope.getAttribute?.("data-engagement-dispatch") === "true" && !originalTweetLinks.length) {
+      const binding = context.navigationBinding;
+      if (!targetIdentity || binding?.root !== identityScope || binding.taskKey !== context.taskKey
+          || normalizeTweetUrl(binding.tweetUrl, true) !== targetIdentity) return { ok: true, completed: false };
+    }
     // Reopening a progress card is only navigation. Its title and reward are
     // not proof of identity: require the official result's original X link.
     if (context.requireExactTarget && (!targetIdentity || !originalTweetLinks.includes(targetIdentity))) {
@@ -2258,6 +2290,8 @@
     if (!hasRecommendedCampaigns && links.length && (!targetIdentity || !links.includes(targetIdentity))) {
       return { ok: true, completed: false };
     }
+    context.completionRoot = root;
+    context.completionFingerprint = rootText;
     context.evidence = { runId: context.runId, taskKey: context.taskKey, tweetUrl: target, observedAt: Date.now(), text: normalize(root.innerText || "").slice(0, 500) };
     return { ok: true, completed: true, evidence: context.evidence };
   }
@@ -2269,12 +2303,17 @@
       assertActiveRun(message.runId || activeRunId);
       const completion = checkOfficialCompletion(message);
       const completionConfirmed = completion.completed;
-      const completionReturnButton = findCompletionReturnToCampaignsButton();
+      const completionReturnButton = findCompletionReturnToCampaignsButton(message);
       if (completionConfirmed && completionReturnButton) {
         completionReturnButton.scrollIntoView({ block: "center", inline: "center" });
-        await clickElement(completionReturnButton);
+        await clickElement(completionReturnButton, { beforeClick: () => {
+          assertActiveRun(message.runId || activeRunId);
+          if (findCompletionReturnToCampaignsButton(message) !== completionReturnButton) {
+            throw new Error("完成结果或关闭按钮已变化，保留当前页面");
+          }
+        } });
         if (await waitForCampaignsReturnAfterCompletion(settings)) {
-          return { ok: true, evidence: completion.evidence, message: "Lighthouse 已显示已完成，已点击打开任务广场" };
+          return { ok: true, evidence: completion.evidence, message: "Lighthouse 已确认完成，已关闭结果并返回任务广场" };
         }
         return {
           ok: false,
@@ -2315,8 +2354,46 @@
     return { ok: true, income };
   }
 
-  function findCompletionReturnToCampaignsButton() {
+  function isCompletionCloseCurrent(message) {
+    const context = completionContext && completionContext.runId === message.runId
+      && completionContext.taskKey === message.task?.taskKey ? completionContext : null;
+    const evidence = message.completionEvidence || context?.evidence;
+    if (!evidence) return true; // Ordinary unclaimed-detail cleanup has no completion receipt.
+    const target = normalizeTweetUrl(message.task?.tweetUrl, true);
+    if (!target || evidence.runId !== message.runId || !message.task?.taskKey
+        || evidence.taskKey !== message.task.taskKey
+        || normalizeTweetUrl(evidence.tweetUrl, true) !== target) return false;
+    if (isCampaignsListOpen()) return true;
+    if (!context?.evidence) {
+      return evidence.source === "lighthouse_x_widget" && Boolean(currentLockedNavigationBinding(message));
+    }
+    // A saved receipt proves completion, not permission to close a later order.
+    // Bind cleanup to the observed DOM result as well as the run and task.
+    const roots = findOfficialCompletionRoots();
+    const root = context.completionRoot;
+    if (roots.length !== 1 || roots[0] !== root
+        || getOfficialCompletionRootFingerprint(root) !== context.completionFingerprint) return false;
+    const scope = root.closest?.("[role='dialog']") || root;
+    const execution = findExecutionDialog();
+    if (execution.present && execution.root !== scope) return false;
+    const originals = Array.from(scope.querySelectorAll("a[href]"))
+      .filter(node => /^查看原推文$/.test(normalize(node.innerText || node.textContent || "")));
+    return originals.every(node => normalizeTweetUrl(node.href, true) === target);
+  }
+
+  function findCompletionReturnToCampaignsButton(message) {
+    if (message && !isCompletionCloseCurrent(message)) return null;
     if (!hasOfficialCompletionEvidence()) return null;
+
+    const dispatchResults = findOfficialCompletionRoots().filter(root => root.classList?.contains("dispatch-completion")
+      && root.classList.contains("success")
+      && root.closest?.("[role='dialog']")?.getAttribute("data-engagement-dispatch") === "true");
+    if (dispatchResults.length) {
+      const buttons = dispatchResults.flatMap(root => Array.from(root.querySelectorAll("button")))
+        .filter(node => node.closest(".completion-controls") && buttonText(node) === "完成并关闭"
+          && isVisible(node) && !isDisabled(node));
+      return dispatchResults.length === 1 && buttons.length === 1 ? buttons[0] : null;
+    }
 
     const labels = /打开任务广场|返回任务广场|回到任务广场|Open Task Hall/i;
     const entries = Array.from(document.querySelectorAll("button,a,[role='button'],[tabindex],div,span"))
@@ -2339,7 +2416,7 @@
   function hasOfficialCompletionEvidence() {
     const completionRoot = findOfficialCompletionRoot();
     const text = normalize(completionRoot?.innerText || "");
-    return /任务验证通过|验证成功|奖励已到账|已到账奖励|任务已完成|奖励已结算/.test(text);
+    return /任务完成[，,]\s*验证通过|任务验证通过|验证成功|奖励已到账|已到账奖励|任务已完成|奖励已结算/.test(text);
   }
 
   function findOfficialCompletionRoot() {
@@ -2353,7 +2430,7 @@
   function isOfficialCompletionMarkerText(text) {
     const value = normalize(text);
     if (!value || value.length > 80) return false;
-    return /^(?:任务验证通过|验证(?:成功|通过)(?:\s*[·•]\s*(?:已通过|奖励已到账|奖励托管中))?|奖励已到账|已到账奖励|任务已完成|奖励已结算)[！!。.]?$/.test(value);
+    return /^(?:任务完成[，,]\s*验证通过|任务验证通过|验证(?:成功|通过)(?:\s*[·•]\s*(?:已通过|奖励已到账|奖励托管中))?|奖励已到账|已到账奖励|任务已完成|奖励已结算)[！!。.]?$/.test(value);
   }
 
   function hasOfficialCompletionRewardText(text) {
@@ -2368,7 +2445,15 @@
       .filter(isVisible)
       .map((node) => ({ node, text: normalize(node.innerText || node.textContent || ""), rect: node.getBoundingClientRect() }))
       .filter((entry) => entry.text.length < 5000 && [entry.node, ...Array.from(entry.node.querySelectorAll("h1,h2,h3,p,span,div"))]
-        .some((node) => isVisible(node) && isOfficialCompletionMarkerText(node.innerText || node.textContent || "")))
+        .some((node) => {
+          const text = normalize(node.innerText || node.textContent || "");
+          if (!isVisible(node) || !isOfficialCompletionMarkerText(text)) return false;
+          if (!/^任务完成[，,]\s*验证通过/.test(text)) return true;
+          const panel = node.closest?.(".dispatch-completion");
+          return node.tagName === "H2" && node.closest?.(".completion-hero")?.getAttribute("role") === "status"
+            && panel?.classList.contains("success")
+            && panel.closest("[role='dialog']")?.getAttribute("data-engagement-dispatch") === "true";
+        }))
       .filter((entry) => hasOfficialCompletionRewardText(entry.text))
       .filter((entry) => entry.rect.width > 240 && entry.rect.height > 120)
       .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
@@ -3117,6 +3202,10 @@
 
     const candidates = Array.from(document.querySelectorAll("[role='dialog'],section,article,div"))
       .filter(isVisible)
+      // Plaza cards (and their list wrappers) can say "前往目标" too.
+      // Their text cannot keep a closed task dialog artificially open.
+      .filter(node => node.getAttribute("role") === "dialog"
+        || (!node.closest("article[role='button']") && !node.querySelector("article[role='button']")))
       .map((node) => ({ node, text: normalize(node.innerText || node.textContent || ""), rect: node.getBoundingClientRect() }))
       .filter((entry) => entry.text.includes("LUX") && DETAIL_MARKERS.some((marker) => entry.text.includes(marker)))
       .filter((entry) => entry.rect.width > 240 && entry.rect.height > 180)

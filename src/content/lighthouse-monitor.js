@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseHighBountyMonitor__";
-  const SCRIPT_VERSION = "0.7.122";
+  const SCRIPT_VERSION = "0.7.123";
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) return;
   if (existingSingleton?.stop) existingSingleton.stop();
@@ -479,14 +479,16 @@
   function detectScopedTaskType(text) {
     const value = normalize(text).replace(/\s+/g, "");
     if (!value) return "";
-    const labels = value.match(/原创推文|原创建推文|原创内容|发布推文|创建推文|发一条推文|CreateTweet|PostTweet|OriginalPost|发推|转发|转推|Repost|Retweet|关注|Follow|评论留言|评论|回复|Comment|Reply|点赞互动|点赞|Like|赞/gi) || [];
-    const remainder = value.replace(/原创推文|原创建推文|原创内容|发布推文|创建推文|发一条推文|CreateTweet|PostTweet|OriginalPost|发推|转发|转推|Repost|Retweet|关注|Follow|评论留言|评论|回复|Comment|Reply|点赞互动|点赞|Like|赞/gi, "").replace(/任务|[+＋&＆、,/／·|与和]/g, "");
+    const labels = value.match(/原创推文|原创建推文|原创内容|发布推文|创建推文|发一条推文|CreateTweet|PostTweet|OriginalPost|发推|引用转发|引用转推|引用推文|引用|Quote(?:Post|Tweet)?|转发互动|转发|转推|转帖|Repost|Retweet|关注|Follow|评论留言|评论|回复|Comment|Reply|点赞互动|点赞|Like|赞/gi) || [];
+    const remainder = value.replace(/原创推文|原创建推文|原创内容|发布推文|创建推文|发一条推文|CreateTweet|PostTweet|OriginalPost|发推|引用转发|引用转推|引用推文|引用|Quote(?:Post|Tweet)?|转发互动|转发|转推|转帖|Repost|Retweet|关注|Follow|评论留言|评论|回复|Comment|Reply|点赞互动|点赞|Like|赞/gi, "").replace(/任务|[+＋&＆、,/／·|与和]/g, "");
     if (remainder || !labels.length) return "";
     if (labels.some((label) => /原创|发推|发布推文|创建推文|发一条推文|CreateTweet|PostTweet|OriginalPost/i.test(label))) return "原创推文";
-    if (labels.some((label) => /转发|转推|Repost|Retweet/i.test(label))) return "转发";
+    if (labels.some((label) => /引用|Quote/i.test(label))) return "引用";
     if (labels.some((label) => /关注|Follow/i.test(label))) return "关注";
     const comment = labels.some((label) => /评论|回复|Comment|Reply/i.test(label));
     const like = labels.some((label) => /赞|Like/i.test(label));
+    const repost = labels.some((label) => /转发|转推|转帖|Repost|Retweet/i.test(label));
+    if (repost) return [comment && "评论", like && "点赞", "转发"].filter(Boolean).join("+");
     return comment && like ? "评论+点赞" : comment ? "评论" : like ? "点赞互动" : "";
   }
 
@@ -753,8 +755,7 @@
 
   function isIgnoredNonCommentTaskInfo(info) {
     const taskType = normalize(info?.taskType || "");
-    return taskType === "原创推文"
-      || taskType === "转发";
+    return ["原创推文", "引用", "关注"].includes(taskType);
   }
 
   function buildAnnounceSeenKey(info, milestoneId) {

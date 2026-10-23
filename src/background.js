@@ -21,7 +21,9 @@ const ATTEMPTED_TASK_DEDUPE_MS = 3 * 60 * 1000;
 const MAX_DEFERRED_TASK_DEDUPE_MS = 6 * 60 * 60 * 1000;
 const CAMPAIGNS_REFRESH_COOLDOWN_MS = 3 * 60 * 1000;
 const CAMPAIGNS_IDLE_REFRESH_MS = 5 * 60 * 1000;
-const PERMANENT_IGNORED_TASK_KEYS_KEY = "permanentIgnoredTaskKeysV4";
+// V4 contains untyped exclusions for reposts that are now supported. Keep
+// that old data intact, but re-evaluate live eligibility under the new policy.
+const PERMANENT_IGNORED_TASK_KEYS_KEY = "permanentIgnoredTaskKeysV5";
 const REPLY_HISTORY_RECORDS_KEY = "replyHistoryRecords";
 const AI_API_KEY_STORAGE_KEY = "lighthouseAiApiKey";
 const LIGHTHOUSE_MONITOR_SNAPSHOT_KEY = "lighthouseMonitorSnapshot";
@@ -1119,7 +1121,7 @@ async function startNextAutoTask(reason) {
   }
   if (!isActiveAutoRun(runId)) return { ok: true, state: runtimeState };
   setStage("selecting_task");
-  log("info", `开始寻找下一条评论/点赞互动任务：${reason || "continue"}`);
+  log("info", `开始寻找下一条评论/点赞/转发任务：${reason || "continue"}`);
   await ensurePermanentIgnoredTaskKeysLoaded();
   if (!isCurrent()) return cancelled();
   pruneAttemptedTasks();
@@ -1177,7 +1179,7 @@ async function startNextAutoTask(reason) {
           // stage transitions must still leave the no-order timer untouched.
           runtimeState.lastProgressAt = Date.now();
           setStage("campaigns_refreshed");
-          log("info", result.message || "任务广场陈旧可做列表已刷新，重新寻找下一条评论/点赞互动任务");
+          log("info", result.message || "任务广场陈旧可做列表已刷新，重新寻找下一条评论/点赞/转发任务");
           await delay(Math.max(settings.actionDelayMs || 500, 1200));
           nextReason = "retry_after_campaigns_refresh";
         } else if (refreshState.skippedCooldown) {
@@ -1204,7 +1206,7 @@ async function startNextAutoTask(reason) {
       await markPermanentIgnoredTask(ignoredTask, result.ignoredTaskType || ignoredTask.taskType || "非评论");
       if (!isCurrent()) return cancelled();
       setStage("task_permanently_ignored");
-      log("warn", result.message || result.error || "已永久忽略非评论任务，继续寻找下一条评论/点赞互动任务");
+      log("warn", result.message || result.error || "已永久忽略非评论任务，继续寻找下一条评论/点赞/转发任务");
       await closeLighthouseTaskDetail(tabId, settings, "永久忽略非评论任务后关闭详情面板", isCurrent, true);
       await delay(settings.actionDelayMs * 2);
       if (!isCurrent()) return cancelled();
@@ -1377,13 +1379,13 @@ async function debugOpenFirstTask() {
       log("warn", result.message || "已永久忽略非评论任务");
       return { ok: true, result, state: runtimeState };
     }
-    return failStep(result, "打开第一个评论/点赞互动任务失败");
+    return failStep(result, "打开第一个评论/点赞/转发任务失败");
   }
   if (result.task) {
     runtimeState.currentTask = result.task;
   }
   setStage("task_detail_opened");
-  log("info", result.message || "已打开第一个评论/点赞互动任务");
+  log("info", result.message || "已打开第一个评论/点赞/转发任务");
   return { ok: true, result, state: runtimeState };
 }
 
@@ -1505,7 +1507,7 @@ async function debugFastXClaimReplyVerify(selectedTask = null, windowId = null) 
     if (!isCurrent()) return cancelled();
     runtimeState.running = false;
     setStage("original_tweet_ignored");
-    log("warn", `已忽略原创/转发任务，不打开详情：${describeTaskForLog(selected)}`);
+    log("warn", `已忽略原创、关注或引用任务，不打开详情：${describeTaskForLog(selected)}`);
     return { ok: true, ignored: true, reason: "ignored_non_comment_task", state: runtimeState };
   }
 
@@ -1650,7 +1652,7 @@ async function runSelectedCountdownTask(selectedTask = null, windowId = null) {
   if (isIgnoredNonCommentTask(selectedTask)) {
     await markPermanentIgnoredTask(selectedTask, selectedTask.taskType || "非评论");
     if (!isCurrent()) return cancelled();
-    return finishSelectedRun("selected_original_tweet_ignored", "已忽略原创/转发任务", null, settings, isCurrent);
+    return finishSelectedRun("selected_original_tweet_ignored", "已忽略原创、关注或引用任务", null, settings, isCurrent);
   }
   const keyFailure = blockRunWithoutAIKey(settings, selectedTask);
   if (keyFailure) return keyFailure;
@@ -1777,7 +1779,7 @@ async function openNextLighthouseTaskTweetTab(settings, stillCurrent = null) {
   if (!isCurrent()) return null;
   await delay(Math.max(settings.actionDelayMs || 500, 1200));
   if (!isCurrent()) return null;
-  log("info", "未选择倒计时任务，已回到 Lighthouse 任务广场准备打开评论/点赞互动任务");
+  log("info", "未选择倒计时任务，已回到 Lighthouse 任务广场准备打开评论/点赞/转发任务");
   await ensurePermanentIgnoredTaskKeysLoaded();
   if (!isCurrent()) return null;
 
@@ -1814,14 +1816,14 @@ async function openNextLighthouseTaskTweetTab(settings, stillCurrent = null) {
       await closeLighthouseTaskDetail(lighthouseTabId, settings, "永久忽略非评论任务后关闭详情", isCurrent);
       if (!isCurrent()) return null;
     }
-    throw new Error(openResult?.message || openResult?.error || "未能从 Lighthouse 任务广场打开评论/点赞互动任务详情");
+    throw new Error(openResult?.message || openResult?.error || "未能从 Lighthouse 任务广场打开评论/点赞/转发任务详情");
   }
   if (openResult.task) {
     runtimeState.currentTask = openResult.task;
   }
 
   setStage("task_detail_opened_for_fast_flow");
-  log("info", openResult.message || "已打开评论/点赞互动任务详情，准备点击在 X 打开/前往目标");
+  log("info", openResult.message || "已打开评论/点赞/转发任务详情，准备点击在 X 打开/前往目标");
 
   beginXOpenWatch(lighthouseTabId, "debug");
   const targetResult = await sendToTab(lighthouseTabId, {
@@ -1851,7 +1853,7 @@ async function openSelectedTaskTweetTab(selectedTask, settings, stillCurrent = n
     && runtimeState.running && !runtimeState.manuallyStopped && (!stillCurrent || stillCurrent());
   if (!isCurrent()) return null;
   if (isIgnoredNonCommentTask(selectedTask)) {
-    throw new Error("已忽略原创/转发任务，不打开详情");
+    throw new Error("已忽略原创、关注或引用任务，不打开详情");
   }
   setStage("selected_task_opening");
   const lighthouseTabId = await resolveLighthouseTab(isCurrent);
@@ -3152,17 +3154,24 @@ async function closeLighthouseDetailToCampaigns(tabId, settings, reason, isCurre
 async function closeLighthouseTaskDetail(tabId, settings, reason, isCurrent = () => true, preserveAutoInvitation = false) {
   if (!tabId || !isCurrent()) return false;
   const runId = runtimeState.runId;
+  const task = runtimeState.currentTask ? { ...runtimeState.currentTask } : null;
+  const completionEvidence = hasLatchedLighthouseCompletion(runId) ? runtimeState.completionEvidence : null;
+  const canClose = () => isCurrent() && runtimeState.runId === runId
+    && runtimeState.currentTask?.taskKey === task?.taskKey
+    && runtimeState.currentTask?.tweetUrl === task?.tweetUrl;
   try {
     await chrome.tabs.update(tabId, { active: true });
-    if (!isCurrent()) return false;
+    if (!canClose()) return false;
     await waitForTabComplete(tabId);
-    if (!isCurrent()) return false;
+    if (!canClose()) return false;
     const result = await sendToTab(tabId, {
       type: "CLOSE_LIGHTHOUSE_TASK_DETAIL",
       runId,
+      task,
+      completionEvidence,
       settings
     });
-    if (!isCurrent() || result?.cancelled) return false;
+    if (!canClose() || result?.cancelled) return false;
     if (result && result.ok) {
       log("info", result.message || reason || "已关闭任务详情");
       return true;
@@ -3170,8 +3179,8 @@ async function closeLighthouseTaskDetail(tabId, settings, reason, isCurrent = ()
     log("warn", result?.message || "任务详情关闭未确认");
     // A new invitation may have appeared while the close receipt was pending.
     if (preserveAutoInvitation) {
-      const invitation = await checkLighthouseInvitationBeforeRefresh(tabId, isCurrent);
-      if (!isCurrent() || invitation.cancelled) return false;
+      const invitation = await checkLighthouseInvitationBeforeRefresh(tabId, canClose);
+      if (!canClose() || invitation.cancelled) return false;
       if (!invitation.ok) throw new Error(invitation.message);
       if (invitation.invitationPending) {
         log("info", "检测到专属任务邀请，保留当前页面继续扫描");
@@ -3180,14 +3189,15 @@ async function closeLighthouseTaskDetail(tabId, settings, reason, isCurrent = ()
     }
     // A stuck Lighthouse drawer can remain in the DOM after every close
     // gesture. Reloading the campaigns tab is the reliable recovery path.
+    if (!canClose()) return false;
     await chrome.tabs.reload(tabId);
-    if (!isCurrent()) return false;
+    if (!canClose()) return false;
     await waitForTabComplete(tabId);
-    if (!isCurrent()) return false;
+    if (!canClose()) return false;
     log("info", "任务详情关闭未确认，已刷新任务广场并继续下一条");
     return true;
   } catch (error) {
-    if (!isCurrent()) return false;
+    if (!canClose()) return false;
     log("warn", `页面内关闭任务详情失败：${error.message}`);
     return false;
   }
@@ -3220,7 +3230,7 @@ async function getSettingsForRun(isCurrent) {
 function missingAIKeyMessage(settings, task) {
   if (String(settings?.aiApiKey || "").trim()) return "";
   const types = String(task?.taskType || "").trim().split(/[+＋、/,&，\s]+/).filter(Boolean);
-  if (types.length && types.every(type => /^(?:点赞|关注|like|follow)$/i.test(type))) return "";
+  if (types.length && types.every(type => /^(?:点赞(?:互动)?|关注|转发(?:互动)?|转推|转帖|like|follow|repost|retweet)$/i.test(type))) return "";
   // Both native and sola_bridge comment paths generate text in this worker.
   // Unknown automatic selections may include comments and need the same check.
   return "尚未保存 API Key，请输入并保存后再接取评论任务";
@@ -5316,10 +5326,10 @@ function describeTaskForLog(task = {}) {
 
 function isIgnoredNonCommentTask(task = {}) {
   const explicitTaskType = normalizeInline(task.taskType || "");
-  if (explicitTaskType) return explicitTaskType === "原创推文" || explicitTaskType === "转发" || explicitTaskType === "关注" || explicitTaskType === "Follow";
+  if (explicitTaskType) return explicitTaskType === "原创推文" || explicitTaskType === "引用" || explicitTaskType === "关注" || explicitTaskType === "Follow";
 
   const text = normalizeInline([task.title, task.candidateTitle, task.text, task.listText, task.detailText].filter(Boolean).join(" "));
-  return /原创推文|原创建推文|原创内容|发推|发布推文|创建推文|发一条推文|转发|转推|Repost|Retweet|关注任务|\bFollow\b/i.test(text);
+  return /原创推文|原创建推文|原创内容|发推|发布推文|创建推文|发一条推文|引用|Quote|关注任务|\bFollow\b/i.test(text);
 }
 
 function failStep(result, fallbackMessage) {

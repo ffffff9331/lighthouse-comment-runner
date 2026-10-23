@@ -1,7 +1,7 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerXSingleton__";
   const RUN_LOCK_KEY = "__lighthouseCommentTaskRunnerXRunLock__";
-  const SCRIPT_VERSION = "0.7.122";
+  const SCRIPT_VERSION = "0.7.123";
   const INSTANCE_ID = `x-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const RESERVED_X_HANDLE_SLUGS = new Set(["home", "explore", "notifications", "messages", "jobs", "i", "settings"]);
   const existingSingleton = globalThis[SINGLETON_KEY];
@@ -156,7 +156,7 @@
       taskActions = await waitForTaskActions(task, settings);
       assertActiveRun(runId);
     } catch (error) {
-      // Only preparation failures prove that no follow, like or reply began.
+      // Only preparation failures prove that no social action began.
       // A stopped run or changed target must retain its cancellation guard.
       assertActiveRun(runId);
       return { ok: false, actionAttempted: false, message: error.message || String(error) };
@@ -182,17 +182,30 @@
       return { ok: false, message: likeResult.message || "当前任务要求点赞，但未确认点赞成功", mode: "like",
         tweet, follow: followResult, like: likeResult, taskActions, xInstanceId: INSTANCE_ID };
     }
+    const officialRepostComplete = taskActions.needsRepost && taskActions.steps
+      .filter(step => step.action === "repost").every(step => step.completed);
+    const repostResult = !taskActions.needsRepost
+      ? { ok: true, status: "not_required", message: "当前任务不要求转发" }
+      : officialRepostComplete
+        ? { ok: true, status: "already_completed", message: "官网当前任务已确认转发完成" }
+        : await repostCurrentTweetIfNeeded();
+    assertActiveRun(runId);
+    if (!repostResult.ok) {
+      return { ok: false, message: repostResult.message, mode: "repost", tweet,
+        follow: followResult, like: likeResult, repost: repostResult, taskActions, xInstanceId: INSTANCE_ID };
+    }
     if (!taskActions.needsComment) {
       assertActiveRun(runId);
       return {
-        ok: likeResult.ok && followResult.ok,
-        message: taskActions.needsFollow && taskActions.needsLike
+        ok: likeResult.ok && followResult.ok && repostResult.ok,
+        message: taskActions.needsRepost ? "已确认当前任务要求的转发及其他互动，等待提交验证" : taskActions.needsFollow && taskActions.needsLike
           ? "已完成关注和点赞任务"
           : (taskActions.needsFollow ? followResult.message : (likeResult.message || "已完成点赞任务")),
-        mode: taskActions.needsFollow ? "follow" : "like",
+        mode: taskActions.needsRepost ? "repost" : taskActions.needsFollow ? "follow" : "like",
         tweet,
         follow: followResult,
         like: likeResult,
+        repost: repostResult,
         taskActions,
         xInstanceId: INSTANCE_ID
       };
@@ -205,7 +218,7 @@
       : await detectExistingReplyBeforeWriting(tweet, task, settings);
     if (dedupeResult.replied) {
       assertActiveRun(runId);
-      return { ...buildDedupeReplyResult(tweet, dedupeResult, likeResult), follow: followResult, taskActions };
+      return { ...buildDedupeReplyResult(tweet, dedupeResult, likeResult), follow: followResult, repost: repostResult, taskActions };
     }
 
     assertActiveRun(runId);
@@ -218,7 +231,7 @@
     if (settings.replyProvider === "sola_bridge") {
       assertActiveRun(runId);
       const bridged = await trySolaBridge({ ...(task || {}), replyText, tweet }, settings);
-      if (bridged.ok) return { ...bridged, replyText, tweet, like: likeResult, follow: followResult, taskActions };
+      if (bridged.ok) return { ...bridged, replyText, tweet, like: likeResult, follow: followResult, repost: repostResult, taskActions };
     }
 
     assertActiveRun(runId);
@@ -233,6 +246,7 @@
         replyText,
         tweet,
         like: likeResult,
+        repost: repostResult,
         taskActions,
         xInstanceId: INSTANCE_ID
       };
@@ -249,6 +263,7 @@
       tweet,
       follow: followResult,
       like: likeResult,
+      repost: repostResult,
       taskActions,
       xInstanceId: INSTANCE_ID,
       verify: postResult
@@ -346,12 +361,13 @@
     const section = value.match(/要完成\s*[:：]?([\s\S]*?)停留时长\s*[:：]?\s*(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\s*s?/i);
     if (!section || !section[1].trim()) return { complete: false };
     const steps = [];
-    const pattern = /(评论|回复|点赞|喜欢|关注|转发|转推|引用|收藏|comment|reply|like|follow|repost|retweet|quote)\s*[:：]?\s*(待完成|未完成|已完成|pending|completed|done)/gi;
+    const pattern = /(评论|回复|点赞|喜欢|关注|转发互动|转发|转推|转帖|引用转发|引用转推|引用|收藏|comment|reply|like|follow|repost|retweet|quote)\s*[:：]?\s*(待完成|未完成|已完成|pending|completed|done)/gi;
     for (const match of section[1].matchAll(pattern)) {
       const label = match[1];
       const action = /^(评论|回复|comment|reply)$/i.test(label) ? "comment"
         : /^(点赞|喜欢|like)$/i.test(label) ? "like"
-        : /^(关注|follow)$/i.test(label) ? "follow" : "unsupported";
+        : /^(关注|follow)$/i.test(label) ? "follow"
+        : /^(转发互动|转发|转推|转帖|repost|retweet)$/i.test(label) ? "repost" : "unsupported";
       steps.push({ action, label, status: match[2], completed: /^(已完成|completed|done)$/i.test(match[2]) });
     }
     // Every requirement must have a recognized action/status pair. A partial
@@ -362,6 +378,7 @@
       needsComment: steps.some((step) => step.action === "comment"),
       needsLike: steps.some((step) => step.action === "like"),
       needsFollow: steps.some((step) => step.action === "follow"),
+      needsRepost: steps.some((step) => step.action === "repost"),
       unsupported: steps.filter((step) => step.action === "unsupported").map((step) => step.label),
       dwellSeconds: Number(section[2]), requiredDwellSeconds: Number(section[3]) };
   }
@@ -374,7 +391,8 @@
     const declared = normalizeText(task.taskType || "");
     const missingDeclaredActions = (actions) => (/评论|回复|comment|reply/i.test(declared) && !actions.needsComment)
       || (/点赞|like/i.test(declared) && !actions.needsLike)
-      || (/关注|follow/i.test(declared) && !actions.needsFollow);
+      || (/关注|follow/i.test(declared) && !actions.needsFollow)
+      || (/转发|转推|转帖|repost|retweet/i.test(declared) && !actions.needsRepost);
     while (Date.now() - started < timeoutMs) {
       assertActiveRun(runId);
       current = inferTaskActions(task);
@@ -1437,6 +1455,71 @@
       like: likeResult || { ok: true, status: "skipped_dedupe", message: "已回复去重命中，跳过重复评论" },
       xInstanceId: INSTANCE_ID
     };
+  }
+
+  function findRepostTargetControl() {
+    const expected = normalizeTweetUrl(activeTargetUrl, true);
+    if (!expected || normalizeTweetUrl(location.href, true) !== expected) return null;
+    // The timeline may include parent/reply/quoted tweets. A visible article
+    // must own a timestamp link for this exact status before we touch it.
+    const articles = Array.from(document.querySelectorAll("article")).filter(isVisible)
+      .filter(article => Array.from(article.querySelectorAll("a[href]")).some(link =>
+        link.closest("article") === article && link.querySelector("time")
+        && !link.parentElement?.closest('[role="link"],[data-testid="quoteTweet"]')
+        && normalizeTweetUrl(new URL(link.getAttribute("href"), location.href).href, true) === expected));
+    if (articles.length !== 1) return null;
+    const controls = Array.from(articles[0].querySelectorAll('[data-testid="retweet"],[data-testid="unretweet"]'))
+      .filter(node => node.closest("article") === articles[0] && isVisible(node) && !isButtonDisabled(node));
+    return controls.length === 1 ? controls[0] : null;
+  }
+
+  function findRepostConfirmation() {
+    const control = findRepostTargetControl();
+    if (control?.getAttribute("data-testid") !== "retweet" || control.getAttribute("aria-expanded") !== "true") return null;
+    const menus = Array.from(document.querySelectorAll('[role="menu"]')).filter(isVisible);
+    if (menus.length !== 1) return null;
+    // Never select the adjacent Quote item or an Undo Repost confirmation.
+    const buttons = Array.from(menus[0].querySelectorAll('[data-testid="retweetConfirm"]'))
+      .filter(node => node.getAttribute("role") === "menuitem" && isVisible(node) && !isButtonDisabled(node));
+    return buttons.length === 1 ? buttons[0] : null;
+  }
+
+  async function repostCurrentTweetIfNeeded() {
+    const runId = activeRunId;
+    const already = () => ({ ok: true, status: "already_reposted", message: "目标推文已转发，跳过重复操作" });
+    try {
+      assertActiveRun(runId);
+      let control = findRepostTargetControl();
+      if (!control) return { ok: false, status: "button_missing", message: "未找到目标推文的唯一可用转发按钮，保留本单" };
+      if (control.getAttribute("data-testid") === "unretweet") return already();
+      if (Array.from(document.querySelectorAll('[role="menu"]')).some(isVisible)) {
+        return { ok: false, status: "menu_conflict", message: "X 已有打开的菜单，未触发转发，请核对本单" };
+      }
+      await randomClickDelay();
+      assertActiveRun(runId);
+      control = findRepostTargetControl();
+      if (control?.getAttribute("data-testid") === "unretweet") return already();
+      if (!control || Array.from(document.querySelectorAll('[role="menu"]')).some(isVisible)) {
+        throw new Error("目标转发按钮或菜单已变化");
+      }
+      await clickElement(control, { randomDelay: false });
+      await waitFor(() => findRepostConfirmation(), 4000, "未找到本次转发的确认菜单");
+      await randomClickDelay();
+      assertActiveRun(runId);
+      control = findRepostTargetControl();
+      if (control?.getAttribute("data-testid") === "unretweet") return already();
+      const confirm = findRepostConfirmation();
+      if (!confirm) throw new Error("转发确认菜单已变化");
+      await clickElement(confirm, { randomDelay: false });
+      const applied = await waitFor(() => findRepostTargetControl()?.getAttribute("data-testid") === "unretweet",
+        5000, "转发状态未确认").catch(() => false);
+      assertActiveRun(runId);
+      return applied
+        ? { ok: true, status: "reposted", message: "已确认目标推文转发成功" }
+        : { ok: false, status: "clicked_unverified", message: "已点击转发但未确认结果，保留本单，不重发或提交验证" };
+    } catch (error) {
+      return { ok: false, status: "error", message: `转发未完成：${error.message || String(error)}` };
+    }
   }
 
   async function likeCurrentTweetIfNeeded(settings = {}) {

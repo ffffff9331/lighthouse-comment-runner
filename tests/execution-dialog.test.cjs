@@ -199,6 +199,40 @@ async function executionWorker(t) {
 }
 const autoSettings = { replyMode: "post", autoSubmitLighthouse: true, actionDelayMs: 150 };
 
+for (const officialCompleted of [true, false]) {
+  test(`ordinary repost order verifies in X then Lighthouse, next order requires completion=${officialCompleted}`, async t => {
+    const { w, e, task } = await executionWorker(t);
+    Object.assign(task, { source: "lighthouse", taskType: "转发" });
+    const sequence = [];
+    const send = w.chrome.tabs.sendMessage;
+    w.chrome.tabs.sendMessage = async (id, message) => {
+      if (id === 22 && message.type === "COMPLETE_X_TASK_WIDGET") sequence.push("x-verify");
+      return send(id, message);
+    };
+    e.verify.onClick = () => {
+      sequence.push("lighthouse-verify");
+      if (officialCompleted) showOfficialCompletion(e);
+    };
+    w.c.getSettingsForRun = async () => ({...autoSettings, maxTasksPerRun: 5});
+    w.c.recordReplyHistory = async result => {
+      assert.equal(result.mode, "repost");
+      assert.equal(result.replyText, undefined);
+    };
+    w.c.closeLighthouseDetailToCampaigns = async () => {
+      assert.equal(w.c.hasLatchedLighthouseCompletion(w.state().runId), true);
+      return true;
+    };
+    w.chrome.tabs.reload = async () => { sequence.push("reload"); };
+    w.c.startNextAutoTask = async () => { sequence.push("next-order"); return {ok: true}; };
+    const result = await w.c.handleXReplyResult({ok: true, mode: "repost", repost: {ok: true, status: "reposted"}}, {runId: w.state().runId});
+    assert.equal(result.ok, officialCompleted);
+    assert.deepEqual(sequence, ["x-verify", "lighthouse-verify", ...(officialCompleted ? ["reload", "next-order"] : [])]);
+    assert.equal(w.state().completed, officialCompleted ? 1 : 0);
+    assert.equal(e.verify.clicks, 1);
+    if (!officialCompleted) assert.equal(w.state().currentTask.taskKey, task.taskKey);
+  });
+}
+
 test("real worker submits X before Lighthouse, persists each intent and waits for official completion", async t => {
   const { w, p, e, task } = await executionWorker(t);
   const send = w.chrome.tabs.sendMessage;
@@ -307,6 +341,126 @@ test("an attempted X verification with no final website result continues to the 
 function showOfficialCompletion(e) {
   e.region.replaceChildren(new Element("h2", "验证成功"), new Element("strong", "0.10 LUX"),
     new Element("a", "查看原推文", [], { href: TARGET }));
+}
+
+// The live invitation receipt no longer includes its original target link.
+function showDispatchCompletion(e) {
+  e.root.attrs["data-engagement-dispatch"] = "true";
+  const close = new Element("button", "完成并关闭");
+  const result = new Element("section", "", [
+    new Element("div", "", [new Element("h2", "任务完成，验证通过"),
+      new Element("p", "感谢认真完成每一次互动。")], { class: "completion-hero", role: "status" }),
+    new Element("div", "任务奖励 0.10 LUX 奖励已发放 奖励已完成结算", [], { class: "completion-reward" }),
+    new Element("div", "你的互动已通过验证 任务完成记录已保存。", [], { class: "completion-receipt" }),
+    new Element("div", "", [close, new Element("p", "任务已完成，无需重复验证。后续复核结果会在这里更新。")],
+      { class: "completion-controls" })], { class: "dispatch-completion success", "aria-label": "任务执行与验证" },
+    { width: 620, height: 700 });
+  e.region.replaceChildren(result);
+  close.onClick = () => e.root.remove();
+  return { close, result };
+}
+
+for (const boundary of ["x-verification", "lighthouse-verification"]) {
+  test(`invitation ${boundary} completion closes the real result before refreshing and claiming next`, async t => {
+    const { w, e } = await executionWorker(t);
+    const sequence = []; let receipt;
+    const finish = () => {
+      receipt = showDispatchCompletion(e);
+      receipt.close.onClick = () => { sequence.push("finish-close"); e.root.remove(); };
+    };
+    e.verify.onClick = () => { sequence.push("lighthouse-verify"); finish(); };
+    const send = w.chrome.tabs.sendMessage;
+    w.chrome.tabs.sendMessage = async (id, message) => {
+      if (id === 22 && message.type === "COMPLETE_X_TASK_WIDGET") {
+        sequence.push("x-verify");
+        if (boundary === "x-verification") finish();
+      }
+      return send(id, message);
+    };
+    w.c.getSettingsForRun = async () => ({ ...autoSettings, maxTasksPerRun: 5 });
+    w.c.recordReplyHistory = async () => {};
+    w.chrome.tabs.reload = async () => { sequence.push("reload"); };
+    w.c.startNextAutoTask = async () => { sequence.push("next-order"); return { ok: true }; };
+    const result = await w.c.handleXReplyResult({ ok: true, mode: "post", posted: true }, { runId: w.state().runId });
+    assert.equal(result.ok, true, result.error || result.message);
+    assert.deepEqual(sequence, ["x-verify", ...(boundary === "lighthouse-verification" ? ["lighthouse-verify"] : []),
+      "finish-close", "reload", "next-order"]);
+    assert.equal(receipt.close.clicks, 1);
+    assert.equal(e.verify.clicks, boundary === "lighthouse-verification" ? 1 : 0);
+    assert.equal(w.state().completed, 1);
+  });
+}
+
+test("completion watch started before lock can bind the same order without resetting its baseline", async () => {
+  const p = page({ popup: false }); const e = installExecution(p, { phase: "working" });
+  const task = { taskKey: "execution-order", tweetUrl: TARGET };
+  await p.run("BEGIN_LIGHTHOUSE_COMPLETION_WATCH", { task });
+  task.seatLocked = true;
+  await p.run("BEGIN_LIGHTHOUSE_COMPLETION_WATCH", { task });
+  showDispatchCompletion(e);
+  await p.run("BEGIN_LIGHTHOUSE_COMPLETION_WATCH", { task });
+  const result = await p.run("CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION", { task });
+  assert.equal(result.completed, true);
+  assert.equal(result.evidence.taskKey, task.taskKey);
+});
+
+for (const failure of ["pre-existing", "different-dialog", "unbound", "prose-only", "wrong-original-link"]) {
+  test(`invitation completion rejects ${failure} evidence`, async () => {
+    const p = page({ popup: false }); let e = installExecution(p, { phase: "working" });
+    const task = { taskKey: "execution-order", tweetUrl: TARGET, seatLocked: failure !== "unbound" };
+    if (failure === "pre-existing") showDispatchCompletion(e);
+    await p.run("BEGIN_LIGHTHOUSE_COMPLETION_WATCH", { task });
+    if (failure === "different-dialog") e = installExecution(p, { phase: "working", target: OTHER });
+    if (failure === "prose-only") {
+      e.region.appendChild(new Element("div", "", [new Element("h2", "任务完成，验证通过"),
+        new Element("p", "0.10 LUX"), new Element("button", "完成并关闭")], {}, { width: 400, height: 300 }));
+    } else if (failure !== "pre-existing") showDispatchCompletion(e);
+    if (failure === "wrong-original-link") e.region.appendChild(new Element("a", "查看原推文", [], { href: OTHER }));
+    const result = await p.run("CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION", { task });
+    assert.equal(result.completed, false);
+    assert.equal(e.verify.clicks + e.open.clicks, 0);
+  });
+}
+
+for (const failure of ["stop", "different-dialog", "disabled"]) {
+  test(`finish-and-close rechecks ${failure} during its click delay`, async () => {
+    const p = page({ popup: false }); const e = installExecution(p, { phase: "working" });
+    const task = { taskKey: "execution-order", tweetUrl: TARGET, seatLocked: true };
+    await p.run("BEGIN_LIGHTHOUSE_COMPLETION_WATCH", { task });
+    const receipt = showDispatchCompletion(e);
+    assert.equal((await p.run("CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION", { task })).completed, true);
+    let interrupted = false;
+    p.f.beforeWait = async () => {
+      if (interrupted) return; interrupted = true;
+      if (failure === "stop") await p.pause();
+      if (failure === "different-dialog") installExecution(p, { phase: "working", target: OTHER });
+      if (failure === "disabled") receipt.close.disabled = true;
+    };
+    const closed = await p.run("CLOSE_LIGHTHOUSE_TASK_DETAIL", { task });
+    assert.equal(closed.ok, false);
+    assert.equal(receipt.close.clicks, 0);
+    assert.equal(e.verify.clicks, 0);
+  });
+}
+
+for (const failure of ["different-dialog", "disabled"]) {
+  test(`worker preserves the page when completion close changes to ${failure}`, async t => {
+    const { w, p, e, task } = await executionWorker(t);
+    const runId = w.state().runId;
+    await w.c.sendToTab(11, { type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId, task });
+    const receipt = showDispatchCompletion(e);
+    const completion = await w.c.sendToTab(11, { type: "CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION", runId, task });
+    assert.equal(w.c.latchLighthouseCompletion(completion.evidence, runId), true);
+    let changed = false;
+    p.f.beforeWait = () => {
+      if (changed) return; changed = true;
+      if (failure === "different-dialog") installExecution(p, { phase: "working", target: OTHER });
+      else receipt.close.disabled = true;
+    };
+    assert.equal(await w.c.closeLighthouseDetailToCampaigns(11, autoSettings, "fixture completion"), false);
+    assert.equal(receipt.close.clicks, 0);
+    assert.equal(w.reloads().length, 0, "changed completion is not permission to discard the current page");
+  });
 }
 
 for (const officialCompleted of [true, false]) {
@@ -437,5 +591,45 @@ for (const failure of ["not-ok", "missing-response"]) {
     assert.equal(w.messages("COMPLETE_X_TASK_WIDGET").length, 0, "unknown execution state is not an absent dialog");
     assert.equal(e.verify.clicks, 0);
     assert.notEqual(result.ok, true);
+  });
+}
+
+test("review: a latched same-order dispatch receipt closes once without recovery reload", async t => {
+  const { w, e, task } = await executionWorker(t);
+  const runId = w.state().runId;
+  await w.c.sendToTab(11, { type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId, task });
+  const receipt = showDispatchCompletion(e);
+  const completed = await w.c.sendToTab(11, { type: "CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION", runId, task });
+  assert.equal(w.c.latchLighthouseCompletion(completed.evidence, runId), true);
+  assert.equal(await w.c.closeLighthouseDetailToCampaigns(11, autoSettings, "review same order"), true);
+  assert.equal(receipt.close.clicks, 1);
+  assert.equal(e.verify.clicks, 0);
+  assert.equal(w.reloads().length, 0);
+});
+
+for (const replacementState of ["working", "completed"]) {
+  test(`review: another ${replacementState} order appearing before CLOSE is left untouched`, async t => {
+    const { w, p, e, task } = await executionWorker(t);
+    const runId = w.state().runId;
+    await w.c.sendToTab(11, { type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId, task });
+    const originalReceipt = showDispatchCompletion(e);
+    const completed = await w.c.sendToTab(11, { type: "CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION", runId, task });
+    assert.equal(w.c.latchLighthouseCompletion(completed.evidence, runId), true);
+    const update = w.chrome.tabs.update;
+    let replacement, replacementReceipt;
+    w.chrome.tabs.update = async (...args) => {
+      const result = await update(...args);
+      if (!replacement) {
+        replacement = installExecution(p, { phase: "working", target: OTHER });
+        if (replacementState === "completed") replacementReceipt = showDispatchCompletion(replacement);
+      }
+      return result;
+    };
+    const closed = await w.c.closeLighthouseDetailToCampaigns(11, autoSettings, "review switched order");
+    assert.equal(w.reloads().length, 0, "an unfinished replacement order must not be discarded by reload");
+    assert.equal(replacementReceipt?.close.clicks || 0, 0, "the old task cannot close another task's result");
+    assert.equal(replacement.open.clicks + replacement.verify.clicks, 0);
+    assert.equal(originalReceipt.close.clicks, 0);
+    assert.equal(closed, false);
   });
 }

@@ -122,8 +122,8 @@ test('later generic comment fallback cannot turn a selected like-only task into 
   assert.equal(h.page.mergeSelectedTaskIdentity(selected, { taskType: '评论', seatLocked: true }).taskType, '点赞互动');
 });
 
-test('follow, repost and original badges remain ineligible even alongside comment/like', () => {
-  for (const [badge, expected] of [['关注', '关注'], ['转发', '转发'], ['原创推文', '原创推文']]) {
+test('follow, quote and original badges remain ineligible even alongside supported actions', () => {
+  for (const [badge, expected] of [['关注', '关注'], ['引用转发', '引用'], ['原创推文', '原创推文']]) {
     const h = harness(card(['评论+点赞', badge]));
     const candidate = h.page.collectTaskCandidates([])[0];
     assert.equal(candidate.taskType, expected);
@@ -131,6 +131,42 @@ test('follow, repost and original badges remain ineligible even alongside commen
     assert.equal(h.monitor.collectTaskInfos()[0].taskType, expected);
     assert.throws(() => h.page.assertSupportedDetailTask(h.page.buildTask({}, '评论+点赞')), error => error.permanentIgnore === true);
   }
+});
+
+for (const [badges, expected] of [
+  [['转发互动'], '转发'], [['转发'], '转发'], [['转推'], '转发'], [['Repost'], '转发'], [['Retweet'], '转发'],
+  [['转发互动', '点赞'], '点赞+转发'], [['评论+点赞', '转发互动'], '评论+点赞+转发'],
+]) {
+  test(`repost badges ${badges.join('/')} pass monitor, selection and detail without losing requirements`, async () => {
+    const h = harness(card(badges));
+    const candidate = h.page.collectTaskCandidates([])[0];
+    const monitored = h.monitor.collectTaskInfos()[0];
+    assert.equal(candidate.taskType, expected);
+    assert.equal(monitored.taskType, expected);
+    assert.equal(candidate.isAutomatable, true);
+    assert.ok(h.page.scoreSelectedTaskCandidate(candidate, monitored) >= 140);
+    const opened = await h.page.debugOpenFirstCommentTask({});
+    assert.equal(opened.task.taskType, expected);
+    assert.doesNotThrow(() => h.page.assertSupportedDetailTask(opened.task));
+  });
+}
+
+test('repost requirement survives a generic comment detail fallback', () => {
+  const h = harness(card(['转发互动']));
+  assert.equal(h.page.mergeSelectedTaskIdentity({taskType: '转发'}, {taskType: '评论'}).taskType, '转发');
+  assert.equal(h.page.mergeSelectedTaskIdentity({taskType: '转发'}, {taskType: '点赞+转发'}).taskType, '点赞+转发');
+});
+
+test('review: explicit composite requirements survive a detail repost label', async () => {
+  const h = harness(card(['评论+点赞']), card(['转发']));
+  const opened = await h.page.debugOpenFirstCommentTask({});
+  assert.equal(opened.task.taskType, '评论+点赞+转发', 'an explicit list composite is not a generic comment fallback');
+});
+
+test('tweet prose cannot turn a comment card into a repost order', () => {
+  const h = harness(card(['评论留言'], '请谈谈转发互动与引用的区别 @zhangtingt5977'));
+  assert.equal(h.page.collectTaskCandidates([])[0].taskType, '评论');
+  assert.equal(h.monitor.collectTaskInfos()[0].taskType, '评论');
 });
 
 test('composite aliases canonicalize consistently for matching and stable identity', () => {

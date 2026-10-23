@@ -149,6 +149,36 @@ test("temporary loading followed by current-task success is awaited", async () =
   assert.equal(p.fixture.clicks, 1);
 });
 
+test("lottery step descriptions and a disabled drawing button are not a seat receipt", async () => {
+  const p = page({ initialNodes: [node("抽签 · 锁定席位"), node("抽签成功后锁定专属席位"),
+    node("前往 X 完成动作"), node("回来提交验证"), node("在 X 打开", {control: true, href: URL_X})],
+    onClick(_f, button) { button.disabled = true; button.innerText = "抽签中"; }
+  });
+  const result = await p.dispatch();
+  assert.equal(result.ok, false);
+  assert.notEqual(result.task?.seatLocked, true);
+  assert.equal(result.claimActionAttempted, true);
+  assert.equal(p.fixture.clicks, 1);
+});
+
+test("lottery waits for the same-order locked receipt and target entrance without claiming twice", async () => {
+  const p = page({ initialNodes: [node("抽签 · 锁定席位"), node("前往 X 完成动作"), node("回来提交验证")],
+    onClick(_f, button) { button.disabled = true; button.innerText = "抽签中"; },
+    onWait(f, button) {
+      if (f.clicks && f.elapsedMs >= 5000) {
+        f.nodes = f.nodes.filter(n => n !== button);
+        if (!f.nodes.some(n => n.href)) f.nodes.push(node("席位已锁定"), node("前往 X 完成动作", {control: true, href: URL_X}));
+      }
+    }
+  });
+  const result = await p.dispatch();
+  assert.equal(result.ok, true, result.message);
+  assert.equal(result.task.seatLocked, true);
+  assert.equal(result.task.tweetUrl, URL_X);
+  assert.ok(p.fixture.elapsedMs >= 5000);
+  assert.equal(p.fixture.clicks, 1);
+});
+
 test("an already locked detail with its target resumes without another claim click", async () => {
   const p = page({ initialNodes: [node("席位已锁定"), node("去 X 完成动作", { control: true, href: URL_X })] });
   p.fixture.nodes = p.fixture.nodes.filter(n => n !== p.button);
