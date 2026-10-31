@@ -72,34 +72,24 @@ await test("stage changes do not reset the no-order refresh timer", () => {
   assert.equal(context.runtimeState.stage, "selecting_task");
 });
 
-await test("locked orders retain protection while unclaimed tasks have no retry dedupe", () => {
+await test("locked orders count once while no task receives temporary retry dedupe", () => {
   const messages = [];
-  const state = {
-    attempts: 0,
-    attemptedTaskRecords: [],
-    attemptedTaskKeys: []
-  };
-  const c = contextFor(background, ["markAttemptedTask"], {
+  const state = { attempts: 0, runId: "r", attemptedTaskRecords: [], attemptedTaskKeys: [] };
+  const c = contextFor(background, ["markAttemptedTask", "isSameCountedTaskAttempt", "getTaskMergeIdentity", "normalizeTweetUrl"], {
     runtimeState: state,
-    ATTEMPTED_TASK_DEDUPE_MS: 3 * 60 * 1000,
-    MAX_DEFERRED_TASK_DEDUPE_MS: 6 * 60 * 60 * 1000,
-    getTaskDedupeKeys: () => ["task-locked"],
-    pruneAttemptedTasks() {},
-    getActiveAttemptedTaskKeys: () => [],
     describeTaskForLog: () => "0.1LUX · @locked",
-    formatDuration: (ms) => `${Math.round(ms / 1000)}s`,
-    log: (_level, message) => messages.push(message),
-    Date: { now: () => 1000 }
+    log: (_level, message) => messages.push(message)
   });
-  c.markAttemptedTask({ seatLocked: true });
-  assert.equal(messages[0], "已登记已锁定订单，完成前不重复抢单：0.1LUX · @locked");
-
-  messages.length = 0;
-  state.attemptedTaskRecords = [];
-  state.attemptedTaskKeys = [];
-  c.markAttemptedTask({});
-  assert.equal(messages.length, 0);
+  const locked = { taskKey: "task-locked", seatLocked: true };
+  c.markAttemptedTask(locked);
+  c.markAttemptedTask({ ...locked });
+  assert.equal(state.attempts, 1);
+  assert.equal(messages[0], "已记录本单接单次数：0.1LUX · @locked");
   assert.equal(state.attemptedTaskRecords.length, 0);
+  messages.length = 0;
+  c.markAttemptedTask({ taskKey: "unclaimed" });
+  assert.equal(messages.length, 0);
+  assert.equal(state.attempts, 1);
 });
 
 if (platform === "lighthouse") {
@@ -374,9 +364,9 @@ if (platform === "lighthouse") {
     assert.equal(result.completed, true);
     assert.equal(result.evidence.taskKey, "task-1");
   });
-  await test("AI-prohibited and wallet-address guidance require a human", () => {
+  await test("AI wording stays eligible while wallet-address guidance requires a human", () => {
     const context = contextFor(page, ["hasUnsupportedCommentGuidance"]);
-    assert.equal(context.hasUnsupportedCommentGuidance("评论引导 不要AI评论"), true);
+    assert.equal(context.hasUnsupportedCommentGuidance("评论引导 不要AI评论"), false);
     assert.equal(context.hasUnsupportedCommentGuidance("接单备注 要求填写EVM地址，抽奖"), true);
     assert.equal(context.hasUnsupportedCommentGuidance("评论引导 评价内容观点"), false);
     assert.equal(context.hasUnsupportedCommentGuidance("正文讨论 AI 交易和钱包地址安全"), false);
@@ -427,7 +417,7 @@ if (platform === "lighthouse") {
     const context = contextFor(page, ["hasUnsupportedCommentGuidance", "getEligibilityBlockReason", "assertSupportedDetailTask"], {
       document: {
         body: {
-          innerText: `${detailRoot.innerText} 推荐任务 接单备注 不要使用 AI 评论`
+          innerText: `${detailRoot.innerText} 推荐任务 接单备注 请填写钱包地址`
         }
       },
       TIER_MISMATCH_PHRASE: "你的F级已满，本次奖励按D级结算",
@@ -436,7 +426,7 @@ if (platform === "lighthouse") {
     });
     assert.doesNotThrow(() => context.assertSupportedDetailTask({ taskType: "评论", detailText: detailRoot.innerText }));
 
-    detailRoot.innerText += " 任务备注 不要使用 AI 评论";
+    detailRoot.innerText += " 任务备注 请填写钱包地址";
     assert.throws(
       () => context.assertSupportedDetailTask({ taskType: "评论", detailText: detailRoot.innerText }),
       (error) => error.permanentIgnore === true && error.ignoredTaskType === "人工评论要求"
@@ -1614,16 +1604,17 @@ if (platform === "xinhuo") {
     state.currentTask = { taskKey: "b" };
     assert.equal(c.hasLatchedLighthouseCompletion("r"), false);
   });
-  await test("completed tasks leave the dedupe table, other tasks stay", () => {
-    const c = contextFor(background, ["releaseAttemptedTask", "getTaskDedupeKeys", "normalizeTweetUrl", "buildStableTaskKey", "buildTaskTextKey", "normalizeInline"], {
-      runtimeState: { attemptedTaskRecords: [
+  await test("completion clears legacy timed records without releasing an unrelated counted order", () => {
+    const c = contextFor(background, ["releaseAttemptedTask", "pruneAttemptedTasks", "isSameCountedTaskAttempt", "getTaskMergeIdentity", "normalizeTweetUrl"], {
+      runtimeState: { runId: "r", countedTaskAttempt: { runId: "r", identity: { taskKey: "task-2" } }, attemptedTaskRecords: [
         { key: "task-1", expiresAt: Date.now() + 60000 },
         { key: "https://x.com/other/status/9", expiresAt: Date.now() + 60000 },
         { key: "stable|评论|0.10||old", expiresAt: Date.now() + 60000 }
       ], attemptedTaskKeys: ["task-1", "https://x.com/other/status/9"] }
     });
     c.releaseAttemptedTask({ taskKey: "task-1", tweetUrl: "https://x.com/a/status/1" });
-    assert.deepEqual([...c.runtimeState.attemptedTaskRecords].map((r) => r.key), ["https://x.com/other/status/9", "stable|评论|0.10||old"]);
+    assert.deepEqual([...c.runtimeState.attemptedTaskRecords], []);
+    assert.equal(c.runtimeState.countedTaskAttempt.identity.taskKey, "task-2");
   });
   await test("completion-overlay timeout is not rescued by unrelated aggregate income", async () => {
     const state = {

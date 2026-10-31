@@ -17,13 +17,11 @@ const SITE_X_OPEN_WAIT_MS = 5000;
 const LIGHTHOUSE_PREVIOUS_DEFAULT_AI_SYSTEM_PROMPT = "根据原推文写一句自然的中文回复。像真实用户刷到后随手留下的感受，简短、有一点具体反应，不必完整表达观点。10到15个汉字为主，可保留必要的英文词。避免宣传腔、总结腔、夸张吹捧、复述原文和模板化感叹。只输出回复。";
 const LIGHTHOUSE_DEFAULT_AI_SYSTEM_PROMPT = "根据原推文写一句自然的中文回复。像真实用户刷到后随手留下的感受，简短、有一点具体反应，不必完整表达观点。5到20个汉字为主，可保留必要的英文词。避免宣传腔、总结腔、夸张吹捧、复述原文和模板化感叹。只输出回复。";
 const MONITOR_COUNTDOWN_CACHE_TTL_MS = 25000;
-const ATTEMPTED_TASK_DEDUPE_MS = 3 * 60 * 1000;
-const MAX_DEFERRED_TASK_DEDUPE_MS = 6 * 60 * 60 * 1000;
 const CAMPAIGNS_REFRESH_COOLDOWN_MS = 3 * 60 * 1000;
 const CAMPAIGNS_IDLE_REFRESH_MS = 5 * 60 * 1000;
-// V4 contains untyped exclusions for reposts that are now supported. Keep
-// that old data intact, but re-evaluate live eligibility under the new policy.
-const PERMANENT_IGNORED_TASK_KEYS_KEY = "permanentIgnoredTaskKeysV5";
+// Older caches include AI wording that no longer makes a task ineligible.
+// Re-evaluate those cards under the current policy; settings/history are separate.
+const PERMANENT_IGNORED_TASK_KEYS_KEY = "permanentIgnoredTaskKeysV6";
 const REPLY_HISTORY_RECORDS_KEY = "replyHistoryRecords";
 const AI_API_KEY_STORAGE_KEY = "lighthouseAiApiKey";
 const LIGHTHOUSE_MONITOR_SNAPSHOT_KEY = "lighthouseMonitorSnapshot";
@@ -1132,8 +1130,7 @@ async function startNextAutoTask(reason) {
     runId,
     settings,
     attemptedTaskKeys: getActiveAttemptedTaskKeys(),
-    attemptedTaskRecords: (runtimeState.attemptedTaskRecords || [])
-      .filter(record => !permanentIgnoredTaskKeysCache.has(record.key)).map(record => ({ ...record }))
+    permanentIgnoredTaskKeys: getActiveAttemptedTaskKeys(true)
   });
   if (isCurrent() && result?.runnerUnavailable) {
     runtimeState.running = false;
@@ -1348,8 +1345,7 @@ async function debugOpenFirstTask() {
     runId,
     settings,
     attemptedTaskKeys: getActiveAttemptedTaskKeys(),
-    attemptedTaskRecords: (runtimeState.attemptedTaskRecords || [])
-      .filter(record => !permanentIgnoredTaskKeysCache.has(record.key)).map(record => ({ ...record }))
+    permanentIgnoredTaskKeys: getActiveAttemptedTaskKeys(true)
   });
   if (!isCurrent()) return cancelled();
   if (result?.refreshRequested) {
@@ -1361,8 +1357,7 @@ async function debugOpenFirstTask() {
         runId,
         settings,
         attemptedTaskKeys: getActiveAttemptedTaskKeys(),
-        attemptedTaskRecords: (runtimeState.attemptedTaskRecords || [])
-          .filter(record => !permanentIgnoredTaskKeysCache.has(record.key)).map(record => ({ ...record }))
+        permanentIgnoredTaskKeys: getActiveAttemptedTaskKeys(true)
       });
       if (!isCurrent()) return cancelled();
     } else if (refreshState.skippedCooldown) {
@@ -1788,8 +1783,7 @@ async function openNextLighthouseTaskTweetTab(settings, stillCurrent = null) {
     runId,
     settings,
     attemptedTaskKeys: getActiveAttemptedTaskKeys(),
-    attemptedTaskRecords: (runtimeState.attemptedTaskRecords || [])
-      .filter(record => !permanentIgnoredTaskKeysCache.has(record.key)).map(record => ({ ...record }))
+    permanentIgnoredTaskKeys: getActiveAttemptedTaskKeys(true)
   });
   if (!isCurrent()) return null;
   if (openResult?.refreshRequested) {
@@ -1801,8 +1795,7 @@ async function openNextLighthouseTaskTweetTab(settings, stillCurrent = null) {
         runId,
         settings,
         attemptedTaskKeys: getActiveAttemptedTaskKeys(),
-        attemptedTaskRecords: (runtimeState.attemptedTaskRecords || [])
-          .filter(record => !permanentIgnoredTaskKeysCache.has(record.key)).map(record => ({ ...record }))
+        permanentIgnoredTaskKeys: getActiveAttemptedTaskKeys(true)
       });
       if (!isCurrent()) return null;
     } else if (refreshState.skippedCooldown) {
@@ -2684,9 +2677,8 @@ async function handleLighthouseDone(result, resumeCountedCompletion = false) {
       runtimeState.completed += 1;
     }
     touchAutoRunState();
-    // Completed cards are excluded by their own 已完成 state; leaving them in
-    // the dedupe table is what made every visible task look "stale" and sent
-    // the runner into the reload/cooldown spin right after a finished batch.
+    // End this order's attempt accounting. Completed cards follow the site's
+    // live state; no temporary exclusion is registered for the next scan.
     releaseAttemptedTask(runtimeState.currentTask);
     log("info", result.message || "Lighthouse 任务已完成");
   } else {
@@ -2757,7 +2749,7 @@ async function recoverAndContinue(message, options = {}) {
     if (!task.claimRejected) runtimeState.attempts += 1;
     runtimeState.currentTask = null;
     runtimeState.lastXResult = null;
-    log("info", "已确认未接到单，已解除本任务去重；刷新任务广场后重新检测");
+    log("info", "已确认未接到单；刷新任务广场后重新检测");
   } else if (options.task) {
     markAttemptedTask(options.task);
   }
@@ -4416,6 +4408,7 @@ function createInitialState() {
     pendingVerifications: [],
     attemptedTaskKeys: [],
     attemptedTaskRecords: [],
+    countedTaskAttempt: null,
     lastProgressAt: Date.now(),
     autoRecovery: null,
     runId: createRunId(),
@@ -5058,45 +5051,39 @@ async function getBoundMatchingTaskXTab(expectedTweetUrl = "", isCurrent = () =>
 }
 
 function releaseAttemptedTask(task) {
-  if (!task) return;
-  const keys = getTaskDedupeKeys(task);
-  if (!keys.length) return;
-  const released = new Set(keys);
-  runtimeState.attemptedTaskRecords = (runtimeState.attemptedTaskRecords || [])
-    .filter((record) => !released.has(record.key));
-  runtimeState.attemptedTaskKeys = runtimeState.attemptedTaskRecords.map((record) => record.key);
+  if (isSameCountedTaskAttempt(task)) runtimeState.countedTaskAttempt = null;
+  pruneAttemptedTasks();
+}
+
+function isSameCountedTaskAttempt(task) {
+  const counted = runtimeState.countedTaskAttempt;
+  if (!task || !counted || counted.runId !== runtimeState.runId) return false;
+  const identity = getTaskMergeIdentity(task);
+  const tweetUrl = normalizeTweetUrl(task.tweetUrl, true);
+  if (tweetUrl && counted.tweetUrl) return tweetUrl === counted.tweetUrl;
+  const sharedField = ["id", "detailPath", "selectionId", "taskKey", "stableTaskKey"]
+    .find(field => identity[field] && counted.identity?.[field]);
+  return Boolean(sharedField && identity[sharedField] === counted.identity[sharedField]);
 }
 
 function markAttemptedTask(task) {
-  // Unclaimed tasks follow the live plaza countdown. Only an actual order
-  // needs local duplicate-action protection; tier exclusions are separate.
   const protectedCurrentTask = task?.taskKey && task.taskKey === runtimeState.currentTask?.taskKey
     && (runtimeState.completionEvidence || runtimeState.lastXResult || runtimeState.uncertainAction);
   if (!task || !(protectedCurrentTask || task.invitationAccepted || task.claimed || task.seatLocked || task.seatLockedAt)) return;
-  const keys = getTaskDedupeKeys(task);
-  if (!keys.length) return;
-
-  pruneAttemptedTasks();
-  const active = new Set(getActiveAttemptedTaskKeys());
-  const now = Date.now();
-  const requestedDeferUntil = Number(task?.deferUntil || 0);
-  const hasDeferredRescan = requestedDeferUntil > now;
-  const expiresAt = hasDeferredRescan
-    ? Math.min(requestedDeferUntil, now + MAX_DEFERRED_TASK_DEDUPE_MS)
-    : now + ATTEMPTED_TASK_DEDUPE_MS;
-  const newKeys = keys.filter((key) => key && !active.has(key));
-  if (newKeys.length) {
+  const identity = Object.fromEntries(Object.entries(getTaskMergeIdentity(task)).filter(([, value]) => value));
+  const tweetUrl = normalizeTweetUrl(task.tweetUrl, true);
+  if (!Object.keys(identity).length && !tweetUrl) return;
+  const counted = isSameCountedTaskAttempt(task);
+  // This single-order marker accounts for the attempt budget only. It never
+  // excludes a card, and cannot leak through task merges into a different order.
+  runtimeState.countedTaskAttempt = {
+    runId: runtimeState.runId,
+    identity: { ...(counted ? runtimeState.countedTaskAttempt.identity : {}), ...identity },
+    tweetUrl: tweetUrl || (counted ? runtimeState.countedTaskAttempt.tweetUrl : "")
+  };
+  if (!counted) {
     runtimeState.attempts += 1;
-    runtimeState.attemptedTaskRecords.push(...newKeys.map((key) => ({ key, expiresAt })));
-    pruneAttemptedTasks();
-    const deferMs = Math.max(0, expiresAt - now);
-    if (hasDeferredRescan) {
-      log("info", `已登记延后重试 ${formatDuration(deferMs)}：${describeTaskForLog(task)}`);
-    } else if (task?.seatLocked === true) {
-      log("info", `已登记已锁定订单，完成前不重复抢单：${describeTaskForLog(task)}`);
-    } else {
-      log("info", `已登记失败任务临时去重 ${formatDuration(deferMs)}：${describeTaskForLog(task)}`);
-    }
+    log("info", `已记录本单接单次数：${describeTaskForLog(task)}`);
   }
 }
 
@@ -5260,30 +5247,22 @@ function trimRecordText(value, maxLength) {
   return chars.length <= limit ? normalized : `${chars.slice(0, limit).join("")}...`;
 }
 
-function getActiveAttemptedTaskKeys() {
+function getActiveAttemptedTaskKeys(permanentOnly = false) {
   pruneAttemptedTasks();
-  const temporaryKeys = (runtimeState.attemptedTaskRecords || []).map((record) => record.key);
-  return Array.from(new Set([...temporaryKeys, ...permanentIgnoredTaskKeysCache]));
+  if (permanentOnly) return Array.from(permanentIgnoredTaskKeysCache);
+  const task = runtimeState.currentTask;
+  // Unknown actions block the entire workflow via uncertainAction; they do
+  // not establish a per-card claim or create another exclusion record.
+  const protectedOrder = task && (task.invitationAccepted || task.claimed || task.seatLocked || task.seatLockedAt
+    || runtimeState.completionEvidence || runtimeState.lastXResult);
+  return Array.from(new Set([...(protectedOrder ? getTaskDedupeKeys(task) : []), ...permanentIgnoredTaskKeysCache]));
 }
 
 function pruneAttemptedTasks() {
-  const now = Date.now();
-  const records = Array.isArray(runtimeState.attemptedTaskRecords)
-    ? runtimeState.attemptedTaskRecords
-    : (runtimeState.attemptedTaskKeys || []).map((key) => ({ key, expiresAt: now + ATTEMPTED_TASK_DEDUPE_MS }));
-  const seen = new Set();
-  runtimeState.attemptedTaskRecords = records
-    // 0.7.120 added six-hour timeout exclusions. Platform orders expire after
-    // twenty minutes; that extra local exclusion must not survive an upgrade.
-    .filter((record) => record?.timeoutRecovery !== true)
-    .filter((record) => record && record.key && Number(record.expiresAt || 0) > now)
-    .filter((record) => {
-      if (seen.has(record.key)) return false;
-      seen.add(record.key);
-      return true;
-    })
-    .slice(-240);
-  runtimeState.attemptedTaskKeys = runtimeState.attemptedTaskRecords.map((record) => record.key).slice(-240);
+  // All timed exclusions are retired, including records saved by older builds.
+  // Current-order state and permanent task eligibility are checked separately.
+  runtimeState.attemptedTaskRecords = [];
+  runtimeState.attemptedTaskKeys = [];
 }
 
 function getTaskDedupeKeys(task = {}) {
@@ -5439,12 +5418,22 @@ async function restoreAutoRunState() {
     const protectedOrder = runtimeState.uncertainAction || runtimeState.completionEvidence || runtimeState.lastXResult
       || [runtimeState.currentTask].some(task => task && (
         task.invitationAccepted || task.claimed || task.seatLocked || task.seatLockedAt));
+    if (protectedOrder && runtimeState.currentTask && !runtimeState.countedTaskAttempt) {
+      const keys = getTaskDedupeKeys(runtimeState.currentTask);
+      const legacyKeys = [...(saved.attemptedTaskKeys || []), ...(saved.attemptedTaskRecords || []).map(record => record?.key)];
+      if (legacyKeys.some(key => keys.includes(key))) {
+        runtimeState.countedTaskAttempt = {
+          runId: runtimeState.runId,
+          identity: getTaskMergeIdentity(runtimeState.currentTask),
+          tweetUrl: normalizeTweetUrl(runtimeState.currentTask.tweetUrl, true)
+        };
+      }
+    }
+    pruneAttemptedTasks();
     if (!protectedOrder) {
       // Older releases cached unclaimed tasks and even treated a batch
       // estimate as an account-wide wait. The plaza is authoritative for
       // unclaimed availability; permanent tier exclusions live separately.
-      runtimeState.attemptedTaskRecords = [];
-      runtimeState.attemptedTaskKeys = [];
       const refusal = runtimeState.logs.find(entry => /^(?:\[详情页\]\s*)?平台明确拒绝本次锁位：/.test(entry.text || ""));
       const batch = String(refusal?.text || "").replace(/\s+/g, "")
         .match(/^(?:\[详情页\])?平台明确拒绝本次锁位：本批名额暂不可领取，请约([1-9]\d{0,3})分钟后重试[。.]?$/);

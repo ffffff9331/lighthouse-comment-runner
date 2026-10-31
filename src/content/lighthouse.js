@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.123";
+  const SCRIPT_VERSION = "0.7.126";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -419,7 +419,7 @@
     assertActiveRun(runId);
     await confirmPagePhase(["campaigns"], settings, "全部筛选后", { allowInvitation: true });
 
-    const selection = await selectNextCommentTask(settings, message.attemptedTaskKeys || [], message.attemptedTaskRecords || []);
+    const selection = await selectNextCommentTask(settings, message.attemptedTaskKeys || [], message.attemptedTaskRecords || [], message.permanentIgnoredTaskKeys || []);
     assertActiveRun(runId);
     if (selection?.invitation) return await openStandaloneInvitation(settings, selection.invitation)
       || debugOpenFirstCommentTask(settings, message);
@@ -1152,7 +1152,7 @@
     await verifyAllFilterAccepted(settings);
   }
 
-  async function selectNextCommentTask(settings, attemptedTaskKeys, attemptedTaskRecords = []) {
+  async function selectNextCommentTask(settings, attemptedTaskKeys, attemptedTaskRecords = [], permanentIgnoredTaskKeys = []) {
     const runId = activeRunId;
     await waitForCampaignsReady(getPageWaitMs(settings));
     const waitingSince = Date.now();
@@ -1190,11 +1190,11 @@
         lastReportedMinTaskBounty = minTaskBounty;
         report("info", `当前全量检测最低赏金：${minTaskBounty.toFixed(3)} LUX`);
       }
-      // Temporary exclusions expire during this scan, not only after a reload.
-      // Keys without a timed record are permanent or legacy exclusions.
-      const expiryByKey = new Map(attemptedTaskRecords.map(record => [record.key, Number(record.expiresAt)]));
-      const activeAttemptedKeys = attemptedTaskKeys.filter(key => !expiryByKey.has(key)
-        || !Number.isFinite(expiryByKey.get(key)) || expiryByKey.get(key) > Date.now());
+      // Ignore legacy timed records immediately. The worker now sends only
+      // current-order protection and task restrictions, without retry timers.
+      const legacyTemporaryKeys = new Set(attemptedTaskRecords.map(record => record.key));
+      const permanentKeys = new Set(permanentIgnoredTaskKeys);
+      const activeAttemptedKeys = attemptedTaskKeys.filter(key => !legacyTemporaryKeys.has(key) || permanentKeys.has(key));
       const candidates = collectTaskCandidates(activeAttemptedKeys, settings);
       const lowBountyCandidates = candidates.filter((candidate) => candidate.isAutomatable && isBelowMinTaskBounty(candidate.bounty, minTaskBounty));
       const ignoredNonCommentCandidates = candidates.filter((candidate) => !candidate.isAutomatable && !candidate.isBlocked);
@@ -1241,9 +1241,8 @@
         throw buildCampaignsRefreshRequestError("任务广场连续 5 分钟未找到可执行任务，已确认未尝试接单，刷新后继续检测");
       }
 
-      // Reloading the plaza cannot change the in-memory dedupe table, so when
-      // every visible ready candidate is merely dedupe-skipped, a refresh
-      // request would only burn the reload and then trip its own cooldown.
+      // A refresh cannot remove a task restriction or a current-order guard.
+      // Avoid a refresh loop when those are the only blockers.
       const dedupeIsOnlyBlocker = visibleReadyCandidates.length > 0
         && visibleReadyCandidates.every((candidate) => candidate.attempted);
       const shouldRefreshStaleReady = visibleReadyCandidates.length >= STALE_READY_REFRESH_THRESHOLD
@@ -1254,8 +1253,10 @@
         staleReadyHitCount += 1;
         if (staleReadyHitCount >= STALE_READY_REFRESH_HITS) {
           const lowBountyReadyCount = visibleReadyCandidates.filter((candidate) => isBelowMinTaskBounty(candidate.bounty, minTaskBounty)).length;
-          const dedupedReadyCount = visibleReadyCandidates.filter((candidate) => candidate.attempted).length;
-          throw buildCampaignsRefreshRequestError(`任务广场连续 ${staleReadyHitCount} 轮出现 ${visibleReadyCandidates.length} 条可做评论、点赞或转发任务，但当前都无法进入自动执行（去重 ${dedupedReadyCount} 条，低赏金 ${lowBountyReadyCount} 条），请求刷新任务广场`);
+          const restrictedReadyCount = visibleReadyCandidates.filter(candidate => candidate.attempted
+            && [candidate.taskKey, candidate.selectionId, candidate.stableTaskKey].some(key => permanentKeys.has(key))).length;
+          const protectedReadyCount = visibleReadyCandidates.filter(candidate => candidate.attempted).length - restrictedReadyCount;
+          throw buildCampaignsRefreshRequestError(`任务广场连续 ${staleReadyHitCount} 轮出现 ${visibleReadyCandidates.length} 条可做评论、点赞或转发任务，但当前都无法进入自动执行（任务限制 ${restrictedReadyCount} 条，当前订单保护 ${protectedReadyCount} 条，低赏金 ${lowBountyReadyCount} 条），请求刷新任务广场`);
         }
       } else {
         staleReadyHitCount = 0;
@@ -1275,8 +1276,10 @@
         lastReportAt = Date.now();
         if (visibleReadyCandidates.length > 0 && !ready) {
           const lowBountyReadyCount = visibleReadyCandidates.filter((candidate) => isBelowMinTaskBounty(candidate.bounty, minTaskBounty)).length;
-          const dedupedReadyCount = visibleReadyCandidates.filter((candidate) => candidate.attempted).length;
-          report("info", `当前可做评论、点赞或转发任务共有 ${visibleReadyCandidates.length} 条，但暂无可执行候选（去重 ${dedupedReadyCount} 条，低赏金 ${lowBountyReadyCount} 条），跳过并等待新任务`);
+          const restrictedReadyCount = visibleReadyCandidates.filter(candidate => candidate.attempted
+            && [candidate.taskKey, candidate.selectionId, candidate.stableTaskKey].some(key => permanentKeys.has(key))).length;
+          const protectedReadyCount = visibleReadyCandidates.filter(candidate => candidate.attempted).length - restrictedReadyCount;
+          report("info", `当前可做评论、点赞或转发任务共有 ${visibleReadyCandidates.length} 条，但暂无可执行候选（任务限制 ${restrictedReadyCount} 条，当前订单保护 ${protectedReadyCount} 条，低赏金 ${lowBountyReadyCount} 条），跳过并等待新任务`);
         } else if (shortest) {
           report("info", `任务广场最近任务仍在冷却：${formatDuration(shortest.cooldownMs)}，到可抢后再打开详情`);
         } else {
@@ -1391,8 +1394,7 @@
     const value = normalize(text);
     const guidance = value.match(/(?:评论引导|买家希望|任务备注|接单备注|接单前)[\s\S]{0,160}/i)?.[0] || "";
     if (!guidance) return false;
-    return /(?:不要|禁止|不得|不可)\s*(?:使用)?\s*AI(?:评论|回复)?/i.test(guidance)
-      || /(?:要求填写|请填写|评论(?:你的)?|回复(?:你的)?)[\s\S]{0,40}(?:EVM|钱包|收款)地址/i.test(guidance);
+    return /(?:要求填写|请填写|评论(?:你的)?|回复(?:你的)?)[\s\S]{0,40}(?:EVM|钱包|收款)地址/i.test(guidance);
   }
 
   function collectExecutableTaskCards() {
@@ -2032,10 +2034,11 @@
     const text = detailRoot
       ? normalize(detailRoot.innerText || detailRoot.textContent || "")
       : (hasTaskDetailOverlayShell() ? normalize(document.body?.innerText || "") : "");
+    // A bare "id:" can occur in tweet prose (e.g. hyperliquid:native) or
+    // task metadata; it is not evidence that loading failed.
     return text.includes("详情加载失败")
       || text.includes("Failed to fetch")
       || text.includes("Request timeout")
-      || text.includes("id:")
       || hasTaskUnavailableError();
   }
 

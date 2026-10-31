@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseHighBountyMonitor__";
-  const SCRIPT_VERSION = "0.7.123";
+  const SCRIPT_VERSION = "0.7.126";
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) return;
   if (existingSingleton?.stop) existingSingleton.stop();
@@ -424,8 +424,7 @@
     const value = normalize(text);
     const guidance = value.match(/(?:评论引导|买家希望|任务备注|接单备注|接单前)[\s\S]{0,160}/i)?.[0] || "";
     if (!guidance) return false;
-    return /(?:不要|禁止|不得|不可)\s*(?:使用)?\s*AI(?:评论|回复)?/i.test(guidance)
-      || /(?:要求填写|请填写|评论(?:你的)?|回复(?:你的)?)[\s\S]{0,40}(?:EVM|钱包|收款)地址/i.test(guidance);
+    return /(?:要求填写|请填写|评论(?:你的)?|回复(?:你的)?)[\s\S]{0,40}(?:EVM|钱包|收款)地址/i.test(guidance);
   }
 
   function belongsToTaskCard(node, card) {

@@ -269,6 +269,7 @@ test("old timeout exclusions are removed immediately after an upgrade",async()=>
   const w=await worker({saved:clone(old.state())});
   assert.equal(w.c.getActiveAttemptedTaskKeys().includes(task.taskKey),false);
   assert.equal(w.state().attemptedTaskRecords.some(record=>record.timeoutRecovery),false);
+  assert.ok(w.state().uncertainAction, "removing a timed key must preserve the global unknown-action guard");
 });
 test("timeout restart retains earlier pending verification records for the user",async()=>{
   const w=await worker();const records=[{taskKey:"earlier-pending",tweetUrl:"https://x.com/old/status/987"}];
@@ -276,12 +277,15 @@ test("timeout restart retains earlier pending verification records for the user"
   assert.deepEqual(clone(w.state().pendingVerifications),records);assert.equal(w.scans.length,1);
 });
 
-test("removing legacy timeout exclusions preserves ordinary active-order dedupe",async()=>{
-  const w=await worker();w.state().attemptedTaskRecords=[
+test("removing legacy timed exclusions preserves only the current protected order",async()=>{
+  const w=await worker();w.state().currentTask.seatLocked=true;w.state().attemptedTaskRecords=[
     {key:"old-timeout",expiresAt:1000000+6*60*60*1000,timeoutRecovery:true},
     {key:"active-order",expiresAt:1000000+60000}
   ];
-  assert.deepEqual(clone(w.c.getActiveAttemptedTaskKeys()),["active-order"]);
+  assert.ok(w.c.getActiveAttemptedTaskKeys().includes(task.taskKey));
+  assert.equal(w.c.getActiveAttemptedTaskKeys().includes("active-order"), false);
+  assert.equal(w.c.getActiveAttemptedTaskKeys().includes("old-timeout"), false);
+  assert.deepEqual(clone(w.state().attemptedTaskRecords), []);
 });
 test("deadline recovery releases the expired task's existing local exclusion",async()=>{
   const w=await worker();w.state().attemptedTaskRecords=[{key:task.taskKey,expiresAt:1000000+LIMIT+60000}];

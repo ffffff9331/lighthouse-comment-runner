@@ -170,7 +170,9 @@ for (const condition of ["batch", "rate-limit", "missing-log", "wrong-deadline",
     if (condition === "locked") saved.currentTask = { ...task, seatLocked: true };
     const w = await worker(t, {lighthouseAutoRunStateV1: saved});
     assert.equal(w.state().claimRetryNotBefore, condition === "batch" ? undefined : saved.claimRetryNotBefore);
-    assert.equal(w.state().attemptedTaskRecords.length, ["uncertain", "locked"].includes(condition) ? 1 : 0);
+    assert.equal(w.state().attemptedTaskRecords.length, 0);
+    if (condition === "uncertain") assert.ok(w.state().uncertainAction);
+    if (condition === "locked") assert.equal(w.state().currentTask.seatLocked, true);
   });
 }
 
@@ -178,8 +180,10 @@ test("unclaimed attempts do not create timed exclusions, locked orders retain pr
   const w = await worker(t);
   w.c.markAttemptedTask({...task, deferUntil: w.now() + 1800000});
   assert.equal(w.c.getActiveAttemptedTaskKeys().includes(task.taskKey), false);
-  w.c.markAttemptedTask({...task, seatLocked: true});
+  w.state().currentTask = {...task, seatLocked: true};
+  w.c.markAttemptedTask(w.state().currentTask);
   assert.equal(w.c.getActiveAttemptedTaskKeys().includes(task.taskKey), true);
+  assert.deepEqual(clone(w.state().attemptedTaskRecords), []);
 });
 
 test("stop after a batch refusal prevents refresh and another scan", async t => {
@@ -306,14 +310,13 @@ for (const lostReceipt of [false, true]) {
   });
 }
 
-test("legacy three-minute temporary records expire at the exact boundary without removing permanent ignores", async t => {
+test("legacy temporary records are discarded immediately without removing permanent restrictions", async t => {
   const w = await worker(t), started = w.now();
   w.state().attemptedTaskRecords = [{ key: task.taskKey, expiresAt: started + 180000 }];
   w.state().attemptedTaskKeys = [task.taskKey];
   vm.runInContext("permanentIgnoredTaskKeysCache.add('permanent-ignore')", w.c);
-  w.advance(179999);
-  assert.deepEqual(clone(w.c.getActiveAttemptedTaskKeys()).sort(), [task.taskKey, "permanent-ignore"].sort());
-  w.advance(1);
+  assert.deepEqual(clone(w.c.getActiveAttemptedTaskKeys()), ["permanent-ignore"]);
+  w.advance(180000);
   assert.deepEqual(clone(w.c.getActiveAttemptedTaskKeys()), ["permanent-ignore"]);
   assert.deepEqual(clone(w.state().attemptedTaskRecords), []);
 });
@@ -362,7 +365,7 @@ function plaza(w) {
   }) };
 }
 
-test("a pending content scan releases expired three-minute exclusions without waiting five minutes for idle refresh", async t => {
+test("a content scan ignores legacy temporary exclusions immediately", async t => {
   const w = await worker(t), started = w.now();
   w.state().attemptedTaskRecords = [{ key: task.taskKey, expiresAt: started + 180000 }];
   w.state().attemptedTaskKeys = [task.taskKey];
@@ -371,7 +374,7 @@ test("a pending content scan releases expired three-minute exclusions without wa
     : { ok: true, claimActionAttempted: true, task: { taskKey: "fixture-end", seatLocked: true } };
   await w.scan();
   assert.equal(page.replies[0].ok, true, page.replies[0].message);
-  assert.ok(w.now() - started <= 180500, "expiry must become visible within one content poll");
+  assert.equal(w.now() - started, 0, "legacy temporary records must not delay the scan");
   assert.equal(w.scans().length, 1);
   assert.equal(w.reloads.length, 0, "expiry alone must not require another page reload");
 });
@@ -399,7 +402,7 @@ test("a permanent key overlapping an expiring temporary record is never sent as 
   await w.scan();
   const request = w.scans()[0];
   assert.equal(request.attemptedTaskKeys.includes(task.taskKey), true);
-  assert.equal(request.attemptedTaskRecords.some(record => record.key === task.taskKey), false,
+  assert.equal((request.attemptedTaskRecords || []).some(record => record.key === task.taskKey), false,
     "content expiry must not downgrade a permanent exclusion to a temporary key");
   w.advance(180001);
   assert.equal(w.c.getActiveAttemptedTaskKeys().includes(task.taskKey), true);
@@ -458,5 +461,82 @@ for (const protection of ["locked", "invitation", "claimed", "completion", "last
     if (protection === "claimed") assert.equal(w.state().currentTask.claimed, true);
     if (protection === "completion") assert.equal(w.state().completionEvidence?.taskKey, task.taskKey);
     if (protection === "lastXResult") assert.equal(w.state().lastXResult?.ok, true);
+  });
+}
+
+
+test("order accounting is idempotent without creating a task exclusion", async t => {
+  const w = await worker(t);
+  const locked = { ...task, seatLocked: true };
+  w.c.markAttemptedTask(locked);
+  w.state().currentTask = w.c.mergeTaskPreservingCapturedTweetUrl(null, locked);
+  w.c.markAttemptedTask({ ...locked });
+  w.advance(6 * 60 * 60 * 1000);
+  w.c.markAttemptedTask({ ...locked });
+  assert.equal(w.state().attempts, 1);
+  assert.deepEqual(clone(w.state().attemptedTaskRecords), []);
+  assert.ok(w.c.getActiveAttemptedTaskKeys().includes(task.taskKey));
+});
+
+test("different orders with identical prose each count and stale release cannot reset the current count", async t => {
+  const w = await worker(t);
+  const a = { taskKey: "order-a", title: "Identical prose", bounty: "0.2", handle: "@same", seatLocked: true };
+  const b = { ...a, taskKey: "order-b" };
+  w.c.markAttemptedTask(a);
+  w.state().currentTask = w.c.mergeTaskPreservingCapturedTweetUrl(null, a);
+  w.c.markAttemptedTask(b);
+  w.state().currentTask = w.c.mergeTaskPreservingCapturedTweetUrl(w.state().currentTask, b);
+  w.c.markAttemptedTask(b);
+  assert.equal(w.state().attempts, 2);
+  w.c.releaseAttemptedTask(a);
+  w.c.markAttemptedTask(b);
+  assert.equal(w.state().attempts, 2);
+  w.c.releaseAttemptedTask(b);
+  w.state().currentTask = null;
+  assert.equal(w.c.getActiveAttemptedTaskKeys().includes(b.taskKey), false);
+  w.c.markAttemptedTask(b);
+  assert.equal(w.state().attempts, 3, "a released order is not a future blacklist entry");
+});
+
+test("worker restart keeps a counted current order without restoring timed exclusions", async t => {
+  const locked = { ...task, seatLocked: true };
+  const w = await worker(t, { lighthouseAutoRunStateV1: {
+    runId: "claim-test", currentTask: locked, attempts: 1,
+    attemptedTaskRecords: [{ key: task.taskKey, expiresAt: 999999999 }],
+    attemptedTaskKeys: [task.taskKey]
+  } });
+  w.c.markAttemptedTask({ ...locked });
+  assert.equal(w.state().attempts, 1);
+  assert.deepEqual(clone(w.state().attemptedTaskRecords), []);
+  assert.ok(w.c.getActiveAttemptedTaskKeys().includes(task.taskKey));
+});
+
+
+test("a restored lock persisted before accounting still counts its first attempt", async t => {
+  const locked = { ...task, seatLocked: true };
+  const w = await worker(t, { lighthouseAutoRunStateV1: {
+    runId: "claim-test", currentTask: locked, attempts: 0,
+    attemptedTaskRecords: [], attemptedTaskKeys: []
+  } });
+  w.c.markAttemptedTask(locked);
+  assert.equal(w.state().attempts, 1);
+  w.c.markAttemptedTask({ ...locked });
+  assert.equal(w.state().attempts, 1);
+  assert.deepEqual(clone(w.state().attemptedTaskRecords), []);
+});
+
+
+for (const useTweetUrl of [false, true]) {
+  test(`different orders cannot share accounting merely through a stable prose key (URL: ${useTweetUrl})`, async t => {
+    const w = await worker(t);
+    const a = { taskKey: "a", selectionId: "a", stableTaskKey: "same-prose", seatLocked: true };
+    const b = { taskKey: "b", selectionId: "b", stableTaskKey: "same-prose", seatLocked: true };
+    if (useTweetUrl) { a.tweetUrl = "https://x.com/a/status/1"; b.tweetUrl = "https://x.com/a/status/2"; }
+    w.c.markAttemptedTask(a);
+    w.c.markAttemptedTask(b);
+    assert.equal(w.state().attempts, 2);
+    w.c.releaseAttemptedTask(a);
+    w.c.markAttemptedTask(b);
+    assert.equal(w.state().attempts, 2);
   });
 }

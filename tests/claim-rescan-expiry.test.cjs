@@ -76,18 +76,17 @@ function pageHarness(cards, onWait = () => {}) {
   return { page: context.page, start, observations, elapsed: () => now - start };
 }
 
-test("a temporary exclusion expires inside the same continuous plaza scan", async () => {
-  const h = pageHarness([{ taskKey: "failed-task" }]);
+test("a two-second task ignores a legacy temporary exclusion immediately", async () => {
+  const h = pageHarness([{ taskKey: "failed-task", cooldownMs: 2000 }]);
   const selected = await h.page.selectNextCommentTask(settings, ["failed-task"], [
     { key: "failed-task", expiresAt: h.start + 180000 },
   ]);
   assert.equal(selected.taskKey, "failed-task");
-  assert.equal(h.elapsed(), 180000);
-  assert.equal(h.observations.at(-2).candidates[0].attempted, true);
+  assert.equal(h.elapsed(), 0);
   assert.equal(h.observations.at(-1).candidates[0].attempted, false);
 });
 
-test("a not-yet-expired failed task stays excluded while another card is selectable", async () => {
+test("a failed task remains selectable alongside another card before its old expiry", async () => {
   const h = pageHarness([
     { taskKey: "failed-task", bounty: 0.5 },
     { taskKey: "available-task", bounty: 0.2 },
@@ -95,12 +94,12 @@ test("a not-yet-expired failed task stays excluded while another card is selecta
   const selected = await h.page.selectNextCommentTask(settings, ["failed-task"], [
     { key: "failed-task", expiresAt: h.start + 180000 },
   ]);
-  assert.equal(selected.taskKey, "available-task");
+  assert.equal(selected.taskKey, "failed-task");
   assert.equal(h.elapsed(), 0);
-  assert.equal(h.observations[0].candidates[0].attempted, true);
+  assert.equal(h.observations[0].candidates[0].attempted, false);
 });
 
-test("expiring a temporary key preserves permanent exclusions", async () => {
+test("discarding a temporary key preserves permanent exclusions", async () => {
   const h = pageHarness([
     { taskKey: "temporary-task", bounty: 0.2 },
     { taskKey: "permanent-task", bounty: 1 },
@@ -109,26 +108,21 @@ test("expiring a temporary key preserves permanent exclusions", async () => {
     { key: "temporary-task", expiresAt: h.start + 1000 },
   ]);
   assert.equal(selected.taskKey, "temporary-task");
-  assert.equal(h.elapsed(), 1000);
+  assert.equal(h.elapsed(), 0);
   assert.ok(h.observations.every((round) => round.candidates[1].attempted));
 });
 
-test("a future deferred retry deadline is not replaced by the ordinary three-minute window", async () => {
-  const h = pageHarness([{ taskKey: "deferred-task" }], ({ elapsed, stop }) => {
-    if (elapsed === 180500) stop();
-  });
-  await assert.rejects(
-    h.page.selectNextCommentTask(settings, ["deferred-task"], [
-      { key: "deferred-task", expiresAt: h.start + 600000 },
-    ]),
-    /已停止|已取消|旧任务/,
-  );
-  assert.ok(h.observations.every((round) => round.candidates[0].attempted));
-  assert.equal(h.observations.at(-1).elapsed, 180000);
+test("an old six-hour defer deadline does not exclude a ready task", async () => {
+  const h = pageHarness([{ taskKey: "deferred-task" }]);
+  const selected = await h.page.selectNextCommentTask(settings, ["deferred-task"], [
+    { key: "deferred-task", expiresAt: h.start + 6 * 60 * 60 * 1000 },
+  ]);
+  assert.equal(selected.taskKey, "deferred-task");
+  assert.equal(h.elapsed(), 0);
 });
 
-test("STOP at the expiry boundary cancels before the newly eligible card is selected", async () => {
-  const h = pageHarness([{ taskKey: "failed-task" }], ({ elapsed, stop }) => {
+test("STOP still cancels a scan waiting for the platform countdown", async () => {
+  const h = pageHarness([{ taskKey: "failed-task", cooldownMs: 120000 }], ({ elapsed, stop }) => {
     if (elapsed === 1000) stop();
   });
   await assert.rejects(
@@ -139,10 +133,10 @@ test("STOP at the expiry boundary cancels before the newly eligible card is sele
   );
   assert.equal(h.elapsed(), 1000);
   assert.equal(h.observations.at(-1).elapsed, 500);
-  assert.ok(h.observations.every((round) => round.candidates[0].attempted));
+  assert.ok(h.observations.every((round) => !round.candidates[0].attempted));
 });
 
-test("the task-opening message forwards expiry records to the continuous scan", async () => {
+test("the task-opening message discards legacy expiry records without waiting", async () => {
   const h = pageHarness([{ taskKey: "failed-task" }]);
   const result = await h.page.debugOpenFirstCommentTask(settings, {
     attemptedTaskKeys: ["failed-task"],
@@ -150,7 +144,7 @@ test("the task-opening message forwards expiry records to the continuous scan", 
   });
   assert.equal(result.ok, true);
   assert.equal(result.task.taskKey, "failed-task");
-  assert.equal(h.elapsed(), 1000);
+  assert.equal(h.elapsed(), 0);
 });
 
 function reloadHarness(waitResult) {
