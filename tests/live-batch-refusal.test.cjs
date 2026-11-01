@@ -150,8 +150,8 @@ function assertUncertain(result, p) {
   assert.equal(p.fixture.observers.size, 0);
 }
 
-// The user explicitly restored the conservative contract: even fresh refusal
-// feedback cannot release a claim until the lock control is clickable again.
+// Busy controls retain the conservative contract: fresh refusal alone cannot
+// release them. A separately verified next-batch transition is tested below.
 for (const route of ["DEBUG_LOCK_SEAT_AND_EXTRACT", "WAIT_SELECTED_COUNTDOWN_AND_LOCK", "START_LIGHTHOUSE_COMMENT_TASK"]) {
   test(`${route}: target tweet completion wording cannot hide a fresh batch refusal`, async () => {
     const p = page({ previewText: "手机性能在线时长任务完成情况都会影响奖励", onClick(f) { f.notify(REFUSAL); } });
@@ -268,4 +268,78 @@ test("an already locked exact target resumes without another claim despite stati
   assert.equal(result.task?.resumedLockedTask, true);
   assert.equal(result.claimRejection, undefined);
   assert.equal(p.fixture.clicks, 0);
+});
+
+const BATCH_COUNTDOWN = "等待下一批释放 · 08:21 · +5 席";
+function batchCountdown(options = {}) {
+  return node(BATCH_COUNTDOWN, { control: true, disabled: true, ...options });
+}
+
+for (const route of ["DEBUG_LOCK_SEAT_AND_EXTRACT", "WAIT_SELECTED_COUNTDOWN_AND_LOCK", "START_LIGHTHOUSE_COMMENT_TASK"]) {
+  for (const duplicate of [false, true]) {
+    test(`${route}: a fresh batch refusal followed by ${duplicate ? "two matching" : "one"} disabled release controls returns a bound rejection`, async () => {
+      const p = page({ onClick(f, button) {
+        makeBusy(button, BATCH_COUNTDOWN);
+        if (duplicate) f.nodes.push(batchCountdown());
+        f.notify(REFUSAL);
+        f.clearNotices();
+      } });
+      assertRejected(await p.dispatch(route), p, route);
+    });
+  }
+  test(`${route}: a refused busy claim is released only after it returns to the next batch countdown`, async () => {
+    let clickedAt = null;
+    const p = page({ onClick(f, button) {
+      clickedAt = f.elapsedMs;
+      makeBusy(button);
+      f.notify(REFUSAL);
+      f.clearNotices();
+    }, onWait(f, button) {
+      if (clickedAt !== null && f.elapsedMs - clickedAt >= 1800) makeBusy(button, BATCH_COUNTDOWN);
+    } });
+    assertRejected(await p.dispatch(route), p, route);
+    assert.ok(p.fixture.elapsedMs - clickedAt >= 1800);
+  });
+}
+
+for (const scenario of ["no refusal", "stale refusal", "generic error", "rate limit", "other detail feedback", "changed detail", "replacement detail", "old countdown", "different countdowns", "busy control", "plain text", "enabled control", "hidden control", "zero countdown", "invalid countdown", "old positive status", "new positive status"]) {
+  test(`next-batch countdown cannot release an unproven claim: ${scenario}`, async () => {
+    const p = page({
+      initialNotices: scenario === "stale refusal" ? [node(REFUSAL)] : [],
+      initialNodes: scenario === "old countdown" ? [batchCountdown()]
+        : scenario === "old positive status" ? [node("已提交")] : [],
+      onClick(f, button) {
+        makeBusy(button, BATCH_COUNTDOWN);
+        if (scenario === "different countdowns") f.nodes.push(batchCountdown({ innerText: "等待下一批释放 · 04:10 · +2 席" }));
+        if (scenario === "busy control") f.nodes.push(node("正在锁定席位…", { control: true, disabled: true }));
+        if (scenario === "plain text") button.control = false;
+        if (scenario === "enabled control") button.disabled = false;
+        if (scenario === "hidden control") button.visible = false;
+        if (scenario === "zero countdown") button.innerText = "等待下一批释放 · 00:00 · +5 席";
+        if (scenario === "invalid countdown") button.innerText = "等待下一批释放 · 08:99 · +5 席";
+        if (scenario === "new positive status") f.nodes.push(node("已提交"));
+        if (scenario === "other detail feedback" || scenario === "changed detail") f.root.title = "另一任务";
+        if (scenario === "replacement detail") f.root = { ...f.root };
+        if (scenario !== "no refusal" && scenario !== "stale refusal") {
+          f.notify(scenario === "generic error" ? "操作失败，请稍后重试。"
+            : scenario === "rate limit" ? "你抢的太快了，请30秒后重试。" : REFUSAL);
+        }
+        if (scenario === "other detail feedback") f.root.title = "把行为数据化成链上资产";
+      }
+    });
+    assertUncertain(await p.dispatch(), p);
+  });
+}
+
+test("new exact-order success still wins over a refusal and next-batch controls", async () => {
+  const p = page({ onClick(f, button) {
+    makeBusy(button, BATCH_COUNTDOWN);
+    f.notify(REFUSAL);
+    f.nodes.push(node("席位已锁定"));
+  } });
+  const result = await p.dispatch();
+  assert.equal(result.ok, true, result.message);
+  assert.equal(result.task?.seatLocked, true);
+  assert.equal(result.claimRejection, undefined);
+  assert.equal(p.fixture.clicks, 1);
 });

@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.126";
+  const SCRIPT_VERSION = "0.7.127";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -2652,7 +2652,24 @@
       detailSignature: claimDetailSignature(root),
       rejectionAbsent: !hasHardFailure(normalize(root?.innerText || "")),
       positiveStateAbsent: !hasPositiveClaimState(normalize(root?.innerText || ""), root),
+      batchCountdownAbsent: !readBatchReleaseControlState(root).present,
     };
+  }
+
+  function readBatchReleaseControlState(root) {
+    const selector = "button,[role='button'],input[type='button'],input[type='submit']";
+    const controls = Array.from(root?.querySelectorAll?.(selector) || [])
+      .filter(node => isVisible(node) && node.matches?.(selector));
+    const releases = controls.filter(node => /^等待下一批(?:释放|开放)/.test(normalize(buttonText(node))));
+    const texts = releases.map(node => normalize(buttonText(node)));
+    // Read the actual disabled release controls, never countdown prose in the
+    // tweet. Responsive layouts can render two copies of the same control.
+    const waiting = releases.length > 0 && new Set(texts).size === 1
+      && releases.every(isDisabled)
+      && /^等待下一批(?:释放|开放)\s*[·:：-]\s*\d{1,2}:[0-5]\d(?::[0-5]\d)?\s*[·:：-]\s*\+[1-9]\d*\s*席$/.test(texts[0])
+      && Boolean(parseDetailReleaseCountdown(texts[0]))
+      && !controls.some(node => /正在(?:预定|预订|锁定)席位|抽签中/.test(normalize(buttonText(node))));
+    return { present: releases.length > 0, waiting };
   }
 
   function hasConfirmedLockedDetail(root, expectedTweetUrl = "") {
@@ -2823,9 +2840,12 @@
         }
         if (evidence.some(value => !observation.evidence.includes(value))) return true;
         const refusal = observation.feedback?.find(item => item.sameDetail && item.refusal);
+        const returnedToBatch = refusal?.refusal.claimRetryScope === "task"
+          && observation.batchCountdownAbsent === true
+          && readBatchReleaseControlState(observation.root).waiting;
         if (refusal && !observation.priorClaimAttempted && observation.rejectionAbsent
             && observation.positiveStateAbsent && !hasPositiveClaimState(text, observation.root)
-            && findLockButton() && !observation.evidence.some(value => value.startsWith("status:"))) {
+            && (findLockButton() || returnedToBatch) && !observation.evidence.some(value => value.startsWith("status:"))) {
           const error = new Error(`平台明确拒绝本次锁位：${refusal.text}`);
           error.confirmedClaimRejection = true;
           error.retryAfterMs = refusal.refusal.retryAfterMs;

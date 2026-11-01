@@ -463,6 +463,23 @@ test("real same-detail rejection releases only its matching background intent", 
   assert.equal(p.fixture.clicks, 1);
 });
 
+test("a real batch refusal with a new release countdown clears its persisted intent and permits recovery", async t => {
+  const p = page({ initialNodes: [node("在 X 打开", { control: true })], onClick(f, button) {
+    button.innerText = button.textContent = "等待下一批释放 · 08:21 · +5 席";
+    button.disabled = true;
+    f.notify("本批名额暂不可领取，请约 9 分钟后重试。");
+  } }), w = await worker(t, p);
+  const result = await w.send();
+  assert.equal(result.claimRejectionConfirmed, true, result.message);
+  assert.equal(result.claimRetryScope, "task");
+  assert.equal(result.task?.claimRejected, true);
+  assert.equal(w.state().running, true);
+  assert.equal(w.state().uncertainAction, undefined);
+  assert.equal(w.stored.lighthouseAutoRunStateV1.uncertainAction, undefined);
+  assert.equal(w.state().attemptedTaskRecords.length, 0);
+  assert.equal(p.fixture.clicks, 1);
+});
+
 test("real confirmed lock persists the order and clears the pending intent", async t => {
   const p = page({ onClick(f) { f.nodes.push(node("已锁定")); } }), w = await worker(t, p);
   assert.equal((await w.send()).ok, true);
