@@ -633,3 +633,42 @@ for (const replacementState of ["working", "completed"]) {
     assert.equal(closed, false);
   });
 }
+
+for (const replacementState of ["unchanged", "working", "completed"]) {
+  test(`completion lifecycle respects the second close receipt when the page is ${replacementState}`, async t => {
+    const { w, p, e, task } = await executionWorker(t);
+    let receipt, replacement, replacementReceipt, closeCalls = 0, nextCalls = 0;
+    const closeResults = [];
+    e.verify.onClick = () => { receipt = showDispatchCompletion(e); };
+    w.c.getSettingsForRun = async () => ({ ...autoSettings, maxTasksPerRun: 5 });
+    w.c.recordReplyHistory = async () => {};
+    w.c.startNextAutoTask = async () => { nextCalls++; return { ok: true }; };
+    const originalClose = w.c.closeLighthouseDetailToCampaigns;
+    w.c.closeLighthouseDetailToCampaigns = async (...args) => {
+      if (++closeCalls === 2 && replacementState !== "unchanged") {
+        replacement = installExecution(p, { phase: "working", target: OTHER });
+        if (replacementState === "completed") replacementReceipt = showDispatchCompletion(replacement);
+      }
+      const closed = await originalClose(...args);
+      closeResults.push(closed);
+      return closed;
+    };
+    const result = await w.c.handleXReplyResult({ ok: true, mode: "post", posted: true }, { runId: w.state().runId });
+    const unchanged = replacementState === "unchanged";
+    assert.equal(closeCalls, 2);
+    assert.deepEqual(closeResults, [true, unchanged], "the production close guard must detect the replacement");
+    assert.equal(w.reloads().length, unchanged ? 1 : 0, "a cancelled close must not refresh the current page");
+    assert.equal(nextCalls, unchanged ? 1 : 0, "only a confirmed return may start the next order");
+    assert.equal(result.ok, unchanged);
+    assert.equal(receipt.close.clicks, 1);
+    assert.equal(e.verify.clicks, 1);
+    assert.equal(w.state().completed, 1, "the original official completion remains counted once");
+    if (!unchanged) {
+      assert.equal(w.state().running, false);
+      assert.equal(w.state().currentTask.taskKey, task.taskKey);
+      assert.equal(w.state().completionEvidence.taskKey, task.taskKey);
+      assert.equal(replacement.open.clicks + replacement.verify.clicks, 0);
+      assert.equal(replacementReceipt?.close.clicks || 0, 0);
+    }
+  });
+}

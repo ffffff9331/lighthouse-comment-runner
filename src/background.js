@@ -2690,13 +2690,20 @@ async function handleLighthouseDone(result, resumeCountedCompletion = false) {
   if (!isCurrent()) return { ok: false, cancelled: true };
   const orderReloadReason = result?.ok ? "接单完成，已重新加载任务广场" : "接单失败，已重新加载任务广场";
   if (result?.ok || !hasLockedTask) {
-    await closeLighthouseDetailToCampaigns(
+    const closed = await closeLighthouseDetailToCampaigns(
       runtimeState.lighthouseTabId,
       settings,
       "正式模式订单结束后关闭任务详情回到广场",
       isCurrent
     );
     if (!isCurrent()) return { ok: false, cancelled: true };
+    if (!closed) {
+      runtimeState.running = false;
+      setStage("campaigns_reload_failed");
+      const error = "任务详情关闭未确认，已停止扫描并保留当前页面";
+      log("warn", error);
+      return { ok: false, error, state: runtimeState };
+    }
     const reloaded = await reloadLighthouseCampaignsAfterOrder(runtimeState.lighthouseTabId, orderReloadReason, isCurrent);
     if (!isCurrent()) return { ok: false, cancelled: true };
     if (reloaded === false) {
