@@ -2471,6 +2471,7 @@ async function waitForLighthouseTaskCompletionAndReturn(runId, settings, isCurre
   });
   if (!isCurrent()) return cancelled();
   const evidenceLatched = Boolean(result?.evidence && latchLighthouseCompletion(result.evidence, runId));
+  if (result?.cancelled) return result;
   if (result?.ok) {
     setStage("campaigns_returned");
     log("info", result.message || "已从 Lighthouse 完成页返回任务广场");

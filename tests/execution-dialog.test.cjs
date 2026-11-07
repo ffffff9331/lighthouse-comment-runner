@@ -607,6 +607,102 @@ test("review: a latched same-order dispatch receipt closes once without recovery
   assert.equal(w.reloads().length, 0);
 });
 
+for (const timing of ["before-close", "during-close-wait"]) {
+  test(`X-first completion binds the same local receipt ${timing} and resumes scanning`, async t => {
+    const { w, p, e, task } = await executionWorker(t);
+    task.source = "lighthouse";
+    const runId = w.state().runId;
+    await w.c.sendToTab(11, { type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId, task });
+    assert.equal(w.c.latchLighthouseCompletion({ source: "lighthouse_x_widget", runId,
+      taskKey: task.taskKey, tweetUrl: task.tweetUrl }, runId), true);
+    let receipt;
+    if (timing === "before-close") receipt = showDispatchCompletion(e);
+    else {
+      const initial = await w.c.sendToTab(11, { type: "CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION", runId, task });
+      assert.equal(initial.completed, false);
+      p.f.beforeWait = () => { if (!receipt) receipt = showDispatchCompletion(e); };
+    }
+    w.c.getSettingsForRun = async () => ({ ...autoSettings, maxTasksPerRun: 5 });
+    w.c.recordReplyHistory = async () => {};
+    let scans = 0;
+    w.c.startNextAutoTask = async () => { scans += 1; return { ok: true }; };
+    const returned = await w.c.waitForLighthouseTaskCompletionAndReturn(runId, autoSettings);
+    assert.equal(returned.ok, true, returned.message);
+    assert.equal(w.reloads().length, 0, "the receipt must close without a recovery reload");
+    const result = await w.c.handleXReplyResult({ ok: true, mode: "post", posted: true }, { runId });
+    assert.equal(result.ok, true, result.message);
+    assert.equal(receipt.close.clicks, 1, "close the exact newly confirmed result once");
+    assert.equal(e.verify.clicks, 0, "the X receipt must not submit the order again");
+    assert.equal(scans, 1);
+    assert.equal(w.state().completed, 1);
+    assert.equal(w.reloads().length, 1, "only the normal refresh after a confirmed return is allowed");
+  });
+}
+
+for (const boundary of ["replacement-result", "changed-target", "new-watch", "stop", "invitation"]) {
+  test(`X-first completion preserves ${boundary} before local evidence is bound`, async t => {
+    const { w, p, e, task } = await executionWorker(t);
+    task.source = "lighthouse";
+    const runId = w.state().runId;
+    await w.c.sendToTab(11, { type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId, task });
+    assert.equal(w.c.latchLighthouseCompletion({ source: "lighthouse_x_widget", runId,
+      taskKey: task.taskKey, tweetUrl: task.tweetUrl }, runId), true);
+    let receipt;
+    if (boundary === "replacement-result") receipt = showDispatchCompletion(installExecution(p, { phase: "working", target: OTHER }));
+    else {
+      receipt = showDispatchCompletion(e);
+      if (boundary === "changed-target") receipt.result.appendChild(new Element("a", "查看原推文", [], { href: OTHER }));
+      else if (boundary === "new-watch") await p.dispatch({ type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId,
+        task: { taskKey: "replacement-task", tweetUrl: OTHER } });
+      else if (boundary === "stop") { w.state().running = false; await p.pause(); }
+      else p.f.showPopup();
+    }
+    const result = await w.c.waitForLighthouseTaskCompletionAndReturn(runId, autoSettings);
+    assert.equal(result.ok, false);
+    assert.equal(receipt.close.clicks + e.verify.clicks + (p.f.accept?.clicks || 0), 0);
+    assert.equal(w.reloads().length, 0);
+  });
+}
+
+for (const boundary of ["receipt", "concurrent-check", "replacement-result", "new-watch", "new-run", "stop", "invitation"]) {
+  test(`X-first completion rechecks ${boundary} during a generic close delay`, async t => {
+    const { w, p, e, task } = await executionWorker(t);
+    task.source = "lighthouse";
+    const runId = w.state().runId;
+    await w.c.sendToTab(11, { type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId, task });
+    assert.equal(w.c.latchLighthouseCompletion({ source: "lighthouse_x_widget", runId,
+      taskKey: task.taskKey, tweetUrl: task.tweetUrl }, runId), true);
+    const oldClose = new Element("button", "关闭", [], { "aria-label": "关闭" },
+      { left: 1010, top: 40, width: 32, height: 32 });
+    e.root.appendChild(oldClose);
+    let changed = false, receipt;
+    p.f.beforeWait = async () => {
+      if (changed) return;
+      changed = true;
+      if (boundary === "stop") { w.state().running = false; await p.pause(); }
+      else if (boundary === "new-run") {
+        w.state().runId = "replacement-run";
+        await p.dispatch({ type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId: "replacement-run", task });
+      } else if (boundary === "new-watch") {
+        await p.dispatch({ type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId,
+          task: { taskKey: "replacement-task", tweetUrl: OTHER } });
+      } else if (boundary === "invitation") p.f.showPopup();
+      else {
+        receipt = showDispatchCompletion(boundary === "replacement-result"
+          ? installExecution(p, { phase: "working", target: OTHER }) : e);
+        if (boundary === "concurrent-check") await p.dispatch({ type: "CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION", runId, task });
+      }
+    };
+    const result = await w.c.waitForLighthouseTaskCompletionAndReturn(runId, autoSettings);
+    const expected = boundary === "receipt" || boundary === "concurrent-check";
+    assert.equal(changed, true);
+    assert.equal(result.ok, expected, result.message);
+    assert.equal(receipt?.close.clicks || 0, expected ? 1 : 0);
+    assert.equal(oldClose.clicks + e.verify.clicks + (p.f.accept?.clicks || 0), 0);
+    assert.equal(w.reloads().length, 0);
+  });
+}
+
 for (const replacementState of ["working", "completed"]) {
   test(`review: another ${replacementState} order appearing before CLOSE is left untouched`, async t => {
     const { w, p, e, task } = await executionWorker(t);
@@ -631,6 +727,272 @@ for (const replacementState of ["working", "completed"]) {
     assert.equal(replacement.open.clicks + replacement.verify.clicks, 0);
     assert.equal(originalReceipt.close.clicks, 0);
     assert.equal(closed, false);
+  });
+}
+
+// A real SPA return unmounts its result before the marketplace data arrives.
+// Keep both production listeners connected so a cancelled CLOSE cannot be
+// hidden by a mocked successful reload.
+async function pendingCompletionReturn(t, { beforeClose = false } = {}) {
+  const { w, p, e, task } = await executionWorker(t);
+  const runId = w.state().runId;
+  await w.c.sendToTab(11, { type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId, task });
+  const receipt = showDispatchCompletion(e);
+  const completed = await w.c.sendToTab(11, { type: "CHECK_LIGHTHOUSE_OFFICIAL_COMPLETION", runId, task });
+  assert.equal(w.c.latchLighthouseCompletion(completed.evidence, runId), true);
+  const close = new Element("button", "关闭", [], { "aria-label": "关闭" },
+    { left: 1010, top: 40, width: 32, height: 32 });
+  const loading = new Element("div", "", [close, new Element("p", "加载中")],
+    { role: "dialog" }, { width: 640, height: 600 });
+  let returning = false, elapsed = 0;
+  const beginReturn = () => {
+    returning = true; e.root.remove(); p.marketplace.remove(); p.body.appendChild(loading);
+  };
+  const ready = () => { loading.remove(); p.body.appendChild(p.marketplace); };
+  receipt.close.onClick = beginReturn;
+  if (beforeClose) beginReturn();
+  const tick = ms => { if (returning) elapsed += ms; return elapsed; };
+  const run = () => w.c.waitForLighthouseTaskCompletionAndReturn(runId, autoSettings);
+  return { w, p, e, task, runId, receipt, loading, close, ready, tick, run };
+}
+
+// The website may finish its own return while our selected close control is
+// waiting to be clicked. Exercise both real worker/content entry points.
+async function automaticCompletionReturn(t, route) {
+  const { w, p, e, task } = await executionWorker(t);
+  task.source = "lighthouse";
+  const runId = w.state().runId;
+  await w.c.sendToTab(11, { type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId, task });
+  const receipt = showDispatchCompletion(e);
+  if (route === "CLOSE") {
+    assert.equal(w.c.latchLighthouseCompletion({ source: "lighthouse_x_widget", runId,
+      taskKey: task.taskKey, tweetUrl: task.tweetUrl }, runId), true);
+  } else w.state().xTabId = null;
+  const run = () => w.c.waitForLighthouseTaskCompletionAndReturn(runId, autoSettings);
+  return { w, p, e, task, runId, receipt, run };
+}
+
+for (const route of ["CLOSE", "WAIT"]) {
+  for (const loading of [false, true]) {
+    test(`${route} accepts the website returning during its pre-click delay, loading=${loading}`, async t => {
+      const f = await automaticCompletionReturn(t, route);
+      const loader = new Element("p", "加载中");
+      let returned = false, elapsed = 0;
+      f.p.f.beforeWait = ms => {
+        if (!returned) {
+          returned = true;
+          f.e.root.remove();
+          if (loading) { f.p.marketplace.remove(); f.p.body.appendChild(loader); }
+          return;
+        }
+        elapsed += ms;
+        if (loading && elapsed >= 1500) { loader.remove(); f.p.body.appendChild(f.p.marketplace); }
+      };
+      const result = await f.run();
+      assert.equal(returned, true, "the website must remove the result before the old control is clicked");
+      assert.equal(f.receipt.close.clicks + f.e.verify.clicks + f.p.action.clicks, 0);
+      assert.equal(f.w.reloads().length, 0, "return detection must remain read-only");
+      assert.equal(result.ok, true, result.message);
+      if (loading) assert.ok(elapsed >= 1500, "wait for the real list, not just the missing result");
+      assert.equal(f.w.state().completionEvidence.taskKey, f.task.taskKey);
+    });
+  }
+
+  for (const boundary of ["working-order", "invitation", "new-watch"]) {
+    test(`${route} preserves ${boundary} after the website removes its result during the pre-click delay`, async t => {
+      const f = await automaticCompletionReturn(t, route);
+      let changed = false, replacement;
+      f.p.f.beforeWait = async () => {
+        if (changed) return;
+        changed = true;
+        f.e.root.remove();
+        if (boundary === "working-order") replacement = installExecution(f.p, { phase: "working", target: OTHER });
+        else if (boundary === "invitation") f.p.f.showPopup();
+        else await f.p.dispatch({ type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId: f.runId,
+          task: { taskKey: "replacement-task", tweetUrl: OTHER } });
+      };
+      const result = await f.run();
+      assert.equal(changed, true);
+      assert.equal(result.ok, false);
+      assert.equal(f.receipt.close.clicks + f.e.verify.clicks + f.p.action.clicks
+        + (replacement?.open.clicks || 0) + (replacement?.verify.clicks || 0)
+        + (f.p.f.accept?.clicks || 0) + (f.p.f.popupClose?.clicks || 0), 0);
+      assert.equal(f.w.reloads().length, 0);
+    });
+  }
+}
+
+test("WAIT cannot close the old result still visible after a new watch starts during its pre-click delay", async t => {
+  const f = await automaticCompletionReturn(t, "WAIT");
+  let changed = false;
+  f.p.f.beforeWait = async () => {
+    if (changed) return;
+    changed = true;
+    await f.p.dispatch({ type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId: f.runId,
+      task: { taskKey: "replacement-task", tweetUrl: OTHER } });
+  };
+  const result = await f.run();
+  assert.equal(changed, true);
+  assert.equal(result.ok, false);
+  assert.equal(result.cancelled, true);
+  assert.equal(f.receipt.close.clicks, 0, "the old result may remain mounted while the new watch takes ownership");
+  assert.equal(f.e.verify.clicks + f.p.action.clicks, 0);
+  assert.equal(f.w.reloads().length, 0);
+});
+
+test("X-first completion observes the loading gap after its bound generic close without a local result", async t => {
+  const { w, p, e, task } = await executionWorker(t);
+  task.source = "lighthouse";
+  const runId = w.state().runId;
+  await w.c.sendToTab(11, { type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId, task });
+  assert.equal(w.c.latchLighthouseCompletion({ source: "lighthouse_x_widget", runId,
+    taskKey: task.taskKey, tweetUrl: task.tweetUrl }, runId), true);
+  const close = new Element("button", "关闭", [], { "aria-label": "关闭" },
+    { left: 1010, top: 40, width: 32, height: 32 });
+  const loader = new Element("p", "加载中");
+  e.root.appendChild(close);
+  close.onClick = () => { e.root.remove(); p.marketplace.remove(); p.body.appendChild(loader); };
+  let elapsed = 0;
+  p.f.beforeWait = ms => {
+    if (!close.clicks) return;
+    elapsed += ms;
+    if (elapsed >= 1500) { loader.remove(); p.body.appendChild(p.marketplace); }
+  };
+  const result = await w.c.waitForLighthouseTaskCompletionAndReturn(runId, autoSettings);
+  assert.equal(close.clicks, 1);
+  assert.equal(e.verify.clicks + p.action.clicks, 0);
+  assert.equal(w.reloads().length, 0);
+  assert.equal(result.ok, true, result.message);
+  assert.ok(elapsed >= 1500, "a missing local receipt must not turn a legitimate return into a cancellation");
+});
+
+for (const beforeClose of [false, true]) {
+  for (const readyAfterMs of [1500, 15000, 60000]) {
+    test(`completion return waits for the real list after ${readyAfterMs}ms, already closed=${beforeClose}`, async t => {
+      const f = await pendingCompletionReturn(t, { beforeClose });
+      f.p.f.beforeWait = ms => { if (f.tick(ms) >= readyAfterMs) f.ready(); };
+      const result = await f.run();
+      assert.equal(result.ok, true, result.message);
+      assert.equal(f.receipt.close.clicks, beforeClose ? 0 : 1);
+      assert.equal(f.close.clicks + f.p.action.clicks + f.e.verify.clicks, 0);
+      assert.equal(f.w.reloads().length, 0);
+      assert.equal(f.w.state().completionEvidence.taskKey, f.task.taskKey);
+      assert.equal(f.w.state().running, true);
+    });
+  }
+}
+
+test("delayed completion return counts once and reaches the next auto scan", async t => {
+  const f = await pendingCompletionReturn(t);
+  f.p.f.beforeWait = ms => { if (f.tick(ms) >= 15000) f.ready(); };
+  f.w.c.getSettingsForRun = async () => ({ ...autoSettings, maxTasksPerRun: 5 });
+  f.w.c.recordReplyHistory = async () => {};
+  let scans = 0;
+  f.w.c.startNextAutoTask = async () => { scans += 1; return { ok: true }; };
+  const result = await f.w.c.handleXReplyResult({ ok: true, mode: "post", posted: true }, { runId: f.runId });
+  assert.equal(result.ok, true, result.message);
+  assert.equal(f.w.state().completed, 1);
+  assert.equal(scans, 1);
+  assert.equal(f.receipt.close.clicks, 1);
+  assert.equal(f.w.reloads().length, 1, "normal order finalization refreshes only after the list is ready");
+  assert.equal(f.close.clicks + f.p.action.clicks + f.e.verify.clicks, 0);
+});
+
+test("an earlier completion cannot wait through a newer watch already present before CLOSE", async t => {
+  const f = await pendingCompletionReturn(t, { beforeClose: true });
+  await f.p.dispatch({ type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId: f.runId,
+    task: { taskKey: "replacement-task", tweetUrl: OTHER } });
+  f.p.f.beforeWait = ms => { if (f.tick(ms) >= 1500) f.ready(); };
+  const result = await f.run();
+  assert.equal(result.ok, false);
+  assert.equal(f.w.reloads().length, 0);
+  assert.equal(f.tick(0), 0);
+  assert.equal(f.receipt.close.clicks + f.close.clicks + f.p.action.clicks, 0);
+});
+
+for (const boundary of ["ready", "new-watch", "working-order", "completed-order", "invitation"]) {
+  test(`unlatched WAIT preserves the same return guards at ${boundary}`, async t => {
+    const f = await pendingCompletionReturn(t);
+    f.w.state().completionEvidence = null;
+    f.w.state().xTabId = null;
+    let changed = false, replacement;
+    f.p.f.beforeWait = async ms => {
+      const elapsed = f.tick(ms);
+      if (elapsed >= 1000 && !changed && boundary !== "ready") {
+        changed = true;
+        if (boundary === "new-watch") {
+          await f.p.dispatch({ type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId: f.runId,
+            task: { taskKey: "replacement-task", tweetUrl: OTHER } });
+        } else if (boundary === "invitation") replacement = f.p.f.showPopup();
+        else {
+          const execution = installExecution(f.p, { phase: "working", target: OTHER });
+          replacement = execution.root;
+          if (boundary === "completed-order") showDispatchCompletion(execution);
+        }
+      }
+      if (elapsed >= 15000) { replacement?.remove(); f.ready(); }
+    };
+    const result = await f.run();
+    assert.equal(result.ok, boundary === "ready");
+    if (boundary !== "ready") {
+      assert.equal(result.cancelled, true);
+      assert.ok(f.tick(0) < 15000, "a changed order cannot disappear and masquerade as the previous return");
+    }
+    assert.equal(f.receipt.close.clicks, 1);
+    assert.equal(f.close.clicks + f.p.action.clicks + (f.p.f.accept?.clicks || 0), 0);
+    assert.equal(f.w.reloads().length, 0);
+  });
+}
+
+for (const timing of ["before-wait", "during-click-delay"]) {
+  test(`unlatched completion leaves an invitation arriving ${timing} untouched`, async t => {
+    const f = await pendingCompletionReturn(t);
+    f.w.state().completionEvidence = null;
+    f.w.state().xTabId = null;
+    if (timing === "before-wait") f.p.f.showPopup();
+    else f.p.f.beforeWait = () => { if (!f.p.f.popup) f.p.f.showPopup(); };
+    const result = await f.run();
+    assert.equal(result.ok, false);
+    assert.equal(result.cancelled, true);
+    assert.equal(f.receipt.close.clicks + f.p.f.accept.clicks + f.p.f.popupClose.clicks, 0);
+    assert.equal(f.w.reloads().length, 0);
+    assert.equal(f.w.state().completionEvidence.taskKey, f.task.taskKey);
+  });
+}
+
+for (const boundary of ["stop", "new-run", "working-order", "completed-order", "invitation", "new-watch", "timeout"]) {
+  test(`completion return preserves orders at ${boundary} during SPA loading`, async t => {
+    const f = await pendingCompletionReturn(t);
+    let changed = false, replacement, replacementReceipt;
+    f.p.f.beforeWait = async ms => {
+      if (f.tick(ms) < 1000 || changed || boundary === "timeout") return;
+      changed = true;
+      if (boundary === "stop") {
+        f.w.state().running = false;
+        await f.p.pause();
+      } else if (boundary === "new-run") {
+        f.w.state().runId = "replacement-run";
+        await f.p.dispatch({ type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId: "replacement-run", task: f.task });
+      } else if (boundary === "new-watch") {
+        await f.p.dispatch({ type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId: f.runId,
+          task: { taskKey: "replacement-task", tweetUrl: OTHER } });
+      } else if (boundary === "invitation") {
+        f.p.f.showPopup();
+      } else {
+        replacement = installExecution(f.p, { phase: "working", target: OTHER });
+        if (boundary === "completed-order") replacementReceipt = showDispatchCompletion(replacement);
+      }
+    };
+    const result = await f.run();
+    assert.equal(result.ok, false);
+    assert.equal(f.w.reloads().length, 0);
+    assert.equal(f.receipt.close.clicks, 1);
+    assert.equal(f.close.clicks + f.p.action.clicks + (replacement?.open.clicks || 0)
+      + (replacement?.verify.clicks || 0) + (replacementReceipt?.close.clicks || 0)
+      + (f.p.f.accept?.clicks || 0), 0);
+    assert.equal(f.w.state().completionEvidence.taskKey, f.task.taskKey);
+    if (boundary !== "timeout") assert.equal(changed, true, "observe the transition before deciding its outcome");
+    else assert.equal(f.tick(0), 60000, "a stuck transition has a bounded observation window");
   });
 }
 

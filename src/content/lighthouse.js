@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.128";
+  const SCRIPT_VERSION = "0.7.131";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -2147,17 +2147,40 @@
 
   async function closeTaskDetailPanel(settings = {}, message = {}) {
     const runId = activeRunId;
+    const closeContext = completionContext;
+    const closeEvidence = closeContext?.evidence;
     const invitationPending = Symbol("invitationPending");
     const expiredInvitation = Symbol("expiredInvitation");
     const completionChanged = Symbol("completionChanged");
+    const completionObserved = Symbol("completionObserved");
     const assertCanClose = () => {
       assertActiveRun(runId);
+      if (message.completionEvidence && completionContext !== closeContext) throw completionChanged;
+      // X can confirm first. Bind the local receipt before deciding whether
+      // its dialog still belongs to this order; completed is no longer locked.
+      const needsLocalReceipt = message.completionEvidence?.source === "lighthouse_x_widget"
+        && closeContext && completionContext === closeContext && !closeContext.evidence
+        && closeContext.runId === message.runId && closeContext.taskKey === message.task?.taskKey;
+      if (needsLocalReceipt) checkOfficialCompletion(message);
       if (!isCompletionCloseCurrent(message)) throw completionChanged;
       const state = getStandaloneInvitationState();
       if (state === "expired") throw expiredInvitation;
       if (state !== "absent") throw invitationPending;
+      // A result arriving during a generic close delay invalidates that old
+      // action. Select its official return control again instead of clicking it.
+      if (closeContext && completionContext === closeContext && closeContext.evidence !== closeEvidence) throw completionObserved;
+    };
+    const observeReturn = async () => {
+      const ready = await waitForCampaignsReturnAfterCompletion(settings, undefined, message);
+      return ready
+        ? { ok: true, message: "本单已完成，并确认任务广场列表已恢复" }
+        : { ok: false, cancelled: ready === null || !isCompletionCloseCurrent(message),
+          message: "本单已完成，但任务广场仍未就绪；已保留订单，未再次点击或刷新" };
     };
     try {
+      // Returning is asynchronous: the result can already be gone while
+      // the plaza is still loading. Observing that gap grants no click.
+      if (!isCompletionCloseCurrent(message) && isCompletionReturnPending(message)) return await observeReturn();
       assertCanClose();
       const completionReturnButton = findCompletionReturnToCampaignsButton(message);
       if (completionReturnButton) {
@@ -2169,9 +2192,7 @@
             throw completionChanged;
           }
         } });
-        if (await waitForCampaignsReturnAfterCompletion(settings, assertCanClose)) {
-          return { ok: true, message: "已关闭任务完成结果，并确认任务广场列表已恢复" };
-        }
+        return await observeReturn();
       }
 
       assertCanClose();
@@ -2222,8 +2243,18 @@
       assertCanClose();
       return { ok: false, message: "任务详情关闭复核失败，仍停留在详情页" };
     } catch (error) {
-      if (error === completionChanged) return { ok: false, cancelled: true,
-        message: "完成结果或关闭按钮已变化，已取消收尾并保留当前页面" };
+      if (error === completionObserved) return closeTaskDetailPanel(settings, message);
+      if (error === completionChanged) {
+        // The website may remove this result before our delayed click. Only
+        // observe its return when the same order and receipt are still bound.
+        if (completionContext === closeContext && completionContext?.evidence === closeEvidence
+            && getStandaloneInvitationState() === "absent" && isCompletionReturnPending(message)) return await observeReturn();
+        return { ok: false, cancelled: true,
+          message: "完成结果或关闭按钮已变化，已取消收尾并保留当前页面" };
+      }
+      if ((error === invitationPending || error === expiredInvitation)
+          && (message.completionEvidence || closeContext?.evidence)) return { ok: false, cancelled: true,
+        invitationPending: true, message: "完成收尾期间出现邀请，已保留当前页面，尚未确认返回广场" };
       if (error === expiredInvitation) return { ok: false, expiredInvitation: true,
         message: "邀请已明确过期且尚未接受，允许后台核对后刷新广场" };
       if (error !== invitationPending) throw error;
@@ -2309,17 +2340,33 @@
       const completionReturnButton = findCompletionReturnToCampaignsButton(message);
       if (completionConfirmed && completionReturnButton) {
         completionReturnButton.scrollIntoView({ block: "center", inline: "center" });
-        await clickElement(completionReturnButton, { beforeClick: () => {
-          assertActiveRun(message.runId || activeRunId);
-          if (findCompletionReturnToCampaignsButton(message) !== completionReturnButton) {
-            throw new Error("完成结果或关闭按钮已变化，保留当前页面");
+        const changed = Symbol("completionReturnChanged");
+        try {
+          await clickElement(completionReturnButton, { beforeClick: () => {
+            assertActiveRun(message.runId || activeRunId);
+            // Each watch owns a distinct receipt object. A new watch must
+            // cancel the old click even while its result remains mounted.
+            if (completionContext?.evidence !== completion.evidence
+                || getStandaloneInvitationState() !== "absent"
+                || findCompletionReturnToCampaignsButton(message) !== completionReturnButton) throw changed;
+          } });
+        } catch (error) {
+          if (error !== changed) throw error;
+          if (completionContext?.evidence !== completion.evidence
+              || getStandaloneInvitationState() !== "absent"
+              || !isCompletionReturnPending({ ...message, completionEvidence: completion.evidence })) {
+            return { ok: false, cancelled: true, completed: true, evidence: completion.evidence,
+              message: "完成结果或邀请状态已变化，已保留当前页面" };
           }
-        } });
-        if (await waitForCampaignsReturnAfterCompletion(settings)) {
+        }
+        const returned = await waitForCampaignsReturnAfterCompletion(settings, undefined,
+          { ...message, completionEvidence: completion.evidence });
+        if (returned) {
           return { ok: true, evidence: completion.evidence, message: "Lighthouse 已确认完成，已关闭结果并返回任务广场" };
         }
         return {
           ok: false,
+          ...(returned === null ? { cancelled: true } : {}),
           completed: true,
           evidence: completion.evidence,
           message: "官网已确认任务完成；已点击打开任务广场，但列表尚未恢复"
@@ -2382,6 +2429,21 @@
     const originals = Array.from(scope.querySelectorAll("a[href]"))
       .filter(node => /^查看原推文$/.test(normalize(node.innerText || node.textContent || "")));
     return originals.every(node => normalizeTweetUrl(node.href, true) === target);
+  }
+
+  function isCompletionReturnPending(message) {
+    const context = completionContext?.runId === message.runId
+      && completionContext.taskKey === message.task?.taskKey ? completionContext : null;
+    if (completionContext && !context) return false;
+    const evidence = message.completionEvidence || context?.evidence;
+    const target = normalizeTweetUrl(message.task?.tweetUrl, true);
+    if (!evidence || !target || !message.task?.taskKey || evidence.runId !== message.runId
+        || evidence.taskKey !== message.task.taskKey || normalizeTweetUrl(evidence.tweetUrl, true) !== target) return false;
+    // Only an empty/loading campaigns transition may be observed. A new
+    // result, execution order or loaded detail must keep its own protection.
+    return /^\/campaigns\/?$/.test(location.pathname)
+      && !findOfficialCompletionRoots().length && !findExecutionDialog().present
+      && !isTaskDetailOpen() && !hasRecoverableDetailLoadFailure();
   }
 
   function findCompletionReturnToCampaignsButton(message) {
@@ -2472,15 +2534,25 @@
       .find((node) => labels.test(buttonText(node))) || null;
   }
 
-  async function waitForCampaignsReturnAfterCompletion(settings = {}, beforeCheck) {
+  async function waitForCampaignsReturnAfterCompletion(settings = {}, beforeCheck, message) {
+    const runId = activeRunId;
+    const returnContext = completionContext;
+    const returnEvidence = returnContext?.evidence;
     const started = Date.now();
-    const timeoutMs = Math.min(Math.max((settings.actionDelayMs || 500) * 8, 4000), 10000);
-    while (Date.now() - started < timeoutMs) {
+    const timeoutMs = 60000;
+    while (true) {
+      assertActiveRun(runId);
       beforeCheck?.();
+      // null means a changed order, distinct from a still-current timeout.
+      // Both completion entry points use this read-only identity guard.
+      if (message && (completionContext !== returnContext || completionContext?.evidence !== returnEvidence
+          || (returnContext && (returnContext.runId !== message.runId || returnContext.taskKey !== message.task?.taskKey))
+          || getStandaloneInvitationState() !== "absent"
+          || (!isCompletionCloseCurrent(message) && !isCompletionReturnPending(message)))) return null;
       if (isCampaignsListOpen()) return true;
+      if (Date.now() - started >= timeoutMs) break;
       await wait(250);
     }
-    beforeCheck?.();
     report("warn", "点击打开任务广场后未确认列表恢复");
     return false;
   }

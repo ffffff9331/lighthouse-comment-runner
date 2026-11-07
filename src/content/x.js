@@ -1,7 +1,7 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerXSingleton__";
   const RUN_LOCK_KEY = "__lighthouseCommentTaskRunnerXRunLock__";
-  const SCRIPT_VERSION = "0.7.128";
+  const SCRIPT_VERSION = "0.7.131";
   const INSTANCE_ID = `x-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const RESERVED_X_HANDLE_SLUGS = new Set(["home", "explore", "notifications", "messages", "jobs", "i", "settings"]);
   const existingSingleton = globalThis[SINGLETON_KEY];
@@ -61,8 +61,8 @@
     const actions = {
       RUN_X_REPLY: () => runReply(message.task, message.settings),
       RUN_X_WIDGET_CLAIM: () => runTaskWidgetClaim(message.task, message.settings),
-      CLICK_X_TASK_VERIFY: () => completeTaskWidgetLifecycle(message.settings, message.task),
-      COMPLETE_X_TASK_WIDGET: () => completeTaskWidgetLifecycle(message.settings, message.task)
+      CLICK_X_TASK_VERIFY: () => completeTaskWidgetForMessage(message),
+      COMPLETE_X_TASK_WIDGET: () => completeTaskWidgetForMessage(message)
     };
     if (!actions[message.type]) return false;
     executeXStep(message, actions[message.type]).then(sendResponse);
@@ -116,6 +116,12 @@
     stepResults.set(key, promise);
     if (stepResults.size > 60) stepResults.delete(stepResults.keys().next().value);
     return promise;
+  }
+
+  function completeTaskWidgetForMessage(message) {
+    const task = message.task || {};
+    const replyKey = [message.runId, task.taskKey, normalizeTweetUrl(task.tweetUrl, true), "RUN_X_REPLY"].join("|");
+    return completeTaskWidgetLifecycle(message.settings, task, task.taskKey ? stepResults.get(replyKey) : null);
   }
 
   startTaskWidgetAssist();
@@ -961,10 +967,15 @@
     return { ok: true, message: `已点击 X 任务验证按钮：${text}` };
   }
 
-  async function completeTaskWidgetLifecycle(settings = {}, task = {}) {
+  async function completeTaskWidgetLifecycle(settings = {}, task = {}, priorReply = null) {
     const runId = activeRunId;
     const startedAt = Date.now();
     const timeoutMs = Math.max(60000, Number(settings.lockSeatTimeoutMs || 0));
+    const reply = await priorReply;
+    const canRecaptureLike = Boolean((task.claimed || task.seatLocked || task.invitationAccepted)
+      && reply?.ok && reply.mode !== "fill" && reply.like?.status === "already_liked");
+    let likeRecaptureAttempted = false;
+    let pendingLikePanel = null, pendingLikeSince = 0;
     let submitText = "";
 
     while (Date.now() - startedAt < timeoutMs) {
@@ -1000,11 +1011,85 @@
         return { ok: true, submitted: false, submissionAttempted: true, message: "已点击灯塔提交，等待官网结果，不重复点击" };
       }
 
+      // The official assistant needs a captured LIKE request, not just X's
+      // existing liked state. Give its saved capture a chance to synchronize
+      // before the user-authorized, single native unlike/like recovery.
+      const pendingPanel = canRecaptureLike && !likeRecaptureAttempted ? currentOfficialLikePending() : null;
+      if (pendingPanel !== pendingLikePanel) {
+        pendingLikePanel = pendingPanel;
+        pendingLikeSince = Date.now();
+      }
+      if (pendingLikePanel && Date.now() - pendingLikeSince >= 1500
+          && findLikeRecaptureControl()?.getAttribute("data-testid") === "unlike") {
+        likeRecaptureAttempted = true;
+        const recaptured = await recaptureCurrentTweetLike();
+        if (!recaptured.ok) return recaptured;
+      }
+
       await wait(250);
     }
 
     const reason = describeTaskWidgetCompletionBlock();
     return { ok: false, message: `X 任务闭环超时：${reason}${submitText ? `：${submitText}` : ""}` };
+  }
+
+  function currentOfficialLikePending() {
+    const panels = queryAccessibleElements(".lh-cur-sec").filter(isVisible);
+    const actions = inferTaskActions();
+    return panels.length === 1 && actions.complete && actions.source === "x_current_task"
+      && !actions.unsupported.length && actions.steps.some(step => step.action === "like" && !step.completed)
+      ? panels[0] : null;
+  }
+
+  function findLikeRecaptureControl() {
+    const target = normalizeTweetUrl(activeTargetUrl, true);
+    if (!target || normalizeTweetUrl(location.href, true) !== target) return null;
+    const articles = Array.from(document.querySelectorAll("article")).filter(isVisible)
+      .filter(article => Array.from(article.querySelectorAll("a[href]")).some(link =>
+        link.closest("article") === article && link.querySelector("time")
+        && !link.parentElement?.closest('[role="link"],[data-testid="quoteTweet"]')
+        && normalizeTweetUrl(new URL(link.getAttribute("href"), location.href).href, true) === target));
+    if (articles.length !== 1) return null;
+    const controls = Array.from(articles[0].querySelectorAll('[data-testid="like"],[data-testid="unlike"]'))
+      .filter(node => node.closest("article") === articles[0]
+        && !node.closest('[role="link"],[data-testid="quoteTweet"]')
+        && isVisible(node) && !isButtonDisabled(node));
+    return controls.length === 1 ? controls[0] : null;
+  }
+
+  async function recaptureCurrentTweetLike() {
+    const runId = activeRunId;
+    const panel = currentOfficialLikePending();
+    let unlikeAttempted = false;
+    try {
+      await randomClickDelay();
+      assertActiveRun(runId);
+      // A late official capture makes the recovery unnecessary. A different
+      // panel grants no permission to undo an existing interaction.
+      if (!currentOfficialLikePending()) return { ok: true, status: "already_acknowledged" };
+      if (currentOfficialLikePending() !== panel) throw new Error("官方当前任务已变化");
+      const unlike = findLikeRecaptureControl();
+      if (unlike?.getAttribute("data-testid") !== "unlike") throw new Error("目标点赞按钮已变化");
+      unlikeAttempted = true;
+      unlike.click();
+      await waitFor(() => findLikeRecaptureControl()?.getAttribute("data-testid") === "like", 4000, "取消点赞状态未确认");
+      await randomClickDelay();
+      assertActiveRun(runId);
+      const panels = queryAccessibleElements(".lh-cur-sec").filter(isVisible);
+      if (panels.length !== 1 || panels[0] !== panel) throw new Error("官方当前任务已变化");
+      const like = findLikeRecaptureControl();
+      if (like?.getAttribute("data-testid") !== "like") throw new Error("重新点赞按钮已变化");
+      like.click();
+      await waitFor(() => findLikeRecaptureControl()?.getAttribute("data-testid") === "unlike", 4000, "重新点赞状态未确认");
+      assertActiveRun(runId);
+      try {
+        chrome.runtime.sendMessage({ type: "CONTENT_LOG", runId, level: "info",
+          text: "官网未识别已有点赞，已完成一次取消后重新点赞，继续等待官方验证" })?.catch?.(() => {});
+      } catch (_) {}
+      return { ok: true, status: "recaptured", message: "已重新点赞，等待官网识别" };
+    } catch (error) {
+      return { ok: false, message: `点赞恢复未完成：${error.message || String(error)}；${unlikeAttempted ? "已尝试取消点赞，请核对原推文是否仍已点赞；" : ""}已保留本单，未提交验证` };
+    }
   }
 
   function readTaskWidgetCompletion(message) {

@@ -13,11 +13,21 @@ const clone = (value) => JSON.parse(JSON.stringify(value));
 
 function harness(options = {}) {
   let elapsed = 0, listener;
-  const calls = { like: 0, follow: 0, dedupe: 0, ai: 0, compose: 0, fill: 0, post: 0, physicalLike: 0 }, logs = [];
+  const calls = { like: 0, follow: 0, dedupe: 0, ai: 0, compose: 0, fill: 0, post: 0, physicalLike: 0, submit: 0 }, logs = [];
   const counters = calls;
   class FakeDate extends Date { static now() { return 100000 + elapsed; } }
-  const panel = { parentElement: null, get innerText() { return options.panel ? options.panel(elapsed) : composite; } };
-  const button = { parentElement: panel, disabled: true };
+  const panel = { parentElement: null,
+    get innerText() { return calls.submit ? "当前任务 +0.2LUX 验证中" : options.panel ? options.panel(elapsed) : composite; },
+    querySelectorAll: selector => selector.includes("lh-cur-pill-done") ? [] : [button]
+  };
+  const button = { parentElement: panel,
+    get disabled() { return options.verifyReadyAt === undefined || elapsed < options.verifyReadyAt || calls.submit > 0; },
+    get innerText() { return this.disabled ? "完成上面步骤解锁" : "验证发奖"; },
+    getAttribute: () => null, matches: () => true,
+    getBoundingClientRect: () => ({left: 100, top: 100, width: 120, height: 40}),
+    click() { calls.submit++; }
+  };
+  const xinhuoPanel = { innerText: "薪火互动任务助手 当前任务 reid_vale 点赞任务 该任务已完成", querySelectorAll: () => [] };
   const fakeDocument = { body: {}, querySelectorAll: () => [] };
   const chrome = { runtime: { onMessage: { addListener(fn) { listener = fn; } }, async sendMessage(message) {
     if (message.type === "CONTENT_LOG") { logs.push(message.text); return {ok: true}; }
@@ -27,7 +37,8 @@ function harness(options = {}) {
   const c = vm.createContext({ console, URL, Date: FakeDate, chrome, document: fakeDocument,
     location: {href: target}, window: {}, setTimeout, clearTimeout,
     fetch: async () => { throw Error("No network in composite action tests"); },
-    options, counters, fixturePanel: panel,
+    options, counters, fixturePanel: panel, fixtureWidget: options.xinhuoCompleted ? xinhuoPanel : panel,
+    fixtureVerifyButton: () => button.disabled ? [] : [button],
     fixtureButtons: () => options.noOfficialButton ? [] : (options.twoPanels ? [button, {parentElement: {...panel, innerText: likeOnly}}] : [button]),
     tick: async (ms) => {
       elapsed += ms;
@@ -42,21 +53,24 @@ function harness(options = {}) {
     assertNotLoginWall = () => {};
     scrapeCurrentTweet = () => ({url: location.href, text: "fixture tweet"});
     simulateReadingBeforeReply = async () => {};
-    queryAccessibleElements = (selector) => selector === "button.lh-cur-btn" ? fixtureButtons() : [];
+    queryAccessibleElements = (selector) => selector === "button.lh-cur-btn" ? fixtureButtons()
+      : selector === ".lh-cur-sec" ? [fixturePanel]
+      : selector === "button.lh-cur-btn.on" ? fixtureVerifyButton() : [];
     isVisible = () => true;
     wait = tick;
-    likeCurrentTweetIfNeeded = async () => { counters.like++; return options.likeResult || {ok: true, status: "already_liked", message: "当前推文已点赞"}; };
+    likeCurrentTweetIfNeeded = async () => { counters.like++; return options.alreadyLiked ? originalLike()
+      : options.likeResult || {ok: true, status: "already_liked", message: "当前推文已点赞"}; };
     followCurrentTweetAuthorIfNeeded = async () => { counters.follow++; return {ok: true}; };
     detectExistingReplyBeforeWriting = async () => { counters.dedupe++; return options.dedupe || {replied: false}; };
     openReplyComposer = async () => { counters.compose++; };
     fillReplyText = async () => { counters.fill++; };
     clickPostButtonAndVerify = async () => { counters.post++; return options.postResult || {ok: true, message: "已确认回复发送成功"}; };
-    findDocumentVerifyActionButton = () => null;
-    findLighthouseTaskWidget = () => fixturePanel;
-    revealTaskWidgetArea = async () => fixturePanel;
-    findVerifyActionButton = () => null;
-    findMainTweetArticle = () => ({});
-    isTweetAlreadyLiked = () => false;
+    if (!options.lifecycle) findDocumentVerifyActionButton = () => null;
+    findLighthouseTaskWidget = () => fixtureWidget;
+    revealTaskWidgetArea = async () => fixtureWidget;
+    if (!options.lifecycle) findVerifyActionButton = () => null;
+    findMainTweetArticle = () => ({querySelector: selector => options.alreadyLiked && selector === '[data-testid="unlike"]' ? {} : null});
+    if (!options.alreadyLiked) isTweetAlreadyLiked = () => false;
     findTweetLikeButton = () => ({});
     clickElement = async () => { counters.physicalLike++; };
     waitForLikeApplied = async () => false;
@@ -221,4 +235,46 @@ test("unverified physical like clicks are not reported as successful", async () 
   assert.equal(h.calls.physicalLike, 1);
   assert.equal(result.ok, false);
   assert.equal(result.status, "clicked_unverified");
+});
+
+test("an existing X like does not submit or count completion while Lighthouse still marks it pending", async () => {
+  const h = harness({alreadyLiked: true, lifecycle: true, panel: () => likeOnly.replace("15/10s", "50/10s")});
+  const action = await h.message("RUN_X_REPLY", "点赞互动");
+  assert.equal(action.like.status, "already_liked");
+  const result = await h.message("COMPLETE_X_TASK_WIDGET", "点赞互动");
+  assert.equal(result.ok, false);
+  assert.notEqual(result.completed, true);
+  assert.match(result.message, /未完成动作：点赞（待完成）/);
+  assert.match(result.message, /停留时长已满足 50\/10s/);
+  assert.equal(h.calls.physicalLike, 0);
+  assert.equal(h.calls.submit, 0);
+  assert.equal(h.calls.post, 0);
+});
+
+test("an existing X like submits once after Lighthouse recognizes it and unlocks verification", async () => {
+  const h = harness({alreadyLiked: true, lifecycle: true, verifyReadyAt: 2250,
+    panel: ms => ms < 2250 ? likeOnly : likeOnly.replace("点赞 待完成", "点赞 已完成")});
+  await h.message("RUN_X_REPLY", "点赞互动");
+  const [first, duplicate] = await Promise.all([
+    h.message("COMPLETE_X_TASK_WIDGET", "点赞互动"), h.message("COMPLETE_X_TASK_WIDGET", "点赞互动")
+  ]);
+  assert.equal(first.ok, true);
+  assert.equal(first.submitted, true);
+  assert.notEqual(first.completed, true, "a submission receipt alone is not official completion");
+  assert.deepEqual(clone(first), clone(duplicate));
+  assert.ok(h.elapsed() >= 2250);
+  assert.equal(h.calls.physicalLike, 0);
+  assert.equal(h.calls.submit, 1);
+});
+
+test("a completed Xinhuo widget cannot complete the pending Lighthouse like on the same X page", async () => {
+  const h = harness({alreadyLiked: true, lifecycle: true, xinhuoCompleted: true, panel: () => likeOnly});
+  await h.message("RUN_X_REPLY", "点赞互动");
+  const result = await h.message("COMPLETE_X_TASK_WIDGET", "点赞互动");
+  assert.equal(result.ok, false);
+  assert.notEqual(result.completed, true);
+  assert.notEqual(result.submitted, true);
+  assert.match(result.message, /未完成动作：点赞（待完成）/);
+  assert.equal(h.calls.physicalLike, 0);
+  assert.equal(h.calls.submit, 0);
 });
