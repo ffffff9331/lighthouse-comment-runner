@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.131";
+  const SCRIPT_VERSION = "0.7.132";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -2177,10 +2177,47 @@
         : { ok: false, cancelled: ready === null || !isCompletionCloseCurrent(message),
           message: "本单已完成，但任务广场仍未就绪；已保留订单，未再次点击或刷新" };
     };
+    const observeLocalCompletion = async () => {
+      const binding = closeContext?.navigationBinding;
+      const evidence = message.completionEvidence;
+      const target = normalizeTweetUrl(message.task?.tweetUrl, true);
+      const canObserve = () => {
+        if (!binding || !target || message.task?.seatLocked !== true
+            || completionContext !== closeContext || closeContext.runId !== message.runId
+            || closeContext.taskKey !== message.task?.taskKey || binding.taskKey !== closeContext.taskKey
+            || normalizeTweetUrl(binding.tweetUrl, true) !== target
+            || evidence?.source !== "lighthouse_x_widget" || evidence.runId !== message.runId
+            || evidence.taskKey !== closeContext.taskKey || normalizeTweetUrl(evidence.tweetUrl, true) !== target
+            || getStandaloneInvitationState() !== "absent") return false;
+        const execution = findExecutionDialog();
+        if (!execution.present || execution.root !== binding.root) return false;
+        const targets = Array.from(binding.root.querySelectorAll("a[href]"))
+          .filter(node => /^(?:查看目标推文|查看原推文)$/.test(normalize(node.getAttribute("aria-label") || buttonText(node))));
+        return targets.every(node => normalizeTweetUrl(node.href || node.getAttribute("href"), true) === target);
+      };
+      if (closeContext?.evidence || !canObserve()) return null;
+      // X may finish while this exact dispatch dialog is still verifying.
+      // Its phase/reward text can disappear; that only permits observation,
+      // never a generic close, Escape, submission or refresh.
+      const started = Date.now();
+      while (true) {
+        assertActiveRun(runId);
+        if (!canObserve()) return { ok: false, cancelled: true,
+          message: "等待本单完成结果时订单或邀请已变化，已取消收尾并保留页面" };
+        if (checkOfficialCompletion(message).completed) return closeTaskDetailPanel(settings, message);
+        if (Date.now() - started >= 60000) return { ok: false, cancelled: true,
+          message: "X 已确认完成，但灯塔本单结果仍未出现；已保留订单，未点击关闭或刷新" };
+        await wait(250);
+      }
+    };
     try {
       // Returning is asynchronous: the result can already be gone while
       // the plaza is still loading. Observing that gap grants no click.
       if (!isCompletionCloseCurrent(message) && isCompletionReturnPending(message)) return await observeReturn();
+      if (!isCompletionCloseCurrent(message)) {
+        const observed = await observeLocalCompletion();
+        if (observed) return observed;
+      }
       assertCanClose();
       const completionReturnButton = findCompletionReturnToCampaignsButton(message);
       if (completionReturnButton) {
@@ -2245,6 +2282,8 @@
     } catch (error) {
       if (error === completionObserved) return closeTaskDetailPanel(settings, message);
       if (error === completionChanged) {
+        const observed = await observeLocalCompletion();
+        if (observed) return observed;
         // The website may remove this result before our delayed click. Only
         // observe its return when the same order and receipt are still bound.
         if (completionContext === closeContext && completionContext?.evidence === closeEvidence

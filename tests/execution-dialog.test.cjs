@@ -639,6 +639,83 @@ for (const timing of ["before-close", "during-close-wait"]) {
   });
 }
 
+// X can acknowledge an invitation before its bound dispatch dialog renders
+// the local receipt. Working hides the claimed reward, and verification can
+// temporarily replace its phase label. Neither transition grants a click.
+async function pendingDispatchReceipt(t, phase = "verifying") {
+  const { w, p, task } = await executionWorker(t);
+  const e = installExecution(p, { phase: "claimed" });
+  e.root.attrs["data-engagement-dispatch"] = "true";
+  const runId = w.state().runId;
+  await w.c.sendToTab(11, { type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId, task });
+  e.heading.ownText = phase === "working" ? "完成任务后，回来验证" : "正在验证任务";
+  e.open.ownText = "打开目标推文 ↗";
+  e.region.children.find(node => node.ownText === "任务奖励 0.10 LUX").remove();
+  await w.c.sendToTab(11, { type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH", runId, task });
+  assert.equal(w.c.latchLighthouseCompletion({ source: "lighthouse_x_widget", runId,
+    taskKey: task.taskKey, tweetUrl: task.tweetUrl }, runId), true);
+  const genericClose = new Element("button", "关闭", [], { "aria-label": "关闭" },
+    { left: 1010, top: 40, width: 32, height: 32 });
+  e.root.appendChild(genericClose);
+  const assertUntouched = () => {
+    assert.equal(genericClose.clicks + e.open.clicks + e.verify.clicks + p.action.clicks, 0,
+      "awaiting a bound local receipt must not click any other control");
+    assert.equal(p.f.dispatchedEvents.length, 0, "do not dismiss the pending dialog with Escape");
+    assert.equal(w.reloads().length, 0, "do not reload before a confirmed return");
+  };
+  return { w, p, e, task, runId, assertUntouched,
+    run: () => w.c.waitForLighthouseTaskCompletionAndReturn(runId, autoSettings) };
+}
+
+for (const phase of ["working", "verifying"]) {
+  test(`X-first dispatch receipt waits through ${phase} before closing the same order`, async t => {
+    const f = await pendingDispatchReceipt(t, phase);
+    let elapsed = 0, receipt;
+    f.p.f.beforeWait = ms => {
+      elapsed += ms;
+      f.assertUntouched();
+      if (elapsed >= 1500 && !receipt) receipt = showDispatchCompletion(f.e);
+    };
+    const result = await f.run();
+    assert.equal(result.ok, true, result.message);
+    assert.ok(elapsed >= 1500, "wait until the local receipt really appears");
+    assert.equal(receipt.close.clicks, 1);
+    f.assertUntouched();
+    assert.equal(f.w.state().completionEvidence.taskKey, f.task.taskKey);
+  });
+}
+
+for (const boundary of ["stop", "new-watch", "replacement-root", "changed-target", "invitation", "timeout"]) {
+  test(`X-first dispatch receipt preserves ${boundary} while awaiting local completion`, async t => {
+    const f = await pendingDispatchReceipt(t);
+    let elapsed = 0, changed = false, replacement, receipt;
+    f.p.f.beforeWait = async ms => {
+      elapsed += ms;
+      f.assertUntouched();
+      if (changed || boundary === "timeout") return;
+      changed = true;
+      if (boundary === "stop") { f.w.state().running = false; await f.p.pause(); }
+      else if (boundary === "new-watch") await f.p.dispatch({ type: "BEGIN_LIGHTHOUSE_COMPLETION_WATCH",
+        runId: f.runId, task: { taskKey: "replacement-task", tweetUrl: OTHER } });
+      else if (boundary === "replacement-root") {
+        replacement = installExecution(f.p, { phase: "working", target: OTHER });
+        receipt = showDispatchCompletion(replacement);
+      } else if (boundary === "changed-target") f.e.link.href = OTHER;
+      else f.p.f.showPopup();
+    };
+    const result = await f.run();
+    assert.equal(result.ok, false);
+    f.assertUntouched();
+    assert.equal((replacement?.open.clicks || 0) + (replacement?.verify.clicks || 0)
+      + (receipt?.close.clicks || 0) + (f.p.f.accept?.clicks || 0) + (f.p.f.popupClose?.clicks || 0), 0);
+    if (boundary === "timeout") {
+      assert.ok(elapsed >= 1500, "a pending current receipt must receive an observation window");
+      assert.ok(elapsed <= 60000, "a missing local receipt must not hold the runner indefinitely");
+    } else assert.equal(changed, true, "exercise the boundary after observation has begun");
+    assert.equal(f.w.state().completionEvidence.taskKey, f.task.taskKey);
+  });
+}
+
 for (const boundary of ["replacement-result", "changed-target", "new-watch", "stop", "invitation"]) {
   test(`X-first completion preserves ${boundary} before local evidence is bound`, async t => {
     const { w, p, e, task } = await executionWorker(t);
