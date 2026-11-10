@@ -1,6 +1,6 @@
 (function () {
   const SINGLETON_KEY = "__lighthouseCommentTaskRunnerLighthouseSingleton__";
-  const SCRIPT_VERSION = "0.7.132";
+  const SCRIPT_VERSION = "0.7.133";
   const INSTANCE_ID = `lighthouse-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const existingSingleton = globalThis[SINGLETON_KEY];
   if (existingSingleton?.active && existingSingleton.version === SCRIPT_VERSION) {
@@ -2856,18 +2856,59 @@
     return null;
   }
 
+  function hasPendingLotteryQueue(root) {
+    const controls = Array.from(root?.querySelectorAll?.("button,[role='button'],input[type='button'],input[type='submit']") || [])
+      .filter(isVisible);
+    const queued = controls.filter(node => normalize(buttonText(node)) === "您已在队列中，请等待结果");
+    return queued.length > 0 && queued.every(isDisabled)
+      && !controls.some(node => /正在(?:预定|预订|锁定)席位|抽签中/.test(normalize(buttonText(node))));
+  }
+
+  function readLotteryRejection(node) {
+    if (!node || node.isConnected === false || !isVisible(node)
+        || node.getAttribute("role") !== "alertdialog" || node.getAttribute("data-state") !== "open"
+        || node.getAttribute("data-slot") !== "alert-dialog-content") return null;
+    const titles = Array.from(node.querySelectorAll("[data-slot='alert-dialog-title']")).filter(isVisible);
+    const descriptions = Array.from(node.querySelectorAll("[data-slot='alert-dialog-description']")).filter(isVisible);
+    const controls = Array.from(node.querySelectorAll("button,a[href],[role='button'],input[type='button'],input[type='submit']")).filter(isVisible);
+    if (titles.length !== 1 || normalize(buttonText(titles[0])) !== "本席位已满"
+        || descriptions.length !== 1 || normalize(buttonText(descriptions[0])) !== "很遗憾，请继续关注其他任务"
+        || controls.length !== 1 || controls[0].tagName !== "BUTTON"
+        || controls[0].getAttribute("data-slot") !== "alert-dialog-action"
+        || normalize(buttonText(controls[0])) !== "我知道了" || isDisabled(controls[0])) return null;
+    return { node, button: controls[0] };
+  }
+
   async function clickAndVerifyLock(button, settings, observation, expectedInvitation = null) {
     const runId = activeRunId;
     const seen = new Map(readLockFeedback().map(item => [item.node, item.text]));
+    const freshFeedback = new Map();
+    const priorDialogs = new Set(document.querySelectorAll("[role='alertdialog']"));
     observation.feedback = [];
     observation.collectFeedback = () => {
       if (activeRunId !== runId || automationPaused || cancelledRunIds.has(runId)) return;
       for (const { node, text } of readLockFeedback()) {
-        if (seen.get(node) === text) continue;
-        seen.set(node, text);
+        const sameDetail = isSameLockDetail(observation);
+        const changed = seen.get(node) !== text;
+        if (changed) {
+          seen.set(node, text);
+          if (sameDetail && claimOperation?.claimActionAttempted) freshFeedback.set(node, text);
+          else freshFeedback.delete(node);
+        }
+        // Text can render before the queue/acknowledgement controls. Recheck
+        // structure for this click's fresh feedback even when logs are deduped.
+        if (sameDetail && freshFeedback.get(node) === text) {
+          if (/^你已加入队列无需重复点击预计在\d{1,3}秒内确定席位请耐心等待[，,]结果将自动弹出$/.test(text.replace(/\s+/g, ""))) {
+            observation.queueEntered = true;
+          } else if (observation.queueEntered && !observation.queueRejection && !priorDialogs.has(node)
+              && !observation.root.contains(node)) {
+            observation.queueRejection = readLotteryRejection(node);
+          }
+        }
+        if (!changed) continue;
         // Preserve diagnostic text even when it is not a proven refusal.
         if (observation.feedback.some(item => item.text === text)) continue;
-        observation.feedback.push({ text, sameDetail: isSameLockDetail(observation), refusal: knownLockRefusal(text) });
+        observation.feedback.push({ text, sameDetail, refusal: knownLockRefusal(text) });
         if (observation.feedback.length > 20) observation.feedback.shift();
         report("info", `锁位即时提示：${text}`);
       }
@@ -2950,6 +2991,29 @@
           return true;
         }
         if (evidence.some(value => !observation.evidence.includes(value))) return true;
+        const queueResult = observation.queueRejection;
+        const canRejectQueue = () => !observation.priorClaimAttempted && observation.rejectionAbsent
+          && observation.positiveStateAbsent && isSameLockDetail(observation)
+          && !hasPositiveClaimState(normalize(observation.root.innerText || ""), observation.root)
+          && !observation.evidence.some(value => value.startsWith("status:"))
+          && !lockConfirmationEvidence(observation.root).some(value => !observation.evidence.includes(value))
+          && getStandaloneInvitationState() === "absent";
+        const hasCurrentQueueResult = () => queueResult && hasPendingLotteryQueue(observation.root)
+          && readLotteryRejection(queueResult.node)?.button === queueResult.button;
+        if (hasCurrentQueueResult() && canRejectQueue()) {
+          // A fresh terminal lottery result can end this queue even while its
+          // underlying button stays disabled. Ordinary busy/toast refusals
+          // below keep their stricter clickable-or-next-batch requirement.
+          await clickElement(queueResult.button, { randomDelay: false, beforeClick: () => {
+            if (!canRejectQueue() || !hasCurrentQueueResult()) throw new Error("队列结果或订单已变化，保留本单");
+          } });
+          assertActiveRun(runId);
+          if (!canRejectQueue()) throw new Error("确认队列结果后订单已变化，保留本单");
+          const error = new Error("平台明确拒绝本次锁位：本席位已满，已确认本次排队未接到单");
+          error.confirmedClaimRejection = true;
+          error.task = { ...observation.task, detailText: text.slice(0, 1800), seatLocked: false, claimRejected: true };
+          throw error;
+        }
         const refusal = observation.feedback?.find(item => item.sameDetail && item.refusal);
         const returnedToBatch = refusal?.refusal.claimRetryScope === "task"
           && observation.batchCountdownAbsent === true
