@@ -120,6 +120,41 @@ test("uses the native inline editor below the exact target with its own send but
   assert.equal(button.clicks, 0);
 });
 
+test("ignores an empty visible inline container under another tweet", async () => {
+  const p = page();
+  const button = addReplyButton(p);
+  addInlineReply(p);
+  p.column.appendChild(article(OTHER, "other", "Nearby reply"));
+  p.column.appendChild(new Element("div", "", [], {"data-testid": "inline_reply_offscreen"}));
+
+  assert.equal(await p.api.openReplyComposer({actionDelayMs: 100}), p.box);
+  assert.doesNotThrow(() => p.api.assertBoundReplyBox(p.box));
+  assert.equal(p.api.findSendButton(p.box), p.send);
+  assert.equal(button.clicks, 0);
+});
+
+test("ignores an empty visible inline container before the target editor", async () => {
+  const p = page();
+  const editor = addInlineReply(p);
+  const placeholder = new Element("div", "", [], {"data-testid": "inline_reply_offscreen"});
+  p.column.replaceChildren(p.target, placeholder, editor);
+
+  assert.equal(await p.api.openReplyComposer({actionDelayMs: 100}), p.box);
+  assert.equal(p.api.findSendButton(p.box), p.send);
+});
+
+test("a second inline container with a send control still blocks an existing editor", async () => {
+  const p = page();
+  const editor = addInlineReply(p);
+  assert.equal(await p.api.openReplyComposer({actionDelayMs: 100}), p.box);
+
+  const unrelatedSend = new Element("button", "Reply", [], {"data-testid": "tweetButtonInline"});
+  editor.appendChild(new Element("div", "", [unrelatedSend], {"data-testid": "inline_reply_offscreen"}));
+  assert.throws(() => p.api.assertBoundReplyBox(p.box), /回复框已变化/);
+  assert.equal(p.api.findSendButton(p.box), null);
+  assert.equal(p.send.clicks + unrelatedSend.clicks, 0);
+});
+
 test("accepts the native inline composer inserted by the target reply button", async () => {
   const p = page();
   p.form.remove();
