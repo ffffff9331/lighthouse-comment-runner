@@ -33,7 +33,8 @@ function page() {
   const context = vm.createContext({
     URL, console, f, location, document: body,
     Date: {now: () => elapsed},
-    tick: async ms => { elapsed += ms; },
+    tick: async ms => { elapsed += Number(ms) || 0; f.onWait?.(); },
+    setTimeout: (callback, ms) => queueMicrotask(() => { elapsed += ms; f.onPoll?.(); callback(); }),
     chrome: {runtime: {onMessage: {addListener() {}}}}
   });
   const end = source.lastIndexOf("})();");
@@ -55,6 +56,141 @@ test("unique target-owned composer and submit action remain usable", async () =>
   const p = page();
   assert.equal(await p.api.openReplyComposer({}), p.box);
   assert.equal(p.api.findSendButton(p.box), p.send);
+});
+
+function addReplyButton(p) {
+  const button = new Element("button", "Reply", [], {"data-testid": "reply"});
+  p.target.appendChild(button);
+  return button;
+}
+
+test("opens a composer with the unique button owned by the target tweet", async () => {
+  const p = page();
+  p.form.remove();
+  const button = addReplyButton(p);
+  button.onClick = () => p.target.appendChild(p.form);
+  assert.equal(await p.api.openReplyComposer({actionDelayMs: 100}), p.box);
+  assert.equal(button.clicks, 1);
+});
+
+test("uses a same-tweet composer that appears while waiting for the reply entry", async () => {
+  const p = page();
+  p.form.remove();
+  p.f.onPoll = () => {
+    p.f.onPoll = null;
+    addReplyButton(p);
+    p.target.appendChild(p.form);
+  };
+  assert.equal(await p.api.openReplyComposer({actionDelayMs: 100}), p.box);
+  assert.equal(p.target.querySelector('[data-testid="reply"]').clicks, 0);
+});
+
+test("uses a same-tweet composer that appears just before the reply button click", async () => {
+  const p = page();
+  p.form.remove();
+  const button = addReplyButton(p);
+  p.f.onWait = () => {
+    p.f.onWait = null;
+    p.target.appendChild(p.form);
+  };
+  assert.equal(await p.api.openReplyComposer({actionDelayMs: 100}), p.box);
+  assert.equal(button.clicks, 0);
+});
+
+function addInlineReply(p) {
+  p.form.remove();
+  p.box.remove();
+  p.send.remove();
+  // X's native conversation editor uses a sibling container, and need not use a form.
+  p.column.appendChild(new Element("section", "当前任务"));
+  const inline = new Element("div", "", [p.box, p.send], {"data-testid": "inline_reply_offscreen"});
+  p.column.appendChild(inline);
+  return inline;
+}
+
+test("uses the native inline editor below the exact target with its own send button", async () => {
+  const p = page();
+  const button = addReplyButton(p);
+  addInlineReply(p);
+  p.column.appendChild(article(OTHER, "other", "Nearby reply", [
+    new Element("button", "Reply", [], {"data-testid": "tweetButtonInline"})
+  ]));
+  assert.equal(await p.api.openReplyComposer({actionDelayMs: 100}), p.box);
+  assert.equal(p.api.findSendButton(p.box), p.send);
+  assert.equal(button.clicks, 0);
+});
+
+test("accepts the native inline composer inserted by the target reply button", async () => {
+  const p = page();
+  p.form.remove();
+  const button = addReplyButton(p);
+  button.onClick = () => addInlineReply(p);
+  assert.equal(await p.api.openReplyComposer({actionDelayMs: 100}), p.box);
+  assert.equal(button.clicks, 1);
+});
+
+test("revalidates inline ownership when a different tweet appears before the editor", async () => {
+  const p = page();
+  const inline = addInlineReply(p);
+  assert.equal(await p.api.openReplyComposer({actionDelayMs: 100}), p.box);
+  p.column.replaceChildren(p.target, article(OTHER, "other", "Different tweet"), inline);
+  assert.throws(() => p.api.assertBoundReplyBox(p.box), /回复框已变化/);
+  assert.equal(p.api.findSendButton(p.box), null);
+  assert.equal(p.send.clicks, 0);
+});
+
+for (const scenario of ["other-tweet", "hidden-other-tweet", "generic-dialog", "two-editors", "second-inline-container", "other-route"]) {
+  test(`does not use an inline composer with ${scenario}`, () => {
+    const p = page();
+    const inline = addInlineReply(p);
+    if (scenario === "other-tweet" || scenario === "hidden-other-tweet") {
+      const other = article(OTHER, "other", "Other tweet");
+      other.hidden = scenario === "hidden-other-tweet";
+      p.column.replaceChildren(p.target, other, inline);
+    }
+    if (scenario === "generic-dialog") {
+      p.box.remove();
+      inline.appendChild(new Element("div", "", [p.box], {role: "dialog"}));
+    }
+    if (scenario === "two-editors" || scenario === "second-inline-container") {
+      const duplicate = new Element("div", "", [], {"data-testid": "tweetTextarea_0", contenteditable: "true"});
+      if (scenario === "two-editors") inline.appendChild(duplicate);
+      else p.column.appendChild(new Element("div", "", [duplicate], {"data-testid": "inline_reply_offscreen"}));
+    }
+    if (scenario === "other-route") p.location.href = OTHER;
+    assert.equal(p.api.getBoundReplyBox(), null);
+    assert.equal(p.api.findSendButton(p.box), null);
+    assert.equal(p.send.clicks, 0);
+  });
+}
+
+test("never picks a send button outside the bound inline editor", async () => {
+  const p = page();
+  addInlineReply(p);
+  p.send.remove();
+  p.column.appendChild(p.send);
+  assert.equal(await p.api.openReplyComposer({actionDelayMs: 100}), p.box);
+  assert.equal(p.api.findSendButton(p.box), null);
+  assert.equal(p.send.clicks, 0);
+});
+
+test("leaves an unbound visible composer untouched and reports why the reply is blocked", async () => {
+  const p = page();
+  p.form.remove();
+  p.column.appendChild(p.form);
+  const button = addReplyButton(p);
+  await assert.rejects(p.api.openReplyComposer({actionDelayMs: 100}), /已有回复框.*无法确认.*本单/);
+  assert.equal(button.clicks, 0);
+  assert.equal(p.api.findSendButton(p.box), null);
+});
+
+test("does not click an ambiguous reply control", async () => {
+  const p = page();
+  p.form.remove();
+  const first = addReplyButton(p);
+  const second = addReplyButton(p);
+  await assert.rejects(p.api.openReplyComposer({actionDelayMs: 100}), /多个.*回复按钮/);
+  assert.equal(first.clicks + second.clicks, 0);
 });
 
 for (const change of ["other-target", "duplicate-box", "nested-article", "removed-box", "generic-compose"]) {

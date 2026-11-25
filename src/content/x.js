@@ -1713,24 +1713,41 @@
     }, timeoutMs, "点赞状态未确认");
   }
 
-  async function openReplyComposer(settings) {
-    const existingComposer = getBoundReplyBox();
-    if (existingComposer) return existingComposer;
+  function readReplyEntry() {
+    const article = findBoundTargetArticle();
+    const composer = getBoundReplyBox(article);
+    if (composer) return { composer };
+    if (!article) return { reason: "未能从页面确认本单的唯一目标推文" };
+    if (Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"]')).some(isVisible)) {
+      return { reason: "X 页面已有回复框，但无法确认唯一回复框属于本单" };
+    }
+    const buttons = Array.from(article.querySelectorAll("[data-testid='reply']"))
+      .filter(button => button.closest("article") === article && isVisible(button) && !isButtonDisabled(button));
+    if (buttons.length === 1) return { button: buttons[0] };
+    return { reason: buttons.length ? "目标推文有多个可用回复按钮" : "目标推文没有可用的回复按钮" };
+  }
 
-    const getReplyButton = () => {
-      if (Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"]')).some(isVisible)) return null;
-      const article = findBoundTargetArticle();
-      const buttons = Array.from(article?.querySelectorAll("[data-testid='reply']") || [])
-        .filter(button => button.closest("article") === article && isVisible(button) && !isButtonDisabled(button));
-      return buttons.length === 1 ? buttons[0] : null;
-    };
-    const replyButton = await waitFor(getReplyButton, 15000, "未找到目标推文的唯一回复按钮");
+  async function openReplyComposer(settings) {
+    let entry;
+    await waitFor(() => {
+      entry = readReplyEntry();
+      return entry.composer || entry.button;
+    }, 15000, () => entry.reason);
+    if (entry.composer) return entry.composer;
+
+    const replyButton = entry.button;
     replyButton.scrollIntoView({ block: "center", inline: "center" });
     await wait(settings.actionDelayMs);
+    let composerAtClick;
     await clickElement(replyButton, { beforeClick() {
-      if (getReplyButton() !== replyButton) throw new Error("目标推文回复按钮已变化");
+      const current = readReplyEntry();
+      if (current.composer) {
+        composerAtClick = current.composer;
+        return false;
+      }
+      if (current.button !== replyButton) throw new Error(current.reason || "目标推文回复按钮已变化");
     } });
-    return findReplyBox({ timeoutMs: 12000 });
+    return composerAtClick || findReplyBox({ timeoutMs: 12000 });
   }
 
   async function fillReplyText(text, settings, textbox) {
@@ -1787,13 +1804,47 @@
     }
   }
 
-  function getBoundReplyBox() {
-    const article = findBoundTargetArticle();
-    const boxes = Array.from(article?.querySelectorAll('[data-testid="tweetTextarea_0"]') || [])
-      .map(resolveReplyComposer)
-      .filter(box => box.matches?.('[contenteditable="true"]') && box.closest("article") === article
-        && !hasAriaHiddenAncestor(box) && isVisible(box));
-    return new Set(boxes).size === 1 ? boxes[0] : null;
+  function findInlineReplyScope(article) {
+    const column = article.closest('[data-testid="primaryColumn"]');
+    if (!column) return null;
+    const selector = '[data-testid="inline_reply_offscreen"]';
+    let precedingArticle = null;
+    let scope = null;
+    for (const node of column.querySelectorAll(`article, ${selector}`)) {
+      if (node.closest('[data-testid="primaryColumn"]') !== column
+          || node.parentElement?.closest('article, [role="dialog"], [aria-modal="true"]')) continue;
+      if (node.matches("article")) {
+        // A hidden post still separates the target from any later editor.
+        precedingArticle = node;
+      } else if (isVisible(node) && !hasAriaHiddenAncestor(node)) {
+        if (scope || precedingArticle !== article) return null;
+        scope = node;
+      }
+    }
+    return scope;
+  }
+
+  function getBoundReplyEditor(article = findBoundTargetArticle()) {
+    if (!article) return null;
+    const matches = new Map();
+    const inline = findInlineReplyScope(article);
+    for (const scope of [article, inline].filter(Boolean)) {
+      const owner = scope === article ? article : null;
+      for (const node of scope.querySelectorAll('[data-testid="tweetTextarea_0"]')) {
+        const box = resolveReplyComposer(node);
+        if (box.matches?.('[contenteditable="true"]') && box.closest("article") === owner
+            && !box.closest('[role="dialog"], [aria-modal="true"]') && !hasAriaHiddenAncestor(box) && isVisible(box)) {
+          matches.set(box, scope);
+        }
+      }
+    }
+    if (matches.size !== 1) return null;
+    const [box, scope] = matches.entries().next().value;
+    return { box, scope };
+  }
+
+  function getBoundReplyBox(article) {
+    return getBoundReplyEditor(article)?.box || null;
   }
 
   function assertBoundReplyBox(input, expectedText) {
@@ -2185,15 +2236,17 @@
   }
 
   function findSendButton(replyBox) {
-    if (!replyBox || getBoundReplyBox() !== replyBox) return null;
+    const editor = getBoundReplyEditor();
+    if (!replyBox || editor?.box !== replyBox) return null;
     const article = replyBox.closest("article");
     const form = replyBox.closest("form");
-    const scope = form || article;
+    const scope = form && editor.scope.contains(form) ? form : editor.scope;
+    const inEditor = node => editor.scope.contains(node) && node.closest("article") === article
+      && node.closest("form") === form && !node.closest('[role="dialog"], [aria-modal="true"]');
     const candidates = Array.from(scope.querySelectorAll('[data-testid="tweetButtonInline"], [data-testid="tweetButton"]'))
-      .filter(node => node.closest("article") === article && node.closest("form") === form)
+      .filter(inEditor)
       .map(resolveClickableButtonNode)
-      .filter(node => node && node.closest("article") === article && node.closest("form") === form
-        && !hasAriaHiddenAncestor(node) && isVisible(node));
+      .filter(node => node && inEditor(node) && !hasAriaHiddenAncestor(node) && isVisible(node));
     return new Set(candidates).size === 1 ? candidates[0] : null;
   }
 
@@ -2404,7 +2457,8 @@
           return;
         }
         if (Date.now() - started > timeoutMs) {
-          reject(new Error(timeoutMessage || "等待页面状态超时"));
+          const message = typeof timeoutMessage === "function" ? timeoutMessage() : timeoutMessage;
+          reject(new Error(message || "等待页面状态超时"));
           return;
         }
         setTimeout(tick, 250);
@@ -2440,7 +2494,7 @@
     try {
       node.scrollIntoView({ block: "center", inline: "center" });
     } catch (_) {}
-    options.beforeClick?.();
+    if (options.beforeClick?.() === false) return;
     if (options.beforeClick) {
       // Do not replay a guarded action if dispatch throws after side effects.
       node.click();
