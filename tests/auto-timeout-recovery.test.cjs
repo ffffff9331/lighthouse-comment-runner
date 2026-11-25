@@ -434,3 +434,162 @@ test("deadline recovery releases the expired task's existing local exclusion",as
   w.advance(LIMIT);await w.tick();assert.equal(w.c.getActiveAttemptedTaskKeys().includes(task.taskKey),false);
   assert.equal(w.state().lastAutoRecovery.taskKey,task.taskKey);
 });
+
+async function acknowledgeResumedScan(w) {
+  const state = w.state();
+  const intent = { type: "START_LIGHTHOUSE_COMMENT_TASK", runId: state.runId, tabId: 11,
+    intentId: "resume-scan", checkpointRequired: true };
+  state.uncertainAction = intent;
+  const result = await w.c.recordLighthouseClaimCheckpoint({ phase: "ready", version: 1, runId: state.runId,
+    operationType: intent.type, claimIntentId: intent.intentId, instanceId: "after-reload" },
+    { tab: { id: 11 }, frameId: 0 });
+  assert.equal(result.ok, true);
+}
+
+test("a timed-out order retains its original stage, deadline and recovery result after STOP and worker restart", async () => {
+  const w = await worker();
+  w.state().stage = "lighthouse_verification_pending";
+  const wake = await worker({ saved: clone(w.state()) });
+  wake.advance(LIMIT);
+  await wake.tick();
+  await acknowledgeResumedScan(wake);
+  await wake.c.stopAndClearRun();
+  const restarted = await worker({ saved: wake.stored[KEY] });
+  assert.deepEqual(clone(restarted.state().autoRecoveryHistory || []), [{
+    taskKey: "order-123", title: "Fixture order", tweetId: "123",
+    stage: "lighthouse_verification_pending", deadlineAt: 2200000,
+    at: 2200000, updatedAt: 2200000, status: "recovered"
+  }]);
+  assert.equal(restarted.state().manuallyStopped, true);
+  assert.equal(restarted.state().completed, 0);
+});
+
+test("a failed reload and its successful retry after a worker restart share one recovery record", async () => {
+  const w = await worker();
+  w.hooks.reload = async () => { throw new Error("fixture private error details"); };
+  w.advance(LIMIT);
+  await w.tick();
+  const failed = clone(w.stored[KEY].autoRecoveryHistory || []);
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0].status, "retrying");
+  assert.doesNotMatch(JSON.stringify(failed), /private error details/);
+  const wake = await worker({ saved: w.stored[KEY] });
+  wake.advance(LIMIT + 60000);
+  await wake.tick();
+  await acknowledgeResumedScan(wake);
+  const records = clone(wake.stored[KEY].autoRecoveryHistory || []);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].taskKey, "order-123");
+  assert.equal(records[0].at, 2200000);
+  assert.equal(records[0].updatedAt, 2260000);
+  assert.equal(records[0].status, "recovered");
+});
+
+test("manual stop preserves interrupted recovery history without restarting the order", async () => {
+  const w = await worker();
+  w.hooks.reload = () => w.c.stopAndClearRun();
+  w.advance(LIMIT);
+  await w.tick();
+  assert.equal(w.scans.length, 0);
+  assert.equal(w.stored[KEY].autoRecoveryHistory?.[0]?.status, "stopped");
+  assert.equal(w.stored[KEY].autoRecoveryHistory?.[0]?.taskKey, "order-123");
+});
+
+test("the five newest timed-out orders survive idle recovery and an explicit fresh start", async () => {
+  const w = await worker();
+  for (let i = 1; i <= 6; i++) {
+    w.state().currentTask = { ...task, taskKey: "order-" + i, seatLocked: true };
+    w.advance(LIMIT);
+    await w.tick();
+  }
+  w.state().uncertainAction = { type: "START_LIGHTHOUSE_COMMENT_TASK", claimActionAttempted: false };
+  w.advance(LIMIT);
+  await w.tick();
+  await w.c.stopAndClearRun();
+  await w.c.startAutoRun({}, 1);
+  assert.deepEqual(clone(w.state().autoRecoveryHistory || []).map(r => r.taskKey),
+    ["order-6", "order-5", "order-4", "order-3", "order-2"]);
+});
+
+test("an upgrade retains the one legacy order without inventing a stage, deadline or result", async () => {
+  const w = await worker();
+  const legacy = clone(w.state());
+  delete legacy.autoRecoveryHistory;
+  legacy.lastAutoRecovery = { at: 1000000, taskKey: "older", task: { title: "Earlier order" },
+    tweetUrl: target, uncertainAction: { type: "RUN_X_REPLY", replyText: "not diagnostic data" } };
+  const wake = await worker({ saved: legacy });
+  assert.deepEqual(clone(wake.state().autoRecoveryHistory || []), [{
+    taskKey: "older", title: "Earlier order", tweetId: "123", stage: "",
+    deadlineAt: null, at: 1000000, updatedAt: 1000000, status: "legacy"
+  }]);
+});
+
+test("a draft candidate with an explicit no-click checkpoint does not count as a stuck order", async () => {
+  const w = await worker();
+  w.state().stage = "selecting_task";
+  w.state().uncertainAction.claimActionAttempted = false;
+  w.advance(LIMIT);
+  await w.tick();
+  assert.equal(w.scans.length, 1);
+  assert.deepEqual(clone(w.stored[KEY].autoRecoveryHistory || []), []);
+});
+
+test("stopping after the plaza reload but before dispatching the scan never archives a successful restart", async () => {
+  const w = await worker();
+  let checkpoint;
+  w.hooks.persist = async (values, callback) => {
+    const snapshot = values[KEY];
+    if (!checkpoint && !callback && snapshot.running && snapshot.autoRecovery?.deadlineAt === 3400000) {
+      checkpoint = clone(snapshot);
+      await w.c.stopAndClearRun();
+    }
+  };
+  w.advance(LIMIT);
+  await w.tick();
+  assert.equal(w.scans.length, 0);
+  assert.equal(checkpoint?.autoRecoveryHistory?.[0]?.status, "reloaded");
+  assert.notEqual(w.stored[KEY].autoRecoveryHistory?.[0]?.status, "recovered");
+  assert.equal(w.stored[KEY].manuallyStopped, true);
+});
+
+test("the compact history keeps the tweet ID without copying the task detail used by legacy deduplication", async () => {
+  const w = await worker();
+  w.state().currentTask = { ...task, taskKey: "Task details: fixture private metadata from the webpage" };
+  w.advance(LIMIT);
+  await w.tick();
+  const [entry] = clone(w.stored[KEY].autoRecoveryHistory || []);
+  assert.equal(entry.tweetId, "123");
+  assert.equal(entry.title, "Fixture order");
+  assert.doesNotMatch(JSON.stringify(entry), /fixture private metadata/);
+});
+
+test("a worker restart cannot turn a saved no-click candidate into a stuck order", async () => {
+  const w = await worker();
+  Object.assign(w.state(), { running: true, stage: "selecting_task" });
+  Object.assign(w.state().uncertainAction, { checkpointRequired: true, checkpointVersion: 1,
+    contentInstanceId: "before-reload", claimActionAttempted: false });
+  const wake = await worker({ saved: clone(w.state()) });
+  assert.equal(wake.state().uncertainAction, undefined);
+  wake.advance(LIMIT);
+  await wake.tick();
+  assert.deepEqual(clone(wake.stored[KEY].autoRecoveryHistory || []), []);
+});
+
+test("entering the selecting stage is not proof the new page runner is ready to scan", async () => {
+  const w = await worker();
+  w.hooks.scan = async () => { w.c.setStage("selecting_task"); };
+  w.advance(LIMIT);
+  await w.tick();
+  assert.equal(w.stored[KEY].autoRecoveryHistory?.[0]?.status, "reloaded");
+  await w.c.stopAndClearRun();
+  assert.equal(w.stored[KEY].autoRecoveryHistory?.[0]?.status, "stopped");
+});
+
+test("a planned stop before the new scanner is ready retires the pending recovery record", async () => {
+  const w = await worker();
+  w.hooks.scan = async () => { w.c.setStage("ai_key_required"); };
+  w.advance(LIMIT);
+  await w.tick();
+  assert.equal(w.state().autoRecovery, null);
+  assert.equal(w.stored[KEY].autoRecoveryHistory?.[0]?.status, "stopped");
+});

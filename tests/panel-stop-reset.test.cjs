@@ -528,3 +528,25 @@ test("a pre-stop countdown response arriving after restart cannot overwrite the 
   old.resolve({ ok: true, tasks: [{ ...task, taskKey: "late-old-order" }], timestamp: Date.now() }); await reading;
   assert.equal(p.read("countdownTasks[0].taskKey"), task.taskKey);
 });
+
+test("side-panel recovery history shows the empty state and displays task text safely after STOP", async () => {
+  const p = await panel({ stopped: true });
+  assert.equal(p.node("recoveryHistoryEmpty").hidden, false);
+  p.setState({ running: false, manuallyStopped: true, stage: "stopped", logs: [], autoRecoveryHistory: [{
+    taskKey: "order-123", title: "<img src=x onerror=alert(1)>", tweetId: "123",
+    stage: "lighthouse_verification_pending", at: 2200000, deadlineAt: 2199000,
+    status: "retrying", updatedAt: 2300000
+  }] });
+  await p.tick();
+  assert.equal(p.node("recoveryHistoryEmpty").hidden, true);
+  const [item] = p.node("recoveryHistoryList").children;
+  const allText = n => [n.textContent, ...n.children.map(allText)].join(" ");
+  assert.match(allText(item), /<img src=x onerror=alert\(1\)>/);
+  assert.match(allText(item), /123/);
+  assert.match(allText(item), /灯塔验证/);
+  assert.match(allText(item), /等待重试/);
+  assert.match(allText(item), /截止/);
+  assert.equal(item.innerHTML, "");
+  await p.tick();
+  assert.equal(p.node("recoveryHistoryList").children[0], item);
+});

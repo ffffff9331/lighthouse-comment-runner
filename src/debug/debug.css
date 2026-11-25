@@ -522,6 +522,38 @@ summary:focus-visible {
   padding: 10px;
 }
 
+.viewRecords {
+  gap: 10px;
+}
+
+.recoveryHistoryList {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.recoveryHistoryTitle,
+.recoveryHistoryStatus,
+.recoveryHistoryMeta,
+.recoveryHistoryEmpty {
+  margin: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
+
+.recoveryHistoryTitle,
+.recoveryHistoryStatus {
+  font-size: 12px;
+}
+
+.recoveryHistoryMeta,
+.recoveryHistoryEmpty {
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .recordToolbar {
   display: flex;
   align-items: center;

@@ -61,6 +61,8 @@ const runWindowHint = document.getElementById("runWindowHint");
 const countdownList = document.getElementById("countdownList");
 const countdownSyncTime = document.getElementById("countdownSyncTime");
 const logList = document.getElementById("logList");
+const recoveryHistoryList = document.getElementById("recoveryHistoryList");
+const recoveryHistoryEmpty = document.getElementById("recoveryHistoryEmpty");
 const replyRecordList = document.getElementById("replyRecordList");
 const replyRecordCount = document.getElementById("replyRecordCount");
 const viewButtons = Array.from(document.querySelectorAll("[data-view]"));
@@ -68,6 +70,7 @@ const viewPanels = Array.from(document.querySelectorAll("[data-view-panel]"));
 const stepButtons = Array.from(document.querySelectorAll(".quickActions [data-command]"));
 const saveBtn = document.getElementById("saveBtn");
 const commandStatus = document.getElementById("commandStatus");
+let recoveryHistorySignature;
 let settingsDirty = false;
 let settingsEditRevision = 0;
 let settingsSaving = false;
@@ -645,6 +648,7 @@ function renderState(state, settings = {}) {
   renderRunWindowHint(state, settingsDirty ? readSettings() : settings);
 
   logList.replaceChildren(...(state.logs || []).slice(0, 60).map(renderLogEntry));
+  renderRecoveryHistory(state.autoRecoveryHistory);
 }
 
 function renderRunModeHint(runMode) {
@@ -696,6 +700,57 @@ function renderLogEntry(entry) {
   const phase = formatLogPagePhase(entry.pagePhase);
   text.textContent = `[${entry.level || "info"}]${phase ? ` [${phase}]` : ""} ${entry.text}`;
   item.append(time, text);
+  return item;
+}
+
+function renderRecoveryHistory(history) {
+  const records = Array.isArray(history) ? history.slice(0, 5).filter(record => record && typeof record === "object") : [];
+  const signature = JSON.stringify(records);
+  if (signature === recoveryHistorySignature) return;
+  recoveryHistorySignature = signature;
+  recoveryHistoryEmpty.hidden = records.length > 0;
+  recoveryHistoryList.replaceChildren(...records.map(renderRecoveryHistoryItem));
+}
+
+function renderRecoveryHistoryItem(record) {
+  const labels = {
+    recovering: "恢复中", retrying: "恢复失败，等待重试", reloaded: "广场已重载，续扫未确认",
+    recovered: "已恢复扫描广场",
+    stopped: "恢复已停止", legacy: "旧版未记录结果"
+  };
+  const stages = {
+    selecting_task: "选择任务或等锁位", locking_seat: "锁定席位", action_result_unknown: "动作结果未确认",
+    locked_task_target_unavailable: "已锁位，X 目标不可用", waiting_x_ready: "等待 X 页面",
+    tweet_opened: "已打开 X", x_reply_failed: "X 互动失败", x_replied: "X 互动已执行",
+    x_task_completion_waiting: "等待 X 验证发奖", x_task_verification_pending: "X 验证结果待确认",
+    x_task_submitted: "X 已提交验证", lighthouse_verification_pending: "灯塔验证待确认",
+    lighthouse_completion_waiting: "等待灯塔确认完成", verification_pending: "灯塔验证待确认",
+    lighthouse_official_completion_detected: "灯塔已确认，待返回广场", campaigns_reload_failed: "广场加载未完成"
+  };
+  const item = document.createElement("li");
+  item.className = "replyRecordItem";
+  const title = document.createElement("strong");
+  title.className = "recoveryHistoryTitle";
+  title.textContent = record.title || "灯塔任务";
+  const status = document.createElement("p");
+  status.className = "recoveryHistoryStatus";
+  status.textContent = Object.hasOwn(labels, record.status) ? labels[record.status] : "结果未记录";
+  const meta = document.createElement("p");
+  meta.className = "recoveryHistoryMeta";
+  const stage = Object.hasOwn(stages, record.stage) ? stages[record.stage] : record.stage || "未记录";
+  meta.textContent = [
+    record.taskKey && `任务 ${record.taskKey}`,
+    record.tweetId && `推文 ${record.tweetId}`,
+    `卡在：${stage}`
+  ].filter(Boolean).join(" / ");
+  const timing = document.createElement("p");
+  timing.className = "recoveryHistoryMeta";
+  timing.textContent = [
+    Number.isFinite(record.deadlineAt) && `截止 ${formatDateTime(record.deadlineAt)}`,
+    Number.isFinite(record.at) && `${record.status === "legacy" ? "旧版记录" : "发现"} ${formatDateTime(record.at)}`,
+    Number.isFinite(record.updatedAt) && record.updatedAt !== record.at && `更新 ${formatDateTime(record.updatedAt)}`
+  ].filter(Boolean).join(" / ");
+  item.append(title, status, meta, timing);
   return item;
 }
 

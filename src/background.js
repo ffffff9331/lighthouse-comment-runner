@@ -13,6 +13,7 @@ const CAMPAIGNS_IDLE_RELOAD_ALARM = "lighthouseCampaignsIdleReloadV1";
 const AUTO_RECOVERY_ALARM = "lighthouseAutoRecoveryV1";
 const AUTO_RECOVERY_TIMEOUT_MS = 20 * 60 * 1000;
 const AUTO_RECOVERY_RECHECK_MS = 60 * 1000;
+const MAX_AUTO_RECOVERY_HISTORY = 5;
 const SITE_X_OPEN_WAIT_MS = 5000;
 const LIGHTHOUSE_PREVIOUS_DEFAULT_AI_SYSTEM_PROMPT = "根据原推文写一句自然的中文回复。像真实用户刷到后随手留下的感受，简短、有一点具体反应，不必完整表达观点。10到15个汉字为主，可保留必要的英文词。避免宣传腔、总结腔、夸张吹捧、复述原文和模板化感叹。只输出回复。";
 const LIGHTHOUSE_DEFAULT_AI_SYSTEM_PROMPT = "根据原推文写一句自然的中文回复。像真实用户刷到后随手留下的感受，简短、有一点具体反应，不必完整表达观点。5到20个汉字为主，可保留必要的英文词。避免宣传腔、总结腔、夸张吹捧、复述原文和模板化感叹。只输出回复。";
@@ -523,7 +524,7 @@ async function stopAndClearRun() {
   const previousRun = runtimeState;
   const stopEpoch = ++manualDebugCommandEpoch;
   runtimeState = {
-    ...createInitialState(),
+    ...createInitialState(previousRun),
     // Keep the cancellation target until its acknowledgements settle.
     runId: previousRun.runId,
     stopEpoch: Number(previousRun.stopEpoch || 0) + 1,
@@ -991,7 +992,7 @@ async function startAutoRun(options, windowId = null, manualRestart = false) {
     return { ok: false, error: "旧订单尚未核对，请先确认本单结果，不能清空后接新单", state: runtimeState };
   }
   const previousRun = runtimeState;
-  runtimeState = createInitialState();
+  runtimeState = createInitialState(previousRun);
   runtimeState.manuallyStopped = Boolean(previousRun.manuallyStopped);
   runtimeState.stopEpoch = previousRun.stopEpoch;
   setRuntimeWindow(windowId);
@@ -1313,7 +1314,7 @@ async function debugOpenCampaigns(windowId = null) {
   if (runtimeState.uncertainAction || ((runtimeState.currentTask?.invitationAccepted || runtimeState.currentTask?.seatLocked || runtimeState.currentTask?.seatLockedAt || runtimeState.currentTask?.claimed) && !hasLatchedLighthouseCompletion(runtimeState.completionEvidence?.runId))) {
     return { ok: false, error: "旧订单尚未核对，已保留当前订单和页面", state: runtimeState };
   }
-  runtimeState = createInitialState();
+  runtimeState = createInitialState(runtimeState);
   setRuntimeWindow(windowId);
   runtimeState.runId = createRunId();
   runtimeState.running = true;
@@ -1509,7 +1510,7 @@ async function debugFastXClaimReplyVerify(selectedTask = null, windowId = null) 
   const keyFailure = blockRunWithoutAIKey(settings, selectedTask);
   if (keyFailure) return keyFailure;
   const selected = selectedTask ? { ...selectedTask } : null;
-  runtimeState = createInitialState();
+  runtimeState = createInitialState(requestedState);
   runtimeState.stopEpoch = requestedState.stopEpoch;
   setRuntimeWindow(windowId);
   runtimeState.running = true;
@@ -1646,7 +1647,7 @@ async function startSelectedCountdownTask(selectedTask = null, windowId = null) 
 
 async function runSelectedCountdownTask(selectedTask = null, windowId = null) {
   const previous = runtimeState;
-  runtimeState = createInitialState();
+  runtimeState = createInitialState(previous);
   runtimeState.stopEpoch = previous.stopEpoch;
   runtimeState.manuallyStopped = Boolean(previous.manuallyStopped);
   setRuntimeWindow(windowId);
@@ -3661,6 +3662,14 @@ async function recordLighthouseClaimCheckpoint(message, sender) {
     const invitation = validateLighthouseInvitationCheckpoint(message, state, intent);
     if (!invitation.ok) return invitation;
   }
+  const scanHistoryDeadlineAt = state.autoRecovery?.scanHistoryDeadlineAt;
+  if (message.phase === "ready" && state.mode === "auto" && intent.type === "START_LIGHTHOUSE_COMMENT_TASK"
+      && Number.isFinite(scanHistoryDeadlineAt)) {
+    // The reloaded page has confirmed that its fresh scan owns this command.
+    state.autoRecoveryHistory = updateRecoveryHistory(state, scanHistoryDeadlineAt, "recovered");
+    delete state.autoRecovery.scanHistoryDeadlineAt;
+    persistAutoRunState();
+  }
   const claimDeadlineAt = beforeClick && state.mode === "auto" ? state.autoRecovery?.deadlineAt : undefined;
   return { ok: true, checkpointRegistered: true, permitClaimClick: beforeClick,
     ...(Number.isFinite(claimDeadlineAt) ? { claimDeadlineAt } : {}),
@@ -4393,7 +4402,7 @@ async function waitForTabClosed(tabId, timeoutMs = 5000) {
   return false;
 }
 
-function createInitialState() {
+function createInitialState(previous = null) {
   return {
     running: false,
     mode: "idle",
@@ -4419,6 +4428,7 @@ function createInitialState() {
     countedTaskAttempt: null,
     lastProgressAt: Date.now(),
     autoRecovery: null,
+    autoRecoveryHistory: previous ? stopPendingRecoveryHistory(previous) : [],
     runId: createRunId(),
     logs: []
   };
@@ -5362,6 +5372,7 @@ function setStage(stage) {
   if (runtimeState.manuallyStopped) return;
   runtimeState.stage = stage;
   if (runtimeState.autoRecovery && isPlannedAutoStop(stage)) {
+    runtimeState.autoRecoveryHistory = stopPendingRecoveryHistory(runtimeState);
     runtimeState.autoRecovery = null;
     void chrome.alarms.clear(AUTO_RECOVERY_ALARM);
   }
@@ -5389,6 +5400,7 @@ async function restoreAutoRunState() {
     const stored = await chrome.storage.local.get([AUTO_RUN_STATE_KEY]);
     const saved = stored[AUTO_RUN_STATE_KEY];
     if (!saved || typeof saved !== "object") return;
+    const autoRecoveryHistory = restoreRecoveryHistory(saved);
     let sessionStop = null;
     try {
       if (!saved.manuallyStopped) sessionStop = await chrome.storage.session?.get?.(["lighthouseStoppedRunId"]);
@@ -5398,6 +5410,7 @@ async function restoreAutoRunState() {
       runtimeState = {
         ...createInitialState(), ...saved, running: false, mode: "idle",
         stage: "stopped", autoRecovery: null, pendingXOpen: null,
+        autoRecoveryHistory: stopPendingRecoveryHistory({ ...saved, autoRecoveryHistory }),
         marketplaceRefreshInFlight: false,
         logs: Array.isArray(saved.logs) ? saved.logs.slice(0, 120) : [],
         runId: saved.runId || createRunId()
@@ -5406,7 +5419,11 @@ async function restoreAutoRunState() {
       return;
     }
     if (saved.manuallyStopped || (saved.runId && saved.runId === sessionStop?.lighthouseStoppedRunId)) {
-      runtimeState = { ...createInitialState(), manuallyStopped: true, stage: "stopped", runId: saved.runId || createRunId(), stopEpoch: saved.stopEpoch, logs: Array.isArray(saved.logs) ? saved.logs.filter(entry => entry.text === "已停止运行").slice(0, 1) : [] };
+      runtimeState = {
+        ...createInitialState({ ...saved, autoRecoveryHistory }),
+        manuallyStopped: true, stage: "stopped", runId: saved.runId || createRunId(), stopEpoch: saved.stopEpoch,
+        logs: Array.isArray(saved.logs) ? saved.logs.filter(entry => entry.text === "已停止运行").slice(0, 1) : []
+      };
       return;
     }
     const resumableScan = canResumeInterruptedClaimScan(saved.uncertainAction, saved);
@@ -5419,6 +5436,8 @@ async function restoreAutoRunState() {
       mode: "idle",
       stage: mayResume ? "interrupted_not_resumed" : "stopped",
       resumeMode: saved.mode,
+      autoRecoveryHistory,
+      interruptedRecoveryStage: recoverySourceStage(saved),
       logs: Array.isArray(saved.logs) ? saved.logs.slice(0, 120) : [],
       pendingXOpen: null,
       // Only the live worker owns a refresh; no in-flight operation survives
@@ -5533,11 +5552,12 @@ async function ensureAutoRecoveryAlarm() {
   });
 }
 
-async function resetAutoRecoveryDeadline() {
+async function resetAutoRecoveryDeadline(scanHistoryDeadlineAt = null) {
   if (runtimeState.manuallyStopped || !runtimeState.running || runtimeState.mode !== "auto") return;
   const state = runtimeState;
   const runId = state.runId;
-  runtimeState.autoRecovery = { mode: "auto", deadlineAt: Date.now() + AUTO_RECOVERY_TIMEOUT_MS };
+  runtimeState.autoRecovery = { mode: "auto", deadlineAt: Date.now() + AUTO_RECOVERY_TIMEOUT_MS,
+    ...(Number.isFinite(scanHistoryDeadlineAt) ? { scanHistoryDeadlineAt } : {}) };
   await persistAutoRunState(true);
   if (runtimeState !== state || state.runId !== runId || state.manuallyStopped) { await persistAutoRunState(true); return; }
   await ensureAutoRecoveryAlarm();
@@ -5550,6 +5570,66 @@ async function readAutoRecoveryMessage(tabId, payload) {
       new Promise(resolve => { timer = setTimeout(() => resolve(null), 2500); })]);
   } catch (_) { return null; }
   finally { clearTimeout(timer); }
+}
+
+function recoverySourceStage(state) {
+  return ["stopped", "interrupted_not_resumed"].includes(state.stage) ? state.interruptedRecoveryStage || "" : state.stage;
+}
+
+function recoveryIdentity(task, taskKey, tweetUrl) {
+  const text = (value, limit) => typeof value === "string" ? value.trim().slice(0, limit) : "";
+  return {
+    // Some old dedupe keys contain the entire task detail rather than an ID.
+    taskKey: typeof taskKey === "string" && /^[a-z0-9_-]{1,64}$/i.test(taskKey) ? taskKey : "",
+    title: text(task?.title || task?.candidateTitle, 160),
+    tweetId: normalizeTweetUrl(tweetUrl, true).split("/").pop().slice(0, 32)
+  };
+}
+
+function restoreRecoveryHistory(saved) {
+  if (Array.isArray(saved.autoRecoveryHistory)) return saved.autoRecoveryHistory.slice(0, MAX_AUTO_RECOVERY_HISTORY);
+  const legacy = saved.lastAutoRecovery;
+  if (!Number.isFinite(legacy?.at)) return [];
+  const identity = recoveryIdentity(legacy.task, legacy.taskKey, legacy.tweetUrl);
+  return legacy.taskKey || identity.tweetId ? [
+    { ...identity, stage: "", deadlineAt: null, at: legacy.at, updatedAt: legacy.at, status: "legacy" }
+  ] : [];
+}
+
+function updateRecoveryHistory(state, deadlineAt, status) {
+  const history = state.autoRecoveryHistory;
+  if (!Number.isFinite(deadlineAt) || !history.some(entry => entry?.deadlineAt === deadlineAt)) return history;
+  return history.map(entry => entry?.deadlineAt === deadlineAt ? { ...entry, status, updatedAt: Date.now() } : entry);
+}
+
+function stopPendingRecoveryHistory(state) {
+  const deadlineAt = state.autoRecovery?.scanHistoryDeadlineAt ?? state.autoRecovery?.deadlineAt;
+  const history = state.autoRecoveryHistory;
+  if (!Number.isFinite(deadlineAt)
+      || !history.some(entry => entry?.deadlineAt === deadlineAt && ["recovering", "retrying", "reloaded"].includes(entry.status))) return history;
+  return updateRecoveryHistory(state, deadlineAt, "stopped");
+}
+
+function recordTimedOutOrderRecovery(state, prior, deadlineAt) {
+  if (state.autoRecoveryHistory.some(entry => entry?.deadlineAt === deadlineAt)) {
+    state.autoRecoveryHistory = updateRecoveryHistory(state, deadlineAt, "recovering");
+    return;
+  }
+  const task = prior.currentTask || prior.selectedTask;
+  const intent = prior.uncertainAction;
+  const taskKey = task?.taskKey || intent?.taskKey;
+  const identity = recoveryIdentity(task, taskKey, task?.tweetUrl);
+  const identifiedLegacyIntent = intent && intent.checkpointRequired !== true
+    && intent.claimActionAttempted !== false && (taskKey || identity.tweetId);
+  // A candidate can exist before any click, including after the worker
+  // revokes an old no-click checkpoint. Require evidence of an order or action.
+  if (!task?.invitationAccepted && !task?.claimed && !task?.seatLocked && !task?.seatLockedAt
+      && !prior.lastXResult && !prior.completionEvidence && intent?.claimActionAttempted !== true
+      && !identifiedLegacyIntent) return;
+  const at = Date.now();
+  const entry = { ...identity, stage: String(recoverySourceStage(prior) || "").slice(0, 80),
+    deadlineAt, at, updatedAt: at, status: "recovering" };
+  state.autoRecoveryHistory = [entry, ...state.autoRecoveryHistory].slice(0, MAX_AUTO_RECOVERY_HISTORY);
 }
 
 function retainTimedOutOrder(state, prior) {
@@ -5590,6 +5670,7 @@ async function recoverTimedOutAutoRun() {
     claimReconciliation = null;
     try {
       retainTimedOutOrder(state, prior);
+      recordTimedOutOrderRecovery(state, prior, recovery.deadlineAt);
       await persistAutoRunState(true);
       if (!current()) { await persistAutoRunState(true); return; }
       await ensureAutoRecoveryAlarm();
@@ -5634,7 +5715,10 @@ async function recoverTimedOutAutoRun() {
       state.xTabId = null; state.xTabWindowId = null;
       state.marketplaceRefreshInFlight = false; state.running = true; state.mode = "auto";
       state.lastProgressAt = Date.now();
-      try { await resetAutoRecoveryDeadline(); }
+      const history = updateRecoveryHistory(state, recovery.deadlineAt, "reloaded");
+      const scanHistoryDeadlineAt = history !== state.autoRecoveryHistory ? recovery.deadlineAt : null;
+      state.autoRecoveryHistory = history;
+      try { await resetAutoRecoveryDeadline(scanHistoryDeadlineAt); }
       catch (error) {
         if (current()) { state.running=false;state.currentTask=task;state.uncertainAction=intent;state.lastXResult=prior.lastXResult;state.completionEvidence=prior.completionEvidence;state.xTabId=prior.xTabId; }
         throw error;
@@ -5653,6 +5737,7 @@ async function recoverTimedOutAutoRun() {
         if (!current() || state.autoRecovery !== scanRecovery) return;
         state.running = false;
         state.autoRecovery = { ...recovery, nextAttemptAt: Date.now() + AUTO_RECOVERY_RECHECK_MS };
+        state.autoRecoveryHistory = updateRecoveryHistory(state, recovery.deadlineAt, "retrying");
         setStage("auto_timeout_recovery_failed");
         log("error", `恢复扫描失败，按恢复计时再次尝试：${error.message || error}`);
         void ensureAutoRecoveryAlarm().catch(() => {});
@@ -5661,6 +5746,7 @@ async function recoverTimedOutAutoRun() {
       if (!current()) return;
       state.running = false;
       state.autoRecovery = {...recovery,nextAttemptAt:Date.now()+AUTO_RECOVERY_RECHECK_MS};
+      state.autoRecoveryHistory = updateRecoveryHistory(state, recovery.deadlineAt, "retrying");
       setStage("auto_timeout_recovery_waiting");
       log("warn", `20 分钟恢复暂未完成，一分钟后重试：${error.message || error}`);
       await ensureAutoRecoveryAlarm();
