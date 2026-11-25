@@ -1808,6 +1808,7 @@
     const column = article.closest('[data-testid="primaryColumn"]');
     if (!column) return null;
     const selector = '[data-testid="inline_reply_offscreen"]';
+    const composerControls = '[data-testid="tweetTextarea_0"], [data-testid="tweetButtonInline"], [data-testid="tweetButton"], [contenteditable], [role="textbox"], textarea, input';
     let precedingArticle = null;
     let scope = null;
     for (const node of column.querySelectorAll(`article, ${selector}`)) {
@@ -1817,6 +1818,8 @@
         // A hidden post still separates the target from any later editor.
         precedingArticle = node;
       } else if (isVisible(node) && !hasAriaHiddenAncestor(node)) {
+        // An empty placeholder is not a competing composer.
+        if (!node.matches(composerControls) && !node.querySelector(composerControls)) continue;
         if (scope || precedingArticle !== article) return null;
         scope = node;
       }
