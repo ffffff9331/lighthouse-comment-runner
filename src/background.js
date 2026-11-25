@@ -3604,6 +3604,8 @@ async function recordLighthouseClaimCheckpoint(message, sender) {
   const intent = state.uncertainAction;
   const ownsIntent = () => runtimeState === state && state.running && !state.manuallyStopped
     && state.runId === message.runId && state.uncertainAction === intent;
+  const beforeClick = message.phase === "before_click";
+  const claimDeadlineExpired = () => state.mode === "auto" && state.autoRecovery?.deadlineAt <= Date.now();
   if (!intent || !ownsIntent() || intent.checkpointRequired !== true || message.version !== 1
       || !message.instanceId || sender?.tab?.id !== intent.tabId || (sender.frameId ?? 0) !== 0
       || message.runId !== intent.runId || message.operationType !== intent.type
@@ -3619,13 +3621,13 @@ async function recordLighthouseClaimCheckpoint(message, sender) {
       intent.contentInstanceId = message.instanceId;
       intent.claimActionAttempted = false;
     }
-  } else if (message.phase === "before_click" && intent.checkpointVersion === 1
+  } else if (beforeClick && intent.checkpointVersion === 1
       && intent.contentInstanceId === message.instanceId) {
     let invitation = Object.hasOwn(message, "invitationTask")
       ? validateLighthouseInvitationCheckpoint(message, state, intent) : null;
     if (invitation && !invitation.ok) return invitation;
     const settings = await getSettings();
-    if (!ownsIntent()) return { ok: false, cancelled: true };
+    if (!ownsIntent() || claimDeadlineExpired()) return { ok: false, cancelled: true };
     if (invitation) {
       invitation = validateLighthouseInvitationCheckpoint(message, state, intent);
       if (!invitation.ok) return invitation;
@@ -3640,19 +3642,28 @@ async function recordLighthouseClaimCheckpoint(message, sender) {
     }
     // Set in memory before yielding, then persist before acknowledging. A
     // refresh during either await must never release an authorized click.
+    const firstClaimClick = intent.claimActionAttempted !== true;
     intent.claimActionAttempted = true;
-    if (state.mode === "auto") await resetAutoRecoveryDeadline();
+    // One automatic claim command handles one candidate. Invitation, lock,
+    // and confirmation clicks share that command's original deadline.
+    if (firstClaimClick && state.mode === "auto") await resetAutoRecoveryDeadline();
     if (!ownsIntent()) return { ok: false, cancelled: true };
   } else {
     return { ok: false, error: "接单检查点未就绪，未允许点击" };
   }
   await persistAutoRunState(true);
-  if (!ownsIntent()) return { ok: false, cancelled: true };
-  if (message.phase === "before_click" && Object.hasOwn(message, "invitationTask")) {
+  if (!ownsIntent()) {
+    if (beforeClick) await persistAutoRunState(true);
+    return { ok: false, cancelled: true };
+  }
+  if (beforeClick && claimDeadlineExpired()) return { ok: false, cancelled: true };
+  if (beforeClick && Object.hasOwn(message, "invitationTask")) {
     const invitation = validateLighthouseInvitationCheckpoint(message, state, intent);
     if (!invitation.ok) return invitation;
   }
-  return { ok: true, checkpointRegistered: true, permitClaimClick: message.phase === "before_click",
+  const claimDeadlineAt = beforeClick && state.mode === "auto" ? state.autoRecovery?.deadlineAt : undefined;
+  return { ok: true, checkpointRegistered: true, permitClaimClick: beforeClick,
+    ...(Number.isFinite(claimDeadlineAt) ? { claimDeadlineAt } : {}),
     claimIntentId: intent.intentId, instanceId: intent.contentInstanceId };
 }
 
@@ -5629,6 +5640,7 @@ async function recoverTimedOutAutoRun() {
         throw error;
       }
       if (!current()) return;
+      const scanRecovery = state.autoRecovery;
       setStage("auto_timeout_recovered");
       log("info", "20 分钟自动恢复完成：旧单记录已保留，重新扫描任务广场；未补发评论或补交验证");
       await ensureAutoRunKeepalive();
@@ -5636,7 +5648,9 @@ async function recoverTimedOutAutoRun() {
       void startNextAutoTask("after_twenty_minute_recovery").then(result => {
         if (current() && result?.ok === false && !result.cancelled) throw new Error(result.error || result.message || "流程未能接续");
       }).catch(error => {
-        if (!current()) return;
+        // The scan promise can outlive the first new claim. Only retry the
+        // old recovery if this is still the scan's original idle deadline.
+        if (!current() || state.autoRecovery !== scanRecovery) return;
         state.running = false;
         state.autoRecovery = { ...recovery, nextAttemptAt: Date.now() + AUTO_RECOVERY_RECHECK_MS };
         setStage("auto_timeout_recovery_failed");

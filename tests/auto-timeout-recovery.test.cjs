@@ -79,7 +79,7 @@ async function worker(options = {}) {
   Object.assign(c,{publishLighthouseMonitorSnapshot(){},ensureContentScriptInjected:async()=>options.injectOk!==false,waitForTabComplete:async()=>options.loadOk!==false,
     delay:async ms=>{now+=ms;},
     getSettings:async()=>({aiApiKey:"fixture",replyMode:"post",autoSubmitLighthouse:true,maxTasksPerRun:9999,maxTaskAttempts:9999,runWindowEnabled:false}),
-    startNextAutoTask:async reason=>{scans.push(reason);return {ok:true};},
+    startNextAutoTask:async reason=>{scans.push(reason);return await hooks.scan?.(reason) ?? {ok:true};},
     handleLighthouseDone:async()=>{done.push(true);return {ok:true};},
     resumeReconciledClaim:async()=>{scans.push("resume-original");return {ok:true};}});
   if(!options.saved)vm.runInContext(`Object.assign(runtimeState,{running:false,mode:"auto",stage:"action_result_unknown",runId:"old-run",lighthouseTabId:11,runtimeWindowId:1,lighthouseWindowId:1,lastProgressAt:1000000,currentTask:${JSON.stringify(task)},uncertainAction:{type:"START_LIGHTHOUSE_COMMENT_TASK",runId:"old-run",tabId:11,intentId:"intent"},autoRecovery:{deadlineAt:1000000+${LIMIT},mode:"auto"}})`,c);
@@ -239,15 +239,157 @@ test("recovery detaches stale worker promises so they cannot block a new flow",a
   assert.equal(vm.runInContext('claimReconciliation',w.c),null);
 });
 
-async function nextClaim(w, claimTask, invitation = false) {
+function prepareClaim(w, claimTask, invitation = false, intentId = "new-intent") {
   const state=w.state();state.running=true;state.currentTask=invitation?null:claimTask;
-  state.uncertainAction={type:"START_LIGHTHOUSE_COMMENT_TASK",runId:state.runId,tabId:11,intentId:"new-intent",
+  state.uncertainAction={type:"START_LIGHTHOUSE_COMMENT_TASK",runId:state.runId,tabId:11,intentId,
     checkpointRequired:true,checkpointVersion:1,contentInstanceId:"new-page",claimActionAttempted:false};
   const message={phase:"before_click",version:1,instanceId:"new-page",runId:state.runId,
-    operationType:"START_LIGHTHOUSE_COMMENT_TASK",claimIntentId:"new-intent"};
+    operationType:"START_LIGHTHOUSE_COMMENT_TASK",claimIntentId:intentId};
   if(invitation)message.invitationTask=claimTask;
-  return w.c.recordLighthouseClaimCheckpoint(message,{tab:{id:11},frameId:0});
+  return () => w.c.recordLighthouseClaimCheckpoint(message,{tab:{id:11},frameId:0});
 }
+const nextClaim = (w, claimTask, invitation = false) => prepareClaim(w, claimTask, invitation)();
+
+test("invitation acceptance and lock share the original deadline across worker restart", async () => {
+  const w = await worker();
+  const tweetUrl = "https://x.com/i/status/123";
+  const invitation = { source: "lighthouse_invitation", taskKey: `invitation:${tweetUrl}`, tweetUrl, taskType: "评论" };
+  const checkpoint = prepareClaim(w, invitation, true);
+  w.advance(60000);
+  assert.equal((await checkpoint()).permitClaimClick, true);
+  const deadline = 1060000 + LIMIT;
+  assert.equal(w.stored[KEY].autoRecovery.deadlineAt, deadline);
+  w.advance(90000);
+  assert.equal((await checkpoint()).permitClaimClick, true);
+  assert.equal(w.stored[KEY].autoRecovery.deadlineAt, deadline);
+  assert.equal(w.alarms.get(ALARM).when, deadline);
+
+  const restored = await worker({ saved: w.stored[KEY], activeCount: 1 });
+  assert.equal(restored.alarms.get(ALARM).when, deadline);
+  restored.advance(60000 + LIMIT - 1);
+  await restored.tick();
+  assert.equal(restored.scans.length, 0);
+  restored.advance(1);
+  await restored.tick();
+  assert.equal(restored.scans.length, 1);
+  assert.equal(restored.stored[KEY].lastAutoRecovery.taskKey, invitation.taskKey);
+  assert.equal(restored.state().completed, 0);
+  assert.equal(restored.sent.some(m => /REPLY|VERIFY|SUBMIT/.test(m.type)), false);
+});
+
+test("a late lock checkpoint cannot renew an expired claim before the alarm runs", async () => {
+  const w = await worker();
+  const checkpoint = prepareClaim(w, task);
+  assert.equal((await checkpoint()).permitClaimClick, true);
+  w.advance(LIMIT);
+  assert.equal((await checkpoint()).ok, false);
+  assert.equal(w.stored[KEY].autoRecovery.deadlineAt, 1000000 + LIMIT);
+  await w.tick();
+  assert.equal(w.scans.length, 1);
+});
+
+test("a checkpoint saved at the deadline cannot grant a late click", async () => {
+  const w = await worker();
+  const checkpoint = prepareClaim(w, task);
+  assert.equal((await checkpoint()).permitClaimClick, true);
+  w.advance(LIMIT - 1);
+  w.hooks.persist = async () => { w.advance(1); };
+  assert.equal((await checkpoint()).ok, false);
+  assert.equal(w.stored[KEY].autoRecovery.deadlineAt, 1000000 + LIMIT);
+});
+
+test("concurrent checkpoints keep the first deadline even if persistence overlaps", async () => {
+  const w = await worker();
+  const checkpoint = prepareClaim(w, task);
+  let entered, release;
+  const writing = new Promise(resolve => { entered = resolve; });
+  const blocked = new Promise(resolve => { release = resolve; });
+  w.hooks.persist = async () => {
+    w.hooks.persist = null;
+    entered();
+    await blocked;
+  };
+  const first = checkpoint();
+  await writing;
+  w.advance(120000);
+  try {
+    assert.equal((await checkpoint()).permitClaimClick, true);
+    assert.equal(w.stored[KEY].autoRecovery.deadlineAt, 1000000 + LIMIT);
+  } finally {
+    release();
+    await first;
+  }
+  assert.equal(w.alarms.get(ALARM).when, 1000000 + LIMIT);
+});
+
+test("STOP while a later click waits for storage cannot revive the old claim", async () => {
+  const w = await worker();
+  const checkpoint = prepareClaim(w, task);
+  assert.equal((await checkpoint()).permitClaimClick, true);
+  let entered, release;
+  const writing = new Promise(resolve => { entered = resolve; });
+  const blocked = new Promise(resolve => { release = resolve; });
+  w.hooks.persist = async () => {
+    w.hooks.persist = null;
+    entered();
+    await blocked;
+  };
+  const pending = checkpoint();
+  await writing;
+  try {
+    assert.equal((await w.c.stopAndClearRun()).ok, true);
+  } finally {
+    release();
+  }
+  assert.equal((await pending).ok, false);
+  assert.equal(w.stored[KEY].manuallyStopped, true);
+  assert.equal(w.alarms.has(ALARM), false);
+  w.advance(LIMIT * 2);
+  await w.tick();
+  assert.equal(w.scans.length, 0);
+});
+
+test("a new claim intent for a recurring task gets its own full deadline", async () => {
+  const w = await worker();
+  assert.equal((await nextClaim(w, task)).permitClaimClick, true);
+  // A previous attempt was released after a conclusive no-order receipt.
+  w.state().uncertainAction = null;
+  w.state().currentTask = null;
+  w.advance(90000);
+  assert.equal((await prepareClaim(w, task, false, "later-intent")()).permitClaimClick, true);
+  assert.equal(w.stored[KEY].autoRecovery.deadlineAt, 1090000 + LIMIT);
+});
+
+test("failure on the next order cannot replace its deadline with the expired order's", async () => {
+  const w = await worker();
+  const nextTask = { ...task, taskKey: "next-order", tweetUrl: "https://x.com/fixture/status/456" };
+  w.hooks.scan = async () => {
+    w.advance(30000);
+    assert.equal((await nextClaim(w, nextTask)).permitClaimClick, true);
+    w.state().currentTask = { ...nextTask, seatLocked: true };
+    w.state().uncertainAction = null;
+    return w.c.recoverAndContinue("X result unknown", { runId: w.state().runId, preserveOrder: true });
+  };
+  w.advance(LIMIT);
+  await w.tick();
+  await new Promise(setImmediate);
+  assert.equal(w.state().stage, "locked_task_recovery_blocked");
+  assert.equal(w.stored[KEY].autoRecovery.deadlineAt, 1030000 + 2 * LIMIT);
+  w.advance(60000);
+  await w.tick();
+  assert.equal(w.scans.length, 1);
+});
+
+test("a failed marketplace restart before any new claim still schedules a recovery retry", async () => {
+  const w = await worker();
+  w.hooks.scan = async () => ({ ok: false, error: "marketplace unavailable" });
+  w.advance(LIMIT);
+  await w.tick();
+  await new Promise(setImmediate);
+  assert.equal(w.state().stage, "auto_timeout_recovery_failed");
+  assert.equal(w.alarms.get(ALARM).when, 1060000 + LIMIT);
+});
+
 test("a newly available task is not blocked by the expired prior order",async()=>{
   const w=await worker();w.advance(LIMIT);await w.tick();
   const result=await nextClaim(w,task);assert.equal(result.ok,true);assert.equal(w.state().uncertainAction.claimActionAttempted,true);

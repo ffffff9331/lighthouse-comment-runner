@@ -491,6 +491,25 @@ test("invitation expiration during its persistent checkpoint prevents the accept
   assert.equal(p.f.lock?.clicks || 0, 0);
 });
 
+test("a lock permit delivered at the twenty-minute deadline cannot click the old order", async () => {
+  const p = page();
+  const send = p.c.chrome.runtime.sendMessage;
+  p.c.chrome.runtime.sendMessage = async message => {
+    const receipt = await send(message);
+    if (message.type !== "LIGHTHOUSE_CLAIM_CHECKPOINT" || message.phase !== "before_click"
+        || p.f.clicksAtPermit.length !== 2) return receipt;
+    const claimDeadlineAt = vm.runInContext("Date.now() + 1", p.c);
+    await p.c.fixtureWait(1);
+    return { ...receipt, claimDeadlineAt };
+  };
+  const result = await p.run();
+  assert.equal(p.f.accept.clicks, 1);
+  assert.equal(p.f.clicksAtPermit.length, 2);
+  assert.equal(p.f.lock.clicks, 0);
+  assert.equal(result.ok, false);
+  assert.equal(result.claimActionAttempted, true);
+});
+
 test("a lock button disabled during its persistent checkpoint is not clicked", async () => {
   const p = page();
   p.f.beforePermit = () => {
@@ -561,7 +580,11 @@ test("real content candidate reports preserve the durable invitation binding thr
   const candidates = workerMessages.filter(value => value.message.type === "DEBUG_TASK_CANDIDATE");
   assert.ok(candidates.length >= 1, "the actual content candidate event must cross the worker boundary");
   assert.ok(candidates.every(value => value.message.task.taskKey === INVITATION_KEY));
-  assert.equal(workerMessages.filter(value => value.message.phase === "before_click" && value.result.permitClaimClick === true).length, 2);
+  const permits = workerMessages.filter(value => value.message.phase === "before_click" && value.result.permitClaimClick === true);
+  assert.equal(permits.length, 2);
+  const deadline = stored.lighthouseAutoRunStateV1.autoRecovery.deadlineAt;
+  assert.equal(permits[0].result.claimDeadlineAt, deadline);
+  assert.equal(permits[1].result.claimDeadlineAt, deadline);
   assert.equal(stored.lighthouseAutoRunStateV1.currentTask.taskKey, INVITATION_KEY);
   assert.equal(stored.lighthouseAutoRunStateV1.currentTask.tweetUrl, TARGET);
 });

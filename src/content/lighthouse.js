@@ -3724,6 +3724,13 @@
         || (phase === "before_click" && receipt.permitClaimClick !== true)) {
       throw new Error("后台未确认接单检查点，尚未点击接单");
     }
+    return receipt.claimDeadlineAt;
+  }
+
+  function assertClaimDeadline(deadlineAt) {
+    if (Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
+      throw new Error("本单已到 20 分钟截止，未继续点击接单");
+    }
   }
 
   async function clickElement(node, options = {}) {
@@ -3737,17 +3744,20 @@
     options.beforeClick?.();
     // Mark before dispatch: a handler can perform the action and then throw.
     // Invitation/confirmation buttons can claim an order just like a lock.
+    let claimDeadlineAt;
     if (options.claimAction && claimOperation) {
       const operation = claimOperation;
-      if (operation.checkpointRequired) await writeClaimCheckpoint(operation, "before_click");
+      if (operation.checkpointRequired) claimDeadlineAt = await writeClaimCheckpoint(operation, "before_click");
       assertActiveRun(runId);
       options.beforeClick?.();
+      assertClaimDeadline(claimDeadlineAt);
       operation.claimActionAttempted = true;
     }
     try {
       node.click();
       return;
     } catch (_) {}
+    assertClaimDeadline(claimDeadlineAt);
     node.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
   }
 
