@@ -26,7 +26,7 @@ function element(id = "") {
 // Only DOM, Chrome, network and media are offline boundary fixtures.
 async function panel(options = {}) {
   const nodes = new Map(), messages = [], intervals = new Map(), timeouts = new Map(), utterances = [], audios = [], fetches = [];
-  const hooks = {}, storage = new Map(), history = [{ taskKey: "completed-order" }];
+  const hooks = {monitorSettings: options.monitorSettings}, storage = new Map(), history = [{ taskKey: "completed-order" }];
   let listener, timerId = 0, speechCancels = 0;
   const node = (id) => { if (!nodes.has(id)) nodes.set(id, element(id)); return nodes.get(id); };
   const step = element("step"); step.dataset.command = "DEBUG_RUN_X_REPLY";
@@ -42,15 +42,19 @@ async function panel(options = {}) {
     async sendMessage(message) {
       messages.push(clone(message));
       if (message.type === "GET_STATE") return hooks.state ? hooks.state() : { ok: true, state: clone(state), settings: clone(settings) };
+      if (message.type === "MONITOR_GET_SETTINGS" && hooks.monitorSettings) return hooks.monitorSettings();
       if (message.type === "MONITOR_GET_SETTINGS" || message.type === "MONITOR_GET_STATUS") return { ...monitor, paused: state.manuallyStopped };
       if (message.type === "MONITOR_GET_COUNTDOWNS") return hooks.countdowns ? hooks.countdowns() : { ok: true, tasks: [clone(task)], timestamp: Date.now() };
       if (message.type === "GET_REPLY_RECORDS") return { ok: true, records: clone(history) };
       if (message.type === "STOP_RUN") {
-        if (hooks.stop) await hooks.stop();
+        if (hooks.stop) {
+          const result = await hooks.stop();
+          if (result) return result;
+        }
         state = { runId: "stopped-run", running: false, mode: "idle", stage: "stopped", manuallyStopped: true, logs: [] };
         return { ok: true, state: clone(state) };
       }
-      if (message.type === "START_RUN" || message.type.startsWith("DEBUG_")) {
+      if (message.type === "START_RUN" || message.type === "RUN_SELECTED_COUNTDOWN_TASK" || message.type.startsWith("DEBUG_")) {
         if (hooks.action) return hooks.action(message);
         state = { runId: "new-run", running: true, mode: message.type === "START_RUN" ? "auto" : "debug", stage: "x_replied", manuallyStopped: false, logs: [] };
         return { ok: true, state: clone(state) };
@@ -118,6 +122,78 @@ test("STOP clears cached runtime UI immediately and leaves settings/history inta
   assert.equal(p.history[0].taskKey, "completed-order");
   pending.resolve(); await stopping;
 });
+
+test("STOP distinguishes a pending request from an acknowledged stop", async () => {
+  const p = await panel(), pending = deferred();
+  p.hooks.stop = () => pending.promise;
+  const stopping = p.stop(); await flush();
+  assert.equal(p.node("stageBadge").textContent, "stopping");
+  assert.match(p.node("commandStatus").textContent, /正在停止|等待.*停止/);
+  pending.resolve(); await stopping;
+  assert.equal(p.node("stageBadge").textContent, "stopped");
+  assert.match(p.node("commandStatus").textContent, /已停止/);
+  assert.doesNotMatch(p.node("monitorStatus").textContent, /等待后台确认/);
+  assert.equal(p.node("countdownSyncTime").textContent, "已停止");
+});
+
+for (const fault of ["transport", "rejected"]) {
+  test(`STOP ${fault} failure remains visible even if the subsequent state read fails`, async () => {
+    const p = await panel();
+    p.hooks.stop = () => {
+      if (fault === "transport") throw Error("message channel closed");
+      return {ok: false, error: "停止记录保存失败"};
+    };
+    p.hooks.state = () => { throw Error("GET_STATE unavailable"); };
+    await p.stop();
+    assert.equal(p.node("commandStatus").hidden, false);
+    assert.equal(p.node("commandStatus").dataset.kind, "error");
+    assert.match(p.node("commandStatus").textContent, /未能确认停止|停止.*失败/);
+    assert.equal(p.node("stageBadge").textContent, "stop_unconfirmed");
+    assert.equal(p.read("panelStopPending"), false);
+  });
+}
+
+test("a late failure from an older STOP cannot overwrite a newer confirmed stop", async () => {
+  const p = await panel(), pending = deferred();
+  p.hooks.stop = () => pending.promise;
+  const old = p.stop(); await flush();
+  p.hooks.stop = null;
+  await p.stop();
+  pending.resolve({ok: false, error: "旧停止请求失败"}); await old;
+  assert.equal(p.node("stageBadge").textContent, "stopped");
+  assert.doesNotMatch(p.node("commandStatus").textContent, /旧停止/);
+});
+
+for (const command of ["START_RUN", "RUN_SELECTED_COUNTDOWN_TASK", "DEBUG_RUN_X_REPLY"]) {
+  test(`a new ${command} takes ownership before the earlier STOP responds`, async () => {
+    const p = await panel(), pending = deferred();
+    p.hooks.stop = () => pending.promise;
+    const stopping = p.stop(); await flush();
+    const state = {runId: "fresh-run", running: command === "START_RUN", manuallyStopped: false,
+      mode: command === "START_RUN" ? "auto" : "debug",
+      stage: command === "START_RUN" ? "selecting_task" : "x_draft_ready", logs: []};
+    p.hooks.action = () => { p.setState(state); return {ok: true, state}; };
+    if (command === "START_RUN") await p.start();
+    else if (command === "DEBUG_RUN_X_REPLY") await p.step();
+    else {
+      const button = element(); button.dataset.command = command;
+      await p.c.runSingleCommand(button);
+    }
+    assert.equal(p.read("panelStopPending"), false);
+    assert.equal(p.read("panelPaused"), false);
+    assert.equal(p.node("stageBadge").textContent, state.stage);
+    if (command !== "START_RUN") assert.match(p.node("commandStatus").textContent, /草稿.*人工发送/);
+    assert.doesNotMatch(p.node("commandStatus").textContent, /等待后台确认|已停止/);
+    const feedback = p.node("commandStatus").textContent;
+    pending.resolve({ok: true, state: {stage: "stopped", manuallyStopped: true}});
+    await stopping;
+    assert.equal(p.node("commandStatus").textContent, feedback);
+    assert.equal(p.node("stageBadge").textContent, state.stage);
+    const reads = p.countdownReads();
+    await p.tick();
+    assert.ok(p.countdownReads() > reads);
+  });
+}
 
 test("late countdown response cannot repopulate a stopped panel", async () => {
   const p = await panel(), pending = deferred();
@@ -238,6 +314,142 @@ test("monitor save rejection does not acknowledge the combined panel save", asyn
   p.hooks.saveMonitor = () => ({ ok: false, error: "fixture storage unavailable" });
   assert.equal(await p.c.saveSettings(), false);
   assert.match(p.node("saveStatus").textContent, /保存失败/);
+});
+
+test("the first monitor response initializes stored values despite an edit to another settings group", async () => {
+  const initial = deferred();
+  const p = await panel({monitorSettings: () => initial.promise});
+  p.node("aiModel").value = "new-model";
+  p.node("aiModel").listeners.input();
+  initial.resolve({ok: true, enabled: true, voiceEnabled: true, minBounty: 2,
+    voiceEngine: "mimo", voiceName: "mimo_default", voiceRate: 1.3, voicePitch: 1,
+    mimoBaseUrl: "https://fixture.invalid/v1", mimoApiKey: "existing-fixture-key",
+    voiceTemplateAppear: "stored-template"});
+  await flush();
+  assert.equal(p.node("aiModel").value, "new-model");
+  assert.equal(p.node("monitorEnabled").checked, true);
+  assert.equal(p.node("monitorMimoApiKey").value, "existing-fixture-key");
+  p.settings.aiModel = "new-model";
+  assert.equal(await p.c.saveSettings(), true);
+  const saved = p.messages.find(m => m.type === "MONITOR_SAVE_SETTINGS");
+  assert.equal(saved.enabled, true);
+  assert.equal(saved.voiceEnabled, true);
+  assert.equal(saved.rate, 1.3);
+  assert.equal(saved.minBounty, 2);
+  assert.equal(saved.mimoApiKey, "existing-fixture-key");
+  assert.equal(saved.templateAppear, "stored-template");
+});
+
+for (const fault of ["pending", "failed"]) {
+  test(`an initial ${fault} monitor read cannot write defaults or start tasks`, async () => {
+    const initial = deferred();
+    const p = await panel({monitorSettings: () => fault === "pending" ? initial.promise : {ok: false}});
+    assert.equal(await p.c.saveSettings(), false);
+    await p.start();
+    await p.node("monitorTestVoiceBtn").listeners.click();
+    assert.equal(p.messages.some(m => ["SAVE_SETTINGS", "MONITOR_SAVE_SETTINGS", "START_RUN", "MONITOR_TEST_VOICE"].includes(m.type)), false);
+    assert.equal(p.node("monitorEnabled").disabled, true);
+    assert.match(p.node("saveStatus").textContent, /尚未加载|加载失败/);
+    // A later successful read releases the controls and permits a normal save.
+    p.hooks.monitorSettings = null;
+    await p.c.loadMonitorStatus();
+    assert.equal(p.node("monitorEnabled").disabled, false);
+    assert.equal(await p.c.saveSettings(), true);
+    initial.resolve({ok: false});
+    await flush();
+  });
+}
+
+for (const boundary of ["save", "saveMonitor"]) {
+  test(`edits during ${boundary} remain visible and unsaved after the old acknowledgement`, async () => {
+    const p = await panel(), saving = deferred();
+    p.hooks[boundary] = () => saving.promise;
+    const operation = p.c.saveSettings(); await flush();
+    p.node("aiModel").value = "new-unsaved-model";
+    p.node("aiModel").listeners.input();
+    saving.resolve({ok: true, settings: p.settings});
+    assert.equal(await operation, false);
+    assert.equal(p.node("aiModel").value, "new-unsaved-model");
+    assert.equal(p.read("settingsDirty"), true);
+    assert.match(p.node("saveStatus").textContent, /未保存|尚未保存/);
+    await p.c.loadState();
+    assert.equal(p.node("aiModel").value, "new-unsaved-model");
+  });
+}
+
+test("a second save cannot race the in-flight settings and monitor snapshots", async () => {
+  const p = await panel(), saving = deferred();
+  p.hooks.save = () => saving.promise;
+  const first = p.c.saveSettings(); await flush();
+  const second = p.c.saveSettings(); await flush();
+  assert.equal(p.messages.filter(m => m.type === "SAVE_SETTINGS").length, 1);
+  saving.resolve({ok: true, settings: p.settings});
+  assert.equal(await first, true);
+  assert.equal(await second, false);
+  assert.equal(p.node("saveBtn").disabled, false);
+});
+
+for (const readReturnsAfterSave of [false, true]) {
+  test(`late monitor settings cannot overwrite edited/saved values (afterSave=${readReturnsAfterSave})`, async () => {
+    const p = await panel(), reading = deferred(), saving = deferred();
+    p.hooks.monitorSettings = () => reading.promise;
+    const load = p.c.loadMonitorStatus(); await flush();
+    p.node("monitorVoiceRate").value = "1.5";
+    p.node("monitorVoiceRate").listeners.input();
+    p.hooks.save = () => saving.promise;
+    const save = p.c.saveSettings(); await flush();
+    if (readReturnsAfterSave) {
+      saving.resolve({ok: true, settings: p.settings});
+      assert.equal(await save, true);
+    }
+    reading.resolve({ok: true, voiceRate: 0.5}); await load;
+    assert.equal(p.node("monitorVoiceRate").value, "1.5");
+    if (!readReturnsAfterSave) {
+      saving.resolve({ok: true, settings: p.settings});
+      assert.equal(await save, true);
+    }
+    assert.equal(p.messages.find(m => m.type === "MONITOR_SAVE_SETTINGS").rate, 1.5);
+  });
+}
+
+for (const readStartsBeforeEdit of [false, true]) {
+  test(`late state settings cannot replace a saved edit (beforeEdit=${readStartsBeforeEdit})`, async () => {
+    const p = await panel(), reading = deferred();
+    const oldSettings = clone(p.settings);
+    p.hooks.state = () => reading.promise;
+    let load;
+    if (readStartsBeforeEdit) { load = p.c.loadState(); await flush(); }
+    p.node("aiModel").value = "new-saved-model";
+    p.node("aiModel").listeners.input();
+    if (!readStartsBeforeEdit) { load = p.c.loadState(); await flush(); }
+    p.settings.aiModel = "new-saved-model";
+    assert.equal(await p.c.saveSettings(), true);
+    assert.equal(p.node("aiModel").value, "new-saved-model");
+    reading.resolve({ok: true, settings: oldSettings, state: {
+      runId: "old-run", running: true, manuallyStopped: false, stage: "x_replied", logs: []
+    }});
+    await load;
+    assert.equal(p.node("aiModel").value, "new-saved-model");
+    assert.equal(p.read("settingsDirty"), false);
+  });
+}
+
+test("selected order ending in draft mode reports manual sending rather than cancellation or completion", async () => {
+  const p = await panel(), action = deferred();
+  const button = element();
+  button.dataset.command = "RUN_SELECTED_COUNTDOWN_TASK";
+  p.hooks.action = () => action.promise;
+  const running = p.c.runSingleCommand(button); await flush();
+  // Settings can change while the selected order is waiting for its lock.
+  p.settings.replyMode = "fill";
+  const state = {runId: "selected-run", mode: "selected_once", running: false,
+    manuallyStopped: false, stage: "x_draft_ready", logs: []};
+  p.setState(state);
+  action.resolve({ok: true, pendingManualReply: true, state});
+  await running;
+  assert.match(p.node("commandStatus").textContent, /草稿.*人工发送/);
+  assert.equal(p.node("commandStatus").dataset.kind, "info");
+  assert.doesNotMatch(p.node("commandStatus").textContent, /已完成|停止|接管/);
 });
 
 test("old TTS completion after a fresh start cannot play or release the new speech owner", async () => {

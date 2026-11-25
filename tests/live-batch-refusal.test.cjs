@@ -122,6 +122,11 @@ function makeBusy(button, label = "正在预定席位…") {
   button.disabled = true;
 }
 
+function showLockedReceipt(fixture, button) {
+  fixture.nodes = fixture.nodes.filter(item => item !== button);
+  fixture.nodes.push(node("席位已锁定"), node("去 X 完成动作", { control: true, href: TARGET }));
+}
+
 function assertRejected(result, p, route) {
   assert.equal(result.ok, false);
   assert.equal(result.claimActionAttempted, true);
@@ -245,10 +250,10 @@ for (const withRefusal of [false, true]) {
       makeBusy(button);
       if (withRefusal) {
         f.notify(REFUSAL);
-        f.nodes.push(node("席位已锁定"));
+        showLockedReceipt(f, button);
       }
-    }, onWait(f) {
-      if (f.clicks && !f.nodes.some(n => n.innerText === "席位已锁定")) f.nodes.push(node("席位已锁定"));
+    }, onWait(f, button) {
+      if (f.clicks && !f.nodes.some(n => n.innerText === "席位已锁定")) showLockedReceipt(f, button);
     } });
     const result = await p.dispatch();
     assert.equal(result.ok, true, result.message);
@@ -331,11 +336,11 @@ for (const scenario of ["no refusal", "stale refusal", "generic error", "rate li
   });
 }
 
-test("new exact-order success still wins over a refusal and next-batch controls", async () => {
+test("new exact-order success wins after replacing the refused next-batch control", async () => {
   const p = page({ onClick(f, button) {
     makeBusy(button, BATCH_COUNTDOWN);
     f.notify(REFUSAL);
-    f.nodes.push(node("席位已锁定"));
+    showLockedReceipt(f, button);
   } });
   const result = await p.dispatch();
   assert.equal(result.ok, true, result.message);

@@ -23,6 +23,9 @@ for(const fault of ["response","missing","throw"]){
       if(flow==="queue")await p.c.runStepQueue(0);else{const button=element();button.dataset.command=flow;await p.c.runSingleCommand(button);}
       assert.equal(p.messages.some(m=>m.type===flow||m.type.startsWith("DEBUG_")||m.type==="START_RUN"),false);
       assert.match(p.node("saveStatus").textContent,/失败|未保存|没有确认/);
+      assert.equal(p.node("commandStatus").hidden,false);
+      assert.equal(p.node("commandStatus").dataset.kind,"error");
+      assert.match(p.node("commandStatus").textContent,/未保存.*未启动/);
       assert.equal(p.read("commandQueueRunning"),false);
     });
   }

@@ -32,6 +32,10 @@ function harness(options = {}) {
   const chrome = { runtime: { onMessage: { addListener(fn) { listener = fn; } }, async sendMessage(message) {
     if (message.type === "CONTENT_LOG") { logs.push(message.text); return {ok: true}; }
     if (message.type === "GENERATE_AI_REPLY") { calls.ai += 1; return {ok: true, replyText: "这条细节说得挺实在"}; }
+    if (message.type === "QUERY_TWEET_REPLY_HISTORY" && options.history) {
+      if (options.history.throw) throw Error("History channel unavailable");
+      return options.history;
+    }
     throw Error(`Unexpected runtime message: ${message.type}`);
   } } };
   const c = vm.createContext({ console, URL, Date: FakeDate, chrome, document: fakeDocument,
@@ -61,7 +65,8 @@ function harness(options = {}) {
     likeCurrentTweetIfNeeded = async () => { counters.like++; return options.alreadyLiked ? originalLike()
       : options.likeResult || {ok: true, status: "already_liked", message: "当前推文已点赞"}; };
     followCurrentTweetAuthorIfNeeded = async () => { counters.follow++; return {ok: true}; };
-    detectExistingReplyBeforeWriting = async () => { counters.dedupe++; return options.dedupe || {replied: false}; };
+    if (!options.history) detectExistingReplyBeforeWriting = async () => { counters.dedupe++; return options.dedupe || {replied: false}; };
+    if (options.history) findExistingOwnReplyOnPage = async () => options.ownReply || {replied: false};
     openReplyComposer = async () => { counters.compose++; };
     fillReplyText = async () => { counters.fill++; };
     clickPostButtonAndVerify = async () => { counters.post++; return options.postResult || {ok: true, message: "已确认回复发送成功"}; };
@@ -145,6 +150,58 @@ test("a matching pure-comment task posts its required comment without adding a l
   assert.equal(h.calls.post, 1);
   assert.equal(h.elapsed(), 750);
 });
+
+test("unverified posted history stops before generation and publishing", async () => {
+  const h = harness({history: {ok: true, replied: false, needsReview: true,
+    message: "历史发布状态待核对", record: {mode: "post", replyText: "Old reply"}}});
+  const result = await h.message("RUN_X_REPLY");
+  assert.equal(result.ok, false);
+  assert.equal(result.needsReview, true);
+  assert.equal(h.calls.ai, 0);
+  assert.equal(h.calls.compose, 0);
+  assert.equal(h.calls.post, 0);
+});
+
+test("a visible own article without target binding cannot resolve legacy history uncertainty", async () => {
+  const h = harness({history: {ok: true, replied: false, needsReview: true},
+    ownReply: {replied: true, source: "x_visible_replies", replyText: "Unrelated own tweet"}});
+  const result = await h.message("RUN_X_REPLY");
+  assert.equal(result.ok, false);
+  assert.equal(result.needsReview, true);
+  assert.equal(h.calls.ai, 0);
+  assert.equal(h.calls.compose, 0);
+  assert.equal(h.calls.post, 0);
+});
+
+test("readable empty history permits a fresh required reply", async () => {
+  const h = harness({history: {ok: true, replied: false}});
+  const result = await h.message("RUN_X_REPLY");
+  assert.equal(result.ok, true);
+  assert.equal(h.calls.ai, 1);
+  assert.equal(h.calls.post, 1);
+});
+
+test("official current-task completion resolves history uncertainty without another reply", async () => {
+  const h = harness({history: {ok: true, replied: false, needsReview: true},
+    panel: () => composite.replace("评论 待完成", "评论 已完成")});
+  const result = await h.message("RUN_X_REPLY");
+  assert.equal(result.ok, true);
+  assert.equal(result.deduped, true);
+  assert.equal(result.existingReply.source, "x_current_task");
+  assert.equal(h.calls.ai, 0);
+  assert.equal(h.calls.post, 0);
+});
+
+for (const history of [{ok: false}, {throw: true}, {ok: true}]) {
+  test(`failed or incomplete history lookup cannot authorize publishing: ${JSON.stringify(history)}`, async () => {
+    const h = harness({history});
+    const result = await h.message("RUN_X_REPLY");
+    assert.equal(result.ok, false);
+    assert.equal(result.needsReview, true);
+    assert.equal(h.calls.ai, 0);
+    assert.equal(h.calls.post, 0);
+  });
+}
 
 for (const options of [{noOfficialButton: true}, {twoPanels: true},
   {panel: () => "当前任务 +0.2LUX 要完成 点赞 待完成"},

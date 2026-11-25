@@ -336,9 +336,18 @@ async function handleMessage(message, sender) {
       markAttemptedTask(message.task);
       return adoptTargetOpenedTweet(message.task, sender.tab && sender.tab.id, "auto");
     case "LIGHTHOUSE_TARGET_TWEET_URL": {
-      if (!isCurrentRunMessage(message)) return { ok: true, state: runtimeState };
+      const pending = runtimeState.pendingXOpen;
+      if (!runtimeState.running || !message.runId || !isCurrentRunMessage(message)
+          || !pending || sender.tab?.id !== runtimeState.lighthouseTabId
+          || sender.tab?.id !== pending.lighthouseTabId) {
+        return { ok: false, error: "目标地址不属于当前页面的等待操作", state: runtimeState };
+      }
       const tweetUrl = normalizeTweetUrl(message.tweetUrl);
       if (!tweetUrl) return { ok: false, error: "Lighthouse 回传的目标 X 地址无效", state: runtimeState };
+      const boundTarget = normalizeTweetUrl(runtimeState.currentTask?.tweetUrl, true);
+      if (boundTarget && boundTarget !== normalizeTweetUrl(tweetUrl, true)) {
+        return { ok: false, error: "回传地址与本单目标推文不一致", state: runtimeState };
+      }
       runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, null, {
         tweetUrl,
         targetUrlCapturedAt: new Date().toISOString(),
@@ -5101,11 +5110,12 @@ async function markPermanentIgnoredTask(task, taskType = "") {
   return true;
 }
 
-async function getReplyHistoryRecords() {
+async function getReplyHistoryRecords(requireReadable = false) {
   try {
     const stored = await chrome.storage.local.get([REPLY_HISTORY_RECORDS_KEY]);
     return normalizeReplyHistoryRecords(stored[REPLY_HISTORY_RECORDS_KEY]);
-  } catch (_) {
+  } catch (error) {
+    if (requireReadable) throw error;
     return [];
   }
 }
@@ -5114,9 +5124,21 @@ async function queryTweetReplyHistory(tweet = {}, task = {}) {
   const tweetUrl = normalizeTweetUrl(tweet?.url || task?.tweetUrl || "");
   if (!tweetUrl) return { ok: true, replied: false, reason: "missing_tweet_url" };
 
-  const records = await getReplyHistoryRecords();
-  const record = records.find((item) => item.publishedVerified && normalizeTweetUrl(item.tweetUrl || "", true) === normalizeTweetUrl(tweetUrl, true));
-  if (!record) return { ok: true, replied: false, tweetUrl };
+  let records;
+  try { records = await getReplyHistoryRecords(true); }
+  catch (_) {
+    return { ok: true, replied: false, needsReview: true, tweetUrl,
+      message: "无法读取历史回复记录，已停止自动评论，请检查后重试" };
+  }
+  const matching = records.filter((item) => normalizeTweetUrl(item.tweetUrl || "", true) === normalizeTweetUrl(tweetUrl, true));
+  const record = matching.find((item) => item.publishedVerified);
+  if (!record) {
+    const unverified = matching.find((item) => item.mode === "post");
+    return unverified
+      ? { ok: true, replied: false, needsReview: true, tweetUrl, record: unverified,
+        message: "本地存在未核实的历史发布记录，已停止自动评论，请核对目标推文" }
+      : { ok: true, replied: false, tweetUrl };
+  }
 
   return {
     ok: true,
@@ -5356,8 +5378,22 @@ async function restoreAutoRunState() {
     const stored = await chrome.storage.local.get([AUTO_RUN_STATE_KEY]);
     const saved = stored[AUTO_RUN_STATE_KEY];
     if (!saved || typeof saved !== "object") return;
-    const sessionStop = saved.manuallyStopped ? null
-      : await chrome.storage.session?.get?.(["lighthouseStoppedRunId"]);
+    let sessionStop = null;
+    try {
+      if (!saved.manuallyStopped) sessionStop = await chrome.storage.session?.get?.(["lighthouseStoppedRunId"]);
+    } catch (_) {
+      // A failed stop-marker read is not proof that no order exists. Keep the
+      // durable order and action intent, but require an explicit restart.
+      runtimeState = {
+        ...createInitialState(), ...saved, running: false, mode: "idle",
+        stage: "stopped", autoRecovery: null, pendingXOpen: null,
+        marketplaceRefreshInFlight: false,
+        logs: Array.isArray(saved.logs) ? saved.logs.slice(0, 120) : [],
+        runId: saved.runId || createRunId()
+      };
+      log("warn", "读取停止标记失败，已保留订单记录并停止自动恢复");
+      return;
+    }
     if (saved.manuallyStopped || (saved.runId && saved.runId === sessionStop?.lighthouseStoppedRunId)) {
       runtimeState = { ...createInitialState(), manuallyStopped: true, stage: "stopped", runId: saved.runId || createRunId(), stopEpoch: saved.stopEpoch, logs: Array.isArray(saved.logs) ? saved.logs.filter(entry => entry.text === "已停止运行").slice(0, 1) : [] };
       return;

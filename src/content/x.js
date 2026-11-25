@@ -218,6 +218,11 @@
       assertActiveRun(runId);
       return { ...buildDedupeReplyResult(tweet, dedupeResult, likeResult), follow: followResult, repost: repostResult, taskActions };
     }
+    if (dedupeResult.needsReview) {
+      assertActiveRun(runId);
+      return { ok: false, needsReview: true, message: dedupeResult.message,
+        tweet, like: likeResult, follow: followResult, repost: repostResult, taskActions, xInstanceId: INSTANCE_ID };
+    }
 
     assertActiveRun(runId);
     const aiResponse = await chrome.runtime.sendMessage({ type: "GENERATE_AI_REPLY", runId, tweet, task });
@@ -1353,7 +1358,7 @@
 
   async function detectExistingReplyBeforeWriting(tweet, task, settings = {}) {
     const local = await queryLocalReplyHistory(tweet, task);
-    if (local.replied) return local;
+    if (local.replied || local.needsReview) return local;
 
     const page = await findExistingOwnReplyOnPage(tweet, settings);
     if (page.replied) return page;
@@ -1377,8 +1382,13 @@
           record: result.record || null
         };
       }
+      if (result?.ok && result.needsReview) {
+        return { replied: false, needsReview: true, record: result.record || null,
+          message: result.message || "历史发布状态待核对，已停止自动评论" };
+      }
+      if (result?.ok && result.replied === false) return { replied: false };
     } catch (_) {}
-    return { replied: false };
+    return { replied: false, needsReview: true, message: "无法核对历史回复，已停止自动评论，请检查连接后重试" };
   }
 
   async function findExistingOwnReplyOnPage(tweet, settings = {}) {

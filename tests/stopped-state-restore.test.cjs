@@ -27,7 +27,7 @@ function savedStorage(extra = {}) {
   };
 }
 
-async function boot(t, stored, beforeWrite = null) {
+async function boot(t, stored, beforeWrite = null, session = null) {
   const event = { addListener() {} };
   const calls = { runStateWrites: [], alarmsCreated: [], alarmsCleared: [], browser: [], scans: [] };
   const timers = new Set();
@@ -38,7 +38,7 @@ async function boot(t, stored, beforeWrite = null) {
       getManifest: () => ({ version: "test" }), onInstalled: event, onMessage: event,
       async getPlatformInfo() { calls.browser.push({ type: "getPlatformInfo" }); return { os: "mac" }; },
     },
-    storage: { session: require("./session-fixture.cjs")(), local: {
+    storage: { session: session || require("./session-fixture.cjs")(), local: {
       async setAccessLevel() {},
       async get(keys) { return Object.fromEntries(keys.map((key) => [key, clone(stored[key])])); },
       async set(values, callback) {
@@ -82,6 +82,32 @@ async function boot(t, stored, beforeWrite = null) {
   const message = (type) => context.handleMessage({ type, clientWindowId: 1 },
     { id: "test", url: "chrome-extension://test/src/debug/debug.html" });
   return { context, calls, state, message };
+}
+
+for (const intent of [uncertainAction, safeScanIntentForRestore()]) {
+  test(`session read failure preserves the saved order and stops automatic recovery (${intent.type})`, async t => {
+    const stored = savedStorage({ running: true, mode: "auto", uncertainAction: intent,
+      autoRecovery: { mode: "auto", deadlineAt: 1 } });
+    const session = require("./session-fixture.cjs")();
+    session.get = async () => { throw new Error("Session storage unavailable"); };
+    const w = await boot(t, stored, null, session);
+    assert.deepEqual(clone(w.state().currentTask), lockedTask);
+    assert.deepEqual(clone(w.state().uncertainAction), intent);
+    assert.equal(w.state().runId, "saved-run");
+    assert.equal(w.state().running, false);
+    assert.equal(w.state().stage, "stopped");
+    assert.equal(w.state().autoRecovery, null);
+    await w.context.handleAutoRunKeepaliveTick();
+    assert.deepEqual(w.calls.scans, []);
+    assert.deepEqual(w.calls.browser, []);
+    assert.deepEqual(w.calls.alarmsCreated, []);
+  });
+}
+
+function safeScanIntentForRestore() {
+  return { type: "START_LIGHTHOUSE_COMMENT_TASK", runId: "saved-run", tabId: 11,
+    intentId: "intent-id", checkpointRequired: true, checkpointVersion: 1,
+    contentInstanceId: "page-id", claimActionAttempted: false };
 }
 
 for (const uncertain of [false, true]) {
@@ -155,7 +181,7 @@ test("STOP_RUN followed by reboot and keepalive retains the stop without startin
   assert.equal(stopped.scheduledResumeAt, 0);
   assert.notEqual(stopped.runId, "saved-run");
   assert.equal(stopped.logs[0].text, "已停止运行");
-  assert.deepEqual(worker.calls.alarmsCleared, [KEEPALIVE, IDLE_RELOAD]);
+  assert.deepEqual(worker.calls.alarmsCleared, [KEEPALIVE, IDLE_RELOAD, "lighthouseAutoRecoveryV1"]);
 
   const rebooted = await boot(t, stored);
   await rebooted.context.handleAutoRunKeepaliveTick();

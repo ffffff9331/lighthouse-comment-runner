@@ -134,7 +134,9 @@ for (const scenario of ["no-entry", "old-popup", "toast-only", "tweet-only", "ol
 
 test("same-order success wins over a queue lottery refusal popup", async () => {
   const f = queuePage({ afterResult: f => {
+    f.lock.remove();
     f.p.f.detail.appendChild(new Element("span", "席位已锁定"));
+    f.p.f.detail.appendChild(new Element("a", "去 X 完成动作", [], { href: TARGET }));
     f.notifyMutation();
   } });
   const result = await f.run();

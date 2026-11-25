@@ -302,14 +302,17 @@ if (platform === "lighthouse") {
   await test("recommended campaign links do not invalidate current paid evidence", () => {
     const recommendedRoot = {
       innerText: "验证成功 · 奖励已到账 +0.10 LUX 继续搞钱 · 类似任务 查看全部",
-      querySelectorAll: () => [{ href: "https://x.com/other/status/999" }]
+      querySelectorAll: () => [
+        { innerText: "查看原推文", href: "https://x.com/test/status/123" },
+        { innerText: "推荐任务", href: "https://x.com/other/status/999" }
+      ]
     };
-    const context = contextFor(page, ["checkOfficialCompletion"], {
+    const context = contextFor(page, ["checkOfficialCompletion", "getOfficialCompletionRootFingerprint"], {
       completionContext: {
         runId: "run-1",
         taskKey: "task-1",
         tweetUrl: "https://x.com/test/status/123",
-        baseline: new Set(),
+        baseline: new Map(),
         evidence: null
       },
       normalizeTweetUrl: (value) => String(value || "").replace(/\?.*$/, ""),
@@ -838,9 +841,10 @@ if (platform === "lighthouse") {
       dataset: { command },
       querySelector: () => ({ textContent: command })
     }));
-    const context = contextFor(debugPanel, ["runStepQueue"], {
+    const context = contextFor(debugPanel, ["runStepQueue", "retirePendingPanelStop"], {
       commandQueueRunning: false,
       activeStepQueue: null,
+      panelStopPending: false,
       stepButtons: buttons,
       async saveSettings() { return true; },
       setStepButtonsDisabled() {},
@@ -863,9 +867,10 @@ if (platform === "lighthouse") {
       dataset: { command },
       querySelector: () => ({ textContent: command })
     }));
-    const context = contextFor(debugPanel, ["runStepQueue"], {
+    const context = contextFor(debugPanel, ["runStepQueue", "retirePendingPanelStop"], {
       commandQueueRunning: false,
       activeStepQueue: null,
+      panelStopPending: false,
       stepButtons: buttons,
       async saveSettings() { return true; },
       setStepButtonsDisabled() {},
@@ -887,9 +892,10 @@ if (platform === "lighthouse") {
       dataset: { command },
       querySelector: () => ({ textContent: command })
     }));
-    const context = contextFor(debugPanel, ["runStepQueue"], {
+    const context = contextFor(debugPanel, ["runStepQueue", "retirePendingPanelStop"], {
       commandQueueRunning: false,
       activeStepQueue: null,
+      panelStopPending: false,
       stepButtons: buttons,
       async saveSettings() { return true; },
       setStepButtonsDisabled() {},

@@ -69,6 +69,9 @@ const stepButtons = Array.from(document.querySelectorAll(".quickActions [data-co
 const saveBtn = document.getElementById("saveBtn");
 const commandStatus = document.getElementById("commandStatus");
 let settingsDirty = false;
+let settingsEditRevision = 0;
+let settingsSaving = false;
+let monitorSettingsLoaded = false;
 let saveStatusTimer = null;
 let commandStatusTimer = null;
 let commandQueueRunning = false;
@@ -104,7 +107,7 @@ const STEP_COMPLETION_STAGES = {
   DEBUG_OPEN_FIRST_TASK: ["task_detail_opened"],
   DEBUG_LOCK_SEAT_OPEN_TWEET: ["tweet_opened"],
   DEBUG_FAST_X_CLAIM_REPLY_VERIFY: ["fast_flow_done"],
-  RUN_SELECTED_COUNTDOWN_TASK: ["selected_flow_done", "selected_lock_failed"],
+  RUN_SELECTED_COUNTDOWN_TASK: ["selected_flow_done", "selected_lock_failed", "x_draft_ready"],
   DEBUG_RUN_X_REPLY: ["x_replied", "x_draft_ready"],
   DEBUG_CLOSE_X_RETURN_LIGHTHOUSE: ["returned_lighthouse"],
   DEBUG_CLICK_DONE: ["done_clicked"],
@@ -119,13 +122,12 @@ document.getElementById("stopBtn").addEventListener("click", () => {
     let response;
     try {
       response = await chrome.runtime.sendMessage({ type: "STOP_RUN" });
-    } finally {
-      if (finishPanelStop(stopEpoch)) {
-        await loadState();
-        if (response?.ok === false && !response.cancelled && stopEpoch === panelEpoch) {
-          showCommandStatus(response.error || "未能确认停止状态", "error", 0);
-        }
-      }
+    } catch (error) {
+      response = { ok: false, error: `未能确认停止状态：${error?.message || "连接失败"}，请检查页面并重试停止` };
+    }
+    if (finishPanelStop(stopEpoch, response)) {
+      // Feedback must survive a second transport failure while refreshing.
+      try { await loadState(); } catch (_) {}
     }
   });
 });
@@ -152,6 +154,7 @@ Object.values(fields).forEach((field) => {
   field.addEventListener("input", markSettingsDirty);
   field.addEventListener("change", markSettingsDirty);
 });
+monitorFields.forEach((name) => { fields[name].disabled = true; });
 
 viewButtons.forEach((button) => {
   button.addEventListener("click", () => setView(button.dataset.view));
@@ -188,13 +191,37 @@ if ("speechSynthesis" in window) {
 function pausePanelActivity() {
   panelStopPending = true;
   applyPanelPause(true, true);
+  stageBadge.textContent = "stopping";
+  document.body.dataset.stage = "stopping";
+  countdownList.innerHTML = '<p class="countdownEmpty">面板已暂停，等待后台确认停止</p>';
+  countdownSyncTime.textContent = "正在停止";
+  document.getElementById("monitorStatus").textContent = "面板已暂停，等待后台确认停止";
+  showCommandStatus("正在停止，等待后台确认", "info", 0);
   return panelEpoch;
 }
 
-function finishPanelStop(epoch) {
+function finishPanelStop(epoch, response) {
   if (epoch !== panelEpoch) return false;
   panelStopPending = false;
+  if (!response?.cancelled) {
+    const confirmed = response?.ok === true;
+    stageBadge.textContent = confirmed ? "stopped" : "stop_unconfirmed";
+    document.body.dataset.stage = stageBadge.textContent;
+    countdownSyncTime.textContent = confirmed ? "已停止" : "停止未确认";
+    const status = confirmed ? "已停止，等待手动启动" : "面板已暂停，后台停止未确认";
+    countdownList.innerHTML = `<p class="countdownEmpty">${status}</p>`;
+    document.getElementById("monitorStatus").textContent = status;
+    showCommandStatus(confirmed ? "已停止" : (response?.error || "未能确认停止状态，请检查页面并重试停止"),
+      confirmed ? "info" : "error", 0);
+  }
   return true;
+}
+
+function retirePendingPanelStop() {
+  if (!panelStopPending) return;
+  panelStopPending = false;
+  panelEpoch += 1;
+  showCommandStatus("");
 }
 
 function applyPanelPause(paused, force = false) {
@@ -252,12 +279,14 @@ function runPanelTask(action) {
 
 async function loadState() {
   const epoch = panelEpoch;
+  const revision = settingsEditRevision;
+  const mayRenderSettings = !settingsDirty && !settingsSaving;
   const response = await chrome.runtime.sendMessage({ type: "GET_STATE" });
   if (epoch !== panelEpoch || panelStopPending) return;
   if (!response || !response.ok) return;
   applyPanelPause(response.state?.manuallyStopped === true);
   panelRunId = panelPaused ? "" : (response.state?.runId || "");
-  if (!settingsDirty) {
+  if (mayRenderSettings && revision === settingsEditRevision && !settingsDirty && !settingsSaving) {
     renderSettings(response.settings);
   }
   renderState(response.state, response.settings);
@@ -265,6 +294,14 @@ async function loadState() {
 }
 
 async function saveSettings() {
+  if (settingsSaving) return false;
+  if (!monitorSettingsLoaded) {
+    showSaveStatus("监控配置尚未加载，请稍后重试；若持续失败请重开侧栏");
+    return false;
+  }
+  settingsSaving = true;
+  saveBtn.disabled = true;
+  const revision = settingsEditRevision;
   const settings = readSettings();
   const monitorSettings = readMonitorSettings();
   try {
@@ -272,6 +309,10 @@ async function saveSettings() {
     const response = await chrome.runtime.sendMessage({ type: "SAVE_SETTINGS", settings });
     if (!response?.ok) throw new Error(response?.error || "保存失败，后台没有确认");
     await saveMonitorSettings(monitorSettings);
+    if (revision !== settingsEditRevision) {
+      showSaveStatus("仍有新修改尚未保存，请再次保存配置");
+      return false;
+    }
     settingsDirty = false;
     renderSettings(response.settings);
     showSaveStatus("已保存，重启后无需重新输入 API Key");
@@ -279,6 +320,9 @@ async function saveSettings() {
   } catch (error) {
     showSaveStatus(`保存失败：${error.message || "请重试"}`);
     return false;
+  } finally {
+    settingsSaving = false;
+    saveBtn.disabled = false;
   }
 }
 
@@ -304,6 +348,7 @@ async function requestCustomAIHostPermission(apiUrl) {
 }
 
 async function saveMonitorSettings(ms = readMonitorSettings()) {
+  if (!monitorSettingsLoaded) throw new Error("监控配置尚未加载，请稍后重试");
   const response = await chrome.runtime.sendMessage({ type: "MONITOR_SAVE_SETTINGS", ...ms });
   if (!response?.ok) throw new Error(response?.error || "监控设置未获后台确认");
 }
@@ -312,7 +357,13 @@ async function runSingleCommand(button) {
   if (commandQueueRunning) return;
   const commandEpoch = panelStopEpoch;
   const isCurrent = () => commandEpoch === panelStopEpoch;
-  if (await saveSettings() !== true || !isCurrent()) return;
+  const saved = await saveSettings();
+  if (!isCurrent()) return;
+  if (saved !== true) {
+    showCommandStatus("配置未保存，任务未启动。请到设置检查后重试", "error", 0);
+    return;
+  }
+  retirePendingPanelStop();
   setButtonRunning(button, true);
   if (button.dataset.command === "RUN_SELECTED_COUNTDOWN_TASK") {
     showCommandStatus("正在停止当前流程并启动选中任务", "info", 0);
@@ -363,9 +414,11 @@ async function runStepQueue(startIndex) {
     setStepButtonsDisabled(true);
     if (await saveSettings() !== true) {
       completed = false;
+      if (isCurrent()) showCommandStatus("配置未保存，任务未启动。请到设置检查后重试", "error", 0);
       return;
     }
     if (!isCurrent()) return;
+    retirePendingPanelStop();
     showCommandStatus(`从第 ${startIndex + 1} 步开始连续执行`, "info", 0);
     const queue = stepButtons.slice(startIndex);
     for (const button of queue) {
@@ -614,6 +667,7 @@ function renderRunWindowHint(state = {}, settings = {}) {
 }
 
 function markSettingsDirty() {
+  settingsEditRevision += 1;
   settingsDirty = true;
   renderRunModeHint(fields.runMode.value || "debug");
   renderMonitorTemplatePreviews();
@@ -751,24 +805,30 @@ function getActiveView() {
 
 async function loadMonitorStatus() {
   const epoch = panelEpoch;
+  const revision = settingsEditRevision;
+  const mayRenderSettings = !settingsDirty && !settingsSaving;
   try {
     const response = await chrome.runtime.sendMessage({ type: "MONITOR_GET_SETTINGS" });
     if (response && response.ok) {
-      fields.monitorEnabled.checked = response.enabled;
-      fields.monitorMinBounty.value = response.minBounty;
-      fields.monitorVoiceEnabled.checked = response.voiceEnabled;
-      fields.monitorVoiceEngine.value = response.voiceEngine || "mimo";
-      populateVoiceOptions(response.voiceName || "", fields.monitorVoiceEngine.value);
-      fields.monitorVoiceRate.value = response.voiceRate;
-      fields.monitorVoicePitch.value = response.voicePitch;
-      fields.monitorMimoBaseUrl.value = response.mimoBaseUrl || "";
-      fields.monitorMimoApiKey.value = response.mimoApiKey || "";
-      fields.monitorVoiceTemplateAppear.value = response.voiceTemplateAppear || "";
-      fields.monitorVoiceTemplateCountdown2m.value = response.voiceTemplateCountdown2m || "";
-      fields.monitorVoiceTemplateCountdown1m.value = response.voiceTemplateCountdown1m || "";
-      renderMonitorTemplatePreviews();
-      document.getElementById("monitorVoiceRateValue").textContent = response.voiceRate;
-      document.getElementById("monitorVoicePitchValue").textContent = response.voicePitch;
+      if (!monitorSettingsLoaded || (mayRenderSettings && revision === settingsEditRevision && !settingsDirty && !settingsSaving)) {
+        fields.monitorEnabled.checked = response.enabled;
+        fields.monitorMinBounty.value = response.minBounty;
+        fields.monitorVoiceEnabled.checked = response.voiceEnabled;
+        fields.monitorVoiceEngine.value = response.voiceEngine || "mimo";
+        populateVoiceOptions(response.voiceName || "", fields.monitorVoiceEngine.value);
+        fields.monitorVoiceRate.value = response.voiceRate;
+        fields.monitorVoicePitch.value = response.voicePitch;
+        fields.monitorMimoBaseUrl.value = response.mimoBaseUrl || "";
+        fields.monitorMimoApiKey.value = response.mimoApiKey || "";
+        fields.monitorVoiceTemplateAppear.value = response.voiceTemplateAppear || "";
+        fields.monitorVoiceTemplateCountdown2m.value = response.voiceTemplateCountdown2m || "";
+        fields.monitorVoiceTemplateCountdown1m.value = response.voiceTemplateCountdown1m || "";
+        renderMonitorTemplatePreviews();
+        document.getElementById("monitorVoiceRateValue").textContent = response.voiceRate;
+        document.getElementById("monitorVoicePitchValue").textContent = response.voicePitch;
+        monitorSettingsLoaded = true;
+        monitorFields.forEach((name) => { fields[name].disabled = false; });
+      }
       if (!panelPaused && epoch === panelEpoch) document.getElementById("monitorStatus").textContent = `已通知 ${response.seenCount || 0} 条`;
       return;
     }

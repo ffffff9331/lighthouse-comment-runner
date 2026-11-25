@@ -28,7 +28,10 @@ async function worker(t, initialTabs = []) {
     runtime: { id: "test", getURL: value => `chrome-extension://test/${value}`,
       getManifest: () => ({ version: "test" }), onInstalled: event, onMessage: event },
     storage: { session: require("./session-fixture.cjs")(), local: { async setAccessLevel() {},
-      async get(keys) { return Object.fromEntries(keys.filter(key => Object.hasOwn(stored, key)).map(key => [key, clone(stored[key])])); },
+      async get(keys) {
+        await hooks.storageGet?.(keys);
+        return Object.fromEntries(keys.filter(key => Object.hasOwn(stored, key)).map(key => [key, clone(stored[key])]));
+      },
       async set(values, callback) { Object.assign(stored, clone(values)); callback?.(); },
     } },
     alarms: { onAlarm: event, async create() {}, async clear() {} },
@@ -158,6 +161,63 @@ test("reply history recognizes a completed author alias for i/status", async t =
   assert.equal(result.replied, true);
   assert.equal(result.record.id, "prior");
   assert.equal((await w.c.queryTweetReplyHistory({ url: OTHER })).replied, false);
+});
+
+for (const scenario of ["different-target", "other-tab", "missing-run", "no-watch", "stopped"]) {
+  test(`captured page target cannot replace the bound order: ${scenario}`, async t => {
+    const w = await worker(t);
+    let recoveries = 0;
+    w.c.recoverPendingXOpenFromCapturedUrl = async () => { recoveries++; };
+    if (scenario === "no-watch") w.state().pendingXOpen = null;
+    if (scenario === "stopped") w.state().running = false;
+    const result = await w.c.handleMessage({ type: "LIGHTHOUSE_TARGET_TWEET_URL",
+      runId: scenario === "missing-run" ? "" : "identity-run",
+      tweetUrl: scenario === "different-target" ? OTHER : ALIAS },
+    { id: "test", frameId: 0, tab: {id: scenario === "other-tab" ? 99 : 11}, url: lighthouse.url });
+    assert.equal(result.ok, false);
+    assert.equal(w.state().currentTask.tweetUrl, TARGET);
+    assert.equal(recoveries, 0);
+  });
+}
+
+test("same-tweet capture from the watched page can continue recovery", async t => {
+  const w = await worker(t);
+  let recovered;
+  w.c.recoverPendingXOpenFromCapturedUrl = async url => { recovered = url; };
+  const result = await w.c.handleMessage({ type: "LIGHTHOUSE_TARGET_TWEET_URL",
+    runId: "identity-run", tweetUrl: ALIAS },
+  { id: "test", frameId: 0, tab: {id: 11}, url: lighthouse.url });
+  assert.equal(result.ok, true);
+  assert.equal(recovered, ALIAS);
+});
+
+test("legacy posted history blocks a duplicate without claiming verified completion", async t => {
+  const w = await worker(t);
+  w.stored.replyHistoryRecords = [{ id: "legacy", tweetUrl: ALIAS, replyText: "Previously sent", mode: "post" }];
+  const result = await w.c.queryTweetReplyHistory({ url: TARGET });
+  assert.equal(result.replied, false);
+  assert.equal(result.needsReview, true);
+  assert.equal(result.record.id, "legacy");
+  assert.equal((await w.c.queryTweetReplyHistory({ url: OTHER })).needsReview, undefined);
+  // Normalization followed by a storage rewrite must not lose the protection.
+  w.stored.replyHistoryRecords = await w.c.getReplyHistoryRecords();
+  assert.equal((await w.c.queryTweetReplyHistory({ url: TARGET })).needsReview, true);
+});
+
+test("a draft is not a posted history record and does not block a new reply", async t => {
+  const w = await worker(t);
+  w.stored.replyHistoryRecords = [{ tweetUrl: ALIAS, replyText: "Draft only", mode: "fill" }];
+  const result = await w.c.queryTweetReplyHistory({ url: TARGET });
+  assert.equal(result.replied, false);
+  assert.equal(result.needsReview, undefined);
+});
+
+test("an unreadable history is unknown rather than permission to publish again", async t => {
+  const w = await worker(t);
+  w.hooks.storageGet = keys => { if (keys.includes("replyHistoryRecords")) throw Error("Storage read failed"); };
+  const result = await w.c.queryTweetReplyHistory({url: TARGET});
+  assert.equal(result.replied, false);
+  assert.equal(result.needsReview, true);
 });
 
 test("completion evidence accepts the same ID alias but still binds run and task", async t => {

@@ -44,6 +44,12 @@ function harness(options = {}) {
     Date: { now: () => now },
     commandQueueRunning: false,
     activeStepQueue: null,
+    panelEpoch: 0,
+    panelStopPending: false,
+    // Queue tests isolate panel rendering; full STOP/timer behavior is covered
+    // by panel-stop-reset.test.cjs using the entire production sidebar.
+    pausePanelActivity: () => ++context.panelEpoch,
+    finishPanelStop: epoch => epoch === context.panelEpoch,
     stepButtons: buttons,
     showCommandStatus: (text, kind) => statuses.push({ text, kind }),
     saveSettings: options.saveSettings || (async () => true),
@@ -65,7 +71,7 @@ function harness(options = {}) {
     }
   });
   vm.runInContext(stageDeclaration, context);
-  for (const name of ["runPanelTask", "runStepQueue", "cancelStepQueue", "sendCommandAndWaitForStage",
+  for (const name of ["runPanelTask", "runStepQueue", "retirePendingPanelStop", "cancelStepQueue", "sendCommandAndWaitForStage",
     "withClientWindowId", "waitForStateStage", "getStepWaitTimeoutMs", "setStepButtonsDisabled", "setButtonRunning"]) {
     vm.runInContext(declaration(name), context);
   }
