@@ -258,6 +258,30 @@ test("a permanent-ignore lookup crossing STOP and restart cannot add an old task
   assert.equal(vm.runInContext("permanentIgnoredTaskKeysCache.has('old-ignored-task')", w.c), false);
 });
 
+test("STOP cancels and clears alarms after the first snapshot write rejects", { timeout: 3000 }, async t => {
+  const w = await worker(t);
+  let rejected = false;
+  w.hooks.storageSet = values => {
+    if (!rejected && values.lighthouseAutoRunStateV1?.manuallyStopped) {
+      rejected = true;
+      throw new Error("first STOP snapshot unavailable");
+    }
+  };
+  const result = await w.message("STOP_RUN");
+  assert.equal(result.ok, true);
+  assert.equal(w.stored.lighthouseAutoRunStateV1.manuallyStopped, true);
+  assert.ok(w.effects.some(effect => effect.type === "alarmClear"));
+  assert.ok(w.effects.some(effect => effect.message?.type === "AUTOMATION_PAUSE_CHANGED" && effect.message.paused));
+});
+
+test("an X draft is neither written nor returned as a published reply", async t => {
+  const w = await worker(t);
+  const draft = { ok: true, mode: "fill", replyText: "draft", tweet: { url: oldXTab.url } };
+  assert.equal(await w.c.recordReplyHistory(draft), false);
+  w.stored.replyHistoryRecords = [{ ...draft, tweetUrl: oldXTab.url }];
+  assert.equal((await w.c.queryTweetReplyHistory(draft.tweet)).replied, false);
+});
+
 for (const operation of ["markPermanentIgnoredTask", "recordReplyHistory"]) {
   test(`${operation}: an old persistence acknowledgement cannot log into a restarted run`, { timeout: 3000 }, async t => {
     const w = await worker(t), entered = deferred(), release = deferred();
@@ -270,7 +294,8 @@ for (const operation of ["markPermanentIgnoredTask", "recordReplyHistory"]) {
       return release.promise;
     };
     const pending = operation === "recordReplyHistory"
-      ? w.c.recordReplyHistory({ ok: true, replyText: "completed reply retained", tweet: { url: oldXTab.url } })
+      ? w.c.recordReplyHistory({ ok: true, mode: "post", verify: { ok: true, reason: "published_reply" },
+        replyText: "completed reply retained", tweet: { url: oldXTab.url } })
       : w.c.markPermanentIgnoredTask({ taskKey: "old-ignored-task", taskType: "old-type" });
     await entered.promise;
     const snapshot = await w.restart();

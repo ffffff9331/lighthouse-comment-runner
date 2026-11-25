@@ -21,6 +21,11 @@ function node(text, options = {}) {
   };
 }
 
+function showLockedReceipt(fixture) {
+  fixture.nodes = fixture.nodes.filter(item => item.innerText !== "锁定席位");
+  fixture.nodes.push(node("席位已锁定"), node("去 X 完成动作", { control: true, href: URL_X }));
+}
+
 // Real listener, click, lock verification and receipt handling; only DOM/page
 // navigation and elapsed time are simulated. No fixture can reach a website.
 function page(options = {}) {
@@ -102,7 +107,7 @@ function page(options = {}) {
 
 for (const route of ["DEBUG_LOCK_SEAT_AND_EXTRACT", "WAIT_SELECTED_COUNTDOWN_AND_LOCK", "START_LIGHTHOUSE_COMMENT_TASK"]) {
   test(`${route}: new success on the selected detail confirms exactly one lock click`, async () => {
-    const p = page({ onClick(f) { f.nodes.push(node("席位已锁定")); } });
+    const p = page({ onClick: showLockedReceipt });
     const result = await p.dispatch(route);
     assert.equal(result.ok, true, result.message);
     assert.equal(result.task.seatLocked, true);
@@ -141,7 +146,7 @@ for (const kind of ["detached", "hidden", "unrelated-state", "preview-link", "ol
 test("temporary loading followed by current-task success is awaited", async () => {
   let observedLoading = false;
   const p = page({ onClick(_f, button) { button.disabled = true; }, onWait(f) {
-    if (f.clicks) { observedLoading = true; f.nodes.push(node("已领取")); }
+    if (f.clicks && !observedLoading) { observedLoading = true; showLockedReceipt(f); }
   } });
   const result = await p.dispatch();
   assert.equal(result.ok, true, result.message);
@@ -230,7 +235,7 @@ for (const scenario of ["disabled-claim", "wrong-target", "missing-target", "dis
 test("a slow platform acknowledgement after five seconds is awaited without another claim", async () => {
   let elapsed = 0;
   const p = page({ onClick(_f, button) { button.disabled = true; }, onWait(f) {
-    if (f.clicks && ++elapsed >= 20) f.nodes.push(node("席位已锁定"));
+    if (f.clicks && ++elapsed === 20) showLockedReceipt(f);
   } });
   const result = await p.dispatch();
   assert.equal(result.ok, true, result.message);
@@ -245,7 +250,7 @@ for (const changedTask of [false, true]) {
       suspended = true;
       f.elapse(45000);
       if (changedTask) f.root.title = "Different order";
-      f.nodes.push(node("席位已锁定"));
+      showLockedReceipt(f);
     } });
     const result = await p.dispatch();
     assert.equal(result.ok, !changedTask, result.message);
@@ -299,7 +304,7 @@ for (const scenario of ["stale", "other-detail", "generic-error", "old-success",
 test("success takes precedence over transient global refusal feedback", async () => {
   const p = page({ onClick(f) {
     f.notify("当前没有可锁定的席位，请刷新任务查看最新名额。");
-    f.nodes.push(node("席位已锁定"));
+    showLockedReceipt(f);
   } });
   const result = await p.dispatch();
   assert.equal(result.ok, true, result.message);
@@ -308,15 +313,15 @@ test("success takes precedence over transient global refusal feedback", async ()
   assert.equal(p.fixture.observers.size, 0);
 });
 
-test("a newly enabled X action in the same detail confirms the transition", async () => {
+test("a newly enabled X action without a locked receipt does not confirm the transition", async () => {
   const action = node("前往 X 完成动作", { control: true, disabled: true, href: URL_X });
   const p = page({ initialNodes: [action], onClick() { action.disabled = false; } });
-  assert.equal((await p.dispatch()).ok, true);
+  assert.equal((await p.dispatch()).ok, false);
   assert.equal(p.fixture.clicks, 1);
 });
 
 test("unrelated refusal text cannot override current-detail success", async () => {
-  const p = page({ onClick(f) { f.outside = "其他订单 不可领取"; f.nodes.push(node("已锁定")); } });
+  const p = page({ onClick(f) { f.outside = "其他订单 不可领取"; showLockedReceipt(f); } });
   const result = await p.dispatch();
   assert.equal(result.ok, true, result.message);
 });
@@ -375,7 +380,7 @@ test("replacement detail with the same title and a success badge remains unconfi
 });
 
 test("switching tasks during the post-lock phase await cannot attach success to the next task", async () => {
-  const p = page({ onClick(f) { f.nodes.push(node("已锁定")); }, onPhase(f, label) {
+  const p = page({ onClick: showLockedReceipt, onPhase(f, label) {
     if (label === "锁定席位后") f.root.title = "Next task";
   } });
   const result = await p.dispatch();
@@ -384,9 +389,9 @@ test("switching tasks during the post-lock phase await cannot attach success to 
   assert.equal(p.fixture.clicks, 1);
 });
 
-for (const evidence of [node("锁定成功"), node("前往 X 完成动作", { control: true, href: URL_X })]) {
-  test(`a late refusal cannot revoke confirmed evidence: ${evidence.innerText}`, async () => {
-    const p = page({ onClick(f) { f.nodes.push(evidence); } });
+{
+  test("a late refusal cannot revoke a complete lock receipt", async () => {
+    const p = page({ onClick: showLockedReceipt });
     const result = await p.dispatch();
     assert.equal(result.ok, true);
     p.fixture.nodes.push(node("不可领取"));
@@ -481,7 +486,7 @@ test("a real batch refusal with a new release countdown clears its persisted int
 });
 
 test("real confirmed lock persists the order and clears the pending intent", async t => {
-  const p = page({ onClick(f) { f.nodes.push(node("已锁定")); } }), w = await worker(t, p);
+  const p = page({ onClick: showLockedReceipt }), w = await worker(t, p);
   assert.equal((await w.send()).ok, true);
   assert.equal(w.state().currentTask.seatLocked, true);
   assert.equal(w.state().uncertainAction, undefined);

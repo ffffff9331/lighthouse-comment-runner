@@ -193,10 +193,7 @@
       DEBUG_OPEN_FIRST_COMMENT_TASK: () => debugOpenFirstCommentTask(message.settings, message),
       OPEN_SELECTED_COUNTDOWN_TASK_DETAIL: () => openSelectedCountdownTaskDetail(message.settings, message.selectedTask),
       OPEN_SELECTED_COUNTDOWN_TASK_TWEET: () => openSelectedCountdownTaskTweet(message.settings, message.selectedTask),
-      OPEN_CURRENT_DETAIL_TWEET_TARGET: () => openCurrentDetailTweetTarget(
-        message.settings,
-        message.taskTypeHint || message.task?.taskType || ""
-      ),
+      OPEN_CURRENT_DETAIL_TWEET_TARGET: () => openCurrentDetailTweetTarget(message),
       WAIT_SELECTED_COUNTDOWN_AND_LOCK: () => waitSelectedCountdownAndLock(message.settings, message.selectedTask),
       CHECK_LIGHTHOUSE_LOCK_FAILURE: () => checkLighthouseLockFailure(message),
       CHECK_LIGHTHOUSE_EXECUTION_STATE: () => readExecutionState(message),
@@ -551,18 +548,19 @@
     };
   }
 
-  async function openCurrentDetailTweetTarget(settings, taskTypeHint = "") {
-    // This command is the post-lock fallback.  Do not wait for the full page
-    // timeout here: the background retries it and can use an extracted URL.
-    const detailTask = await waitForSelectedTaskTweetTarget(settings, taskTypeHint, 1800);
-    return {
-      ok: true,
-      message: detailTask.awaitingXTabAdoption ? "已点击当前任务详情的在 X 打开控件" : "已从当前任务详情提取推文链接",
-      task: {
-        ...detailTask,
-        source: "current_lighthouse_detail"
+  async function openCurrentDetailTweetTarget(message) {
+    const binding = currentLockedNavigationBinding(message);
+    const target = binding && findOpenTweetTargetButton();
+    if (!target || !binding.root.contains(target)) {
+      return { ok: false, message: "当前详情没有与本单目标绑定的 X 入口" };
+    }
+    await clickElement(target, { beforeClick() {
+      if (currentLockedNavigationBinding(message) !== binding
+          || !binding.root.contains(target) || findOpenTweetTargetButton() !== target) {
+        throw new Error("点击前订单或 X 入口已变化");
       }
-    };
+    } });
+    return { ok: true, taskKey: binding.taskKey, tweetUrl: binding.tweetUrl };
   }
 
   async function findSelectedCountdownCandidate(settings, selectedTask) {
@@ -1074,8 +1072,9 @@
     const lockObservation = observeLockAttempt(taskBeforeClick);
     await clickAndVerifyLock(lockButton, settings, lockObservation, expectedInvitation);
     await confirmPagePhase(["detail_ready"], settings, "锁定席位后", { timeoutMs: 2500 });
-    if (!isSameLockDetail(lockObservation)) {
-      const error = new Error("锁位确认期间任务详情已变化，未确认当前订单状态，请核对本单");
+    if (!isSameLockDetail(lockObservation)
+        || !hasConfirmedLockedDetail(lockObservation.root, lockObservation.tweetUrl || lockObservation.task?.tweetUrl)) {
+      const error = new Error("锁位确认后未找到本单的完整回执，请核对本单");
       error.task = lockObservation.task;
       throw error;
     }
@@ -2324,48 +2323,30 @@
   function checkOfficialCompletion(message) {
     const context = completionContext;
     if (!context || context.runId !== message.runId || context.taskKey !== message.task?.taskKey) return { ok: true, completed: false };
-    if (context.evidence) return { ok: true, completed: true, evidence: context.evidence };
-    const root = findOfficialCompletionRoots().find((node) => {
-      if (!context.baseline.has(node)) return true;
-      return context.baseline.get(node) !== getOfficialCompletionRootFingerprint(node);
-    });
-    if (!root) return { ok: true, completed: false };
     const target = normalizeTweetUrl(message.task?.tweetUrl || context.tweetUrl);
     const targetIdentity = normalizeTweetUrl(target, true);
-    const rootText = normalize(root.innerText || "");
-    const identityScope = root.closest?.("[role='dialog']") || root;
-    const originalTweetLinks = Array.from(identityScope.querySelectorAll("a[href]"))
-      .filter((node) => /^查看原推文$/.test(normalize(node.innerText || node.textContent || "")))
-      .map((node) => normalizeTweetUrl(node.href, true)).filter(Boolean);
-    if (originalTweetLinks.length && (!targetIdentity || !originalTweetLinks.every((url) => url === targetIdentity))) {
-      return { ok: true, completed: false };
-    }
-    // The new dispatch receipt removes its target link. It is attributable
-    // only when this exact dialog was observed locked to the watched order.
-    if (identityScope.getAttribute?.("data-engagement-dispatch") === "true" && !originalTweetLinks.length) {
+    const watchedIdentity = normalizeTweetUrl(context.tweetUrl, true);
+    if (!targetIdentity || (watchedIdentity && watchedIdentity !== targetIdentity)) return { ok: true, completed: false };
+    if (context.evidence) return { ok: true, completed: true, evidence: context.evidence };
+    const root = findOfficialCompletionRoots().find((node) => {
+      if (context.baseline.get(node) === getOfficialCompletionRootFingerprint(node)) return false;
+      const identityScope = node.closest?.("[role='dialog']") || node;
+      const originalTweetLinks = Array.from(identityScope.querySelectorAll("a[href]"))
+        .filter(link => /^查看原推文$/.test(normalize(link.innerText || link.textContent || "")))
+        .map(link => normalizeTweetUrl(link.href, true));
+      if (originalTweetLinks.length) return originalTweetLinks.every(url => url === targetIdentity);
+      // Linkless dispatch results are attributable only on a dialog already
+      // observed locked to this specific order. A remount is not evidence.
       const binding = context.navigationBinding;
-      if (!targetIdentity || binding?.root !== identityScope || binding.taskKey !== context.taskKey
-          || normalizeTweetUrl(binding.tweetUrl, true) !== targetIdentity) return { ok: true, completed: false };
-    }
-    // Reopening a progress card is only navigation. Its title and reward are
-    // not proof of identity: require the official result's original X link.
-    if (context.requireExactTarget && (!targetIdentity || !originalTweetLinks.includes(targetIdentity))) {
-      return { ok: true, completed: false };
-    }
-    const links = Array.from(root.querySelectorAll("a[href]"))
-      .map((node) => normalizeTweetUrl(node.href, true))
-      .filter(Boolean);
-    // The paid-result overlay also contains unrelated recommended campaigns.
-    // Only use X links as an identity check when the result panel has no
-    // recommendation section; the completion watch itself is already scoped
-    // to the current run and task and rejects pre-existing result panels.
-    const hasRecommendedCampaigns = /继续搞钱|类似任务|推荐任务|查看全部/.test(rootText);
-    if (!hasRecommendedCampaigns && links.length && (!targetIdentity || !links.includes(targetIdentity))) {
-      return { ok: true, completed: false };
-    }
+      return !context.requireExactTarget && identityScope.getAttribute?.("data-engagement-dispatch") === "true"
+        && binding?.root === identityScope && binding.taskKey === context.taskKey
+        && normalizeTweetUrl(binding.tweetUrl, true) === targetIdentity;
+    });
+    if (!root) return { ok: true, completed: false };
+    const rootText = normalize(root.innerText || "");
     context.completionRoot = root;
     context.completionFingerprint = rootText;
-    context.evidence = { runId: context.runId, taskKey: context.taskKey, tweetUrl: target, observedAt: Date.now(), text: normalize(root.innerText || "").slice(0, 500) };
+    context.evidence = { runId: context.runId, taskKey: context.taskKey, tweetUrl: target, observedAt: Date.now(), text: rootText.slice(0, 500) };
     return { ok: true, completed: true, evidence: context.evidence };
   }
 
@@ -2796,7 +2777,7 @@
     const claimControls = Array.from(root.querySelectorAll("button,a,[role='button'],input[type='button'],input[type='submit']"))
       .filter((node) => isVisible(node) && node.matches?.("button,a[href],[role='button'],input[type='button'],input[type='submit']"))
       .some((node) => /^(?:锁定席位|锁定名额|抢占席位|领取任务|开始任务|去评论)(?:\s|·|$)/.test(normalize(buttonText(node))));
-    if (claimControls) return false;
+    if (claimControls || readBatchReleaseControlState(root).present) return false;
     const evidence = lockConfirmationEvidence(root);
     return evidence.some(value => /^status:(?:席位已锁定|已锁定席位|锁定成功)$/.test(value))
       && evidence.some(value => /^action:(?:去|前往)\s*X\s*完成动作:/.test(value));
@@ -2990,7 +2971,6 @@
           report("info", "已复核本单席位锁定、目标链接和可用 X 入口，接续本单");
           return true;
         }
-        if (evidence.some(value => !observation.evidence.includes(value))) return true;
         const queueResult = observation.queueRejection;
         const canRejectQueue = () => !observation.priorClaimAttempted && observation.rejectionAbsent
           && observation.positiveStateAbsent && isSameLockDetail(observation)
@@ -3020,6 +3000,7 @@
           && readBatchReleaseControlState(observation.root).waiting;
         if (refusal && !observation.priorClaimAttempted && observation.rejectionAbsent
             && observation.positiveStateAbsent && !hasPositiveClaimState(text, observation.root)
+            && !evidence.some(value => !observation.evidence.includes(value))
             && (findLockButton() || returnedToBatch) && !observation.evidence.some(value => value.startsWith("status:"))) {
           const error = new Error(`平台明确拒绝本次锁位：${refusal.text}`);
           error.confirmedClaimRejection = true;

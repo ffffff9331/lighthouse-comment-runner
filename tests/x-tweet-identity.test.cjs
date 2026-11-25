@@ -167,14 +167,14 @@ for (const patch of [{ task: { taskKey: "identity-order", tweetUrl: OTHER } }, {
 }
 
 for (const type of ["RUN_X_REPLY", "COMPLETE_X_TASK_WIDGET"]) {
-  test(`reply-compose exception keeps its existing step restriction: ${type}`, async () => {
+  test(`a generic compose route cannot inherit the active target: ${type}`, async () => {
     const p = page({ target: CANONICAL, onAction(f) {
       f.location.href = "https://x.com/compose/post";
       f.composer = true;
       return { ok: true };
     } });
     const result = await p.send({ type });
-    assert.equal(result.ok, type === "RUN_X_REPLY");
+    assert.equal(result.ok, false);
     assert.equal(p.fixture.actions.length, 1);
   });
 }

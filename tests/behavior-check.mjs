@@ -1008,8 +1008,8 @@ await test("navigation during a step invalidates its result", async () => {
   h.finish();
   assert.equal((await first).ok, false);
 });
-await test("only the active reply step may survive a visible X compose route", () => {
-  const c = contextFor(xPage, ["assertActiveRun", "isExpectedReplyComposeTransition"], {
+await test("an active reply step cannot survive an unbound X compose route", () => {
+  const c = contextFor(xPage, ["assertActiveRun"], {
     activeTargetUrl: "https://x.com/test/status/123",
     activeRunId: "run-1",
     activeStepName: "RUN_X_REPLY",
@@ -1019,7 +1019,7 @@ await test("only the active reply step may survive a visible X compose route", (
     document: { querySelector: () => ({}) },
     normalizeTweetUrl: (value) => /\/status\/\d+/.test(String(value || "")) ? String(value) : ""
   });
-  assert.doesNotThrow(() => c.assertActiveRun("run-1"));
+  assert.throws(() => c.assertActiveRun("run-1"), /目标推文已变化/);
   c.activeStepName = "COMPLETE_X_TASK_WIDGET";
   assert.throws(() => c.assertActiveRun("run-1"), /目标推文已变化/);
   c.activeStepName = "RUN_X_REPLY";
@@ -1704,7 +1704,9 @@ if (platform === "xinhuo") {
   });
   await test("completion watch rejects pre-existing evidence and keeps newly observed evidence", () => {
     const old = { innerText: "old result", querySelectorAll: () => [] };
-    const fresh = { innerText: "new result", querySelectorAll: () => [] };
+    const fresh = { innerText: "new result", querySelectorAll: () => [
+      { innerText: "查看原推文", href: "https://x.com/a/status/1" }
+    ] };
     let roots = [old];
     const c = contextFor(page, ["getOfficialCompletionRootFingerprint", "beginCompletionWatch", "checkOfficialCompletion"], {
       completionContext: null, normalizeTweetUrl: (s) => s,
@@ -1720,7 +1722,7 @@ if (platform === "xinhuo") {
     assert.equal(c.checkOfficialCompletion(message).completed, true);
     assert.equal(c.checkOfficialCompletion({ ...message, task: { taskKey: "b" } }).completed, false);
   });
-  await test("completion watch accepts a replacement panel with identical official text", () => {
+  await test("completion watch rejects a replacement panel with identical linkless text", () => {
     const old = { innerText: "验证成功 · 奖励已到账 +0.10 LUX", querySelectorAll: () => [] };
     const replacement = { innerText: old.innerText, querySelectorAll: () => [] };
     let roots = [old];
@@ -1731,10 +1733,12 @@ if (platform === "xinhuo") {
     const message = { runId: "r", task: { taskKey: "a", tweetUrl: "https://x.com/a/status/1" } };
     c.beginCompletionWatch(message);
     roots = [replacement];
-    assert.equal(c.checkOfficialCompletion(message).completed, true);
+    assert.equal(c.checkOfficialCompletion(message).completed, false);
   });
   await test("official completion is not rejected by an unrelated detail link underneath", () => {
-    const root = { innerText: "验证通过 · 已通过 +0.10 LUX", querySelectorAll: () => [] };
+    const root = { innerText: "验证通过 · 已通过 +0.10 LUX", querySelectorAll: () => [
+      { innerText: "查看原推文", href: "https://x.com/a/status/1" }
+    ] };
     let roots = [];
     const c = contextFor(page, ["getOfficialCompletionRootFingerprint", "beginCompletionWatch", "checkOfficialCompletion"], {
       completionContext: null, normalizeTweetUrl: (s) => s,
@@ -1819,12 +1823,13 @@ if (platform === "xinhuo") {
         running: true,
         runId: "run-1",
         xTabId: null,
-        currentTask: { seatLocked: true, tweetUrl: "https://x.com/test/status/123" },
+        currentTask: { taskKey: "test-order", seatLocked: true, tweetUrl: "https://x.com/test/status/123" },
         pendingXOpen: { lighthouseTabId: 1, windowId: 2, startedAt: 10 }
       },
       normalizeTweetUrl: (value) => String(value || "").replace(/\?.*$/, ""),
       getBoundMatchingTaskXTab: async () => null,
       consumeXOpenCandidate: () => ({ id: 9, windowId: 2, url: "https://x.com/test/status/123" }),
+      clearXOpenWatch() {},
       findRecentTweetTab: async () => null,
       adoptCurrentXTab: (tab, task, source) => { adopted = { tab, task, source }; },
       openDirectTweetTabIfAvailable: async () => { directOpens += 1; return 10; },
@@ -1846,7 +1851,7 @@ if (platform === "xinhuo") {
         running: true,
         runId: "run-1",
         xTabId: null,
-        currentTask: { seatLocked: true, tweetUrl: "https://x.com/test/status/123" },
+        currentTask: { taskKey: "test-order", seatLocked: true, tweetUrl: "https://x.com/test/status/123" },
         pendingXOpen: { lighthouseTabId: 1, windowId: 2, startedAt: 10 }
       },
       normalizeTweetUrl: (value) => String(value || "").replace(/\?.*$/, ""),

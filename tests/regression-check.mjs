@@ -16,7 +16,7 @@ assert.match(background, /const SITE_X_OPEN_WAIT_MS = 5000/);
 assert.doesNotMatch(waitFunction, /getActiveTweetTab\(/);
 assert.match(waitFunction, /consumeXOpenCandidate\(lighthouseTabId, currentExpectedUrl\)/);
 assert.match(waitFunction, /source: "extension_fallback"/);
-assert.match(waitFunction, /单次点击“去 X 完成动作”/);
+assert.match(waitFunction, /单次点击本单已绑定的 X 入口/);
 assert.match(background, /const createProperties = \{ url: tweetUrl, active: true, openerTabId: lighthouseTabId \}/);
 assert.match(background, /await focusTaskXTab\(tabId\)/);
 assert.match(background, /async function focusTaskXTab/);
@@ -77,9 +77,7 @@ assert.match(monitor, /function hasUnsupportedCommentGuidance/);
 assert.match(debugPage, /function runPanelTask/);
 assert.match(debugPage, /message channel closed\|Extension context invalidated\|Receiving end does not exist/);
 assert.doesNotMatch(debugPage, /button\.addEventListener\("click", async \(\) => \{\s*await runSingleCommand/);
-assert.match(xPage, /activeStepName !== "RUN_X_REPLY"/);
-assert.match(xPage, /url\.pathname !== "\/compose\/post"/);
-assert.match(xPage, /Date\.now\(\) - activeStepStartedAt > 45000/);
+assert.doesNotMatch(xPage, /isExpectedReplyComposeTransition/);
 assert.match(background, /settingsVersion: 14/);
 assert.match(background, /model: settings\.aiModel/);
 assert.match(background, /aiModel: String\(merged\.aiModel/);
@@ -105,12 +103,10 @@ const sharedReplyPipelineFns = ["runReply",
   "setReplyComposerTextNatively",
   "waitForNativeComposerText",
   "classifyReplyComposerMismatch",
-  "clearReplyBoxIfNeeded",
   "findReplyBox",
   "clickPostButtonAndVerify",
   "waitForReplySendButtonReady",
   "waitForReplySuccess",
-  "waitForDraftClearAfterReplySuccess",
   "waitForReplyBoxContentStable",
   "simulateReadingBeforeReply",
   "waitForPageReady",

@@ -21,8 +21,6 @@
 
   const stepResults = new Map();
   let activeStepKey = "";
-  let activeStepName = "";
-  let activeStepStartedAt = 0;
   let activeTargetUrl = "";
   let activeRunId = "";
   const cancelledRunIds = new Set();
@@ -86,8 +84,6 @@
       return Promise.resolve({ ok: false, conflict: true, message: "另一任务步骤仍在执行，未触发新操作" });
     }
     activeStepKey = key;
-    activeStepName = step;
-    activeStepStartedAt = Date.now();
     activeTargetUrl = target;
     activeRunId = message.runId;
     globalThis[RUN_LOCK_KEY] = { active: true, runId: message.runId, instanceId: INSTANCE_ID };
@@ -102,8 +98,6 @@
       .finally(() => {
         if (activeStepKey !== key) return;
         activeStepKey = "";
-        activeStepName = "";
-        activeStepStartedAt = 0;
         if (globalThis[RUN_LOCK_KEY]?.instanceId === INSTANCE_ID) globalThis[RUN_LOCK_KEY].active = false;
       }).then((result) => {
         // In-flight duplicates share one promise; only proven no-action failures
@@ -139,8 +133,6 @@
     if (activeRunId) cancelledRunIds.add(activeRunId);
     activeRunId = "";
     activeStepKey = "";
-    activeStepName = "";
-    activeStepStartedAt = 0;
     activeTargetUrl = "";
     stepResults.clear();
     cachedTaskWidgetControls = null;
@@ -234,15 +226,9 @@
     }
 
     const replyText = aiResponse.replyText;
-    if (settings.replyProvider === "sola_bridge") {
-      assertActiveRun(runId);
-      const bridged = await trySolaBridge({ ...(task || {}), replyText, tweet }, settings);
-      if (bridged.ok) return { ...bridged, replyText, tweet, like: likeResult, follow: followResult, repost: repostResult, taskActions };
-    }
-
     assertActiveRun(runId);
-    await openReplyComposer(settings);
-    await fillReplyText(replyText, settings);
+    const replyInput = await openReplyComposer(settings);
+    await fillReplyText(replyText, settings, replyInput);
 
     if (settings.replyMode === "fill") {
       return {
@@ -259,7 +245,7 @@
     }
 
     assertActiveRun(runId);
-    const postResult = await clickPostButtonAndVerify(settings);
+    const postResult = await clickPostButtonAndVerify(replyInput, replyText, task);
     assertActiveRun(runId);
     return {
       ok: postResult?.ok === true,
@@ -1369,13 +1355,6 @@
     const local = await queryLocalReplyHistory(tweet, task);
     if (local.replied) return local;
 
-    // A native-mode run has no Sola bridge listening; skip the doomed
-    // postMessage round-trip and its full timeout.
-    const sola = settings.replyProvider === "sola_bridge"
-      ? await querySolaBridgeReplyHistory(tweet, task, settings)
-      : { replied: false, checked: false, source: "disabled_native_mode" };
-    if (sola.replied) return sola;
-
     const page = await findExistingOwnReplyOnPage(tweet, settings);
     if (page.replied) return page;
 
@@ -1400,51 +1379,6 @@
       }
     } catch (_) {}
     return { replied: false };
-  }
-
-  async function querySolaBridgeReplyHistory(tweet, task, settings = {}) {
-    const tweetUrl = normalizeTweetUrl(tweet?.url || task?.tweetUrl || location.href);
-    if (!tweetUrl) return { replied: false };
-
-    const requestId = `lh-dedupe-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const timeoutMs = Math.max(1200, Math.min(Number(settings.actionDelayMs || 1200) * 2, 3500));
-    const response = await new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        window.removeEventListener("message", listener);
-        resolve(null);
-      }, timeoutMs);
-
-      function listener(event) {
-        if (event.source !== window) return;
-        const data = event.data || {};
-        if (data.source !== "sola-login-reply" || data.requestId !== requestId) return;
-        clearTimeout(timer);
-        window.removeEventListener("message", listener);
-        resolve(data);
-      }
-
-      window.addEventListener("message", listener);
-      window.postMessage({
-        source: "lighthouse-comment-runner",
-        type: "REPLY_DEDUPE_QUERY",
-        requestId,
-        tweetUrl,
-        tweet,
-        task
-      }, "*");
-    });
-
-    if (!response) return { replied: false, checked: false, source: "sola_bridge" };
-    const replied = Boolean(response.replied || response.alreadyReplied || response.exists || response.status === "already_replied");
-    return replied
-      ? {
-        replied: true,
-        source: "sola_bridge",
-        message: response.message || "Sola 本地记录显示该推文已回复",
-        replyText: response.replyText || response.text || "",
-        record: response.record || null
-      }
-      : { replied: false, checked: true, source: "sola_bridge" };
   }
 
   async function findExistingOwnReplyOnPage(tweet, settings = {}) {
@@ -1542,19 +1476,29 @@
     };
   }
 
-  function findRepostTargetControl() {
+  function findBoundTargetArticle() {
     const expected = normalizeTweetUrl(activeTargetUrl, true);
     if (!expected || normalizeTweetUrl(location.href, true) !== expected) return null;
-    // The timeline may include parent/reply/quoted tweets. A visible article
-    // must own a timestamp link for this exact status before we touch it.
     const articles = Array.from(document.querySelectorAll("article")).filter(isVisible)
-      .filter(article => Array.from(article.querySelectorAll("a[href]")).some(link =>
-        link.closest("article") === article && link.querySelector("time")
-        && !link.parentElement?.closest('[role="link"],[data-testid="quoteTweet"]')
-        && normalizeTweetUrl(new URL(link.getAttribute("href"), location.href).href, true) === expected));
-    if (articles.length !== 1) return null;
-    const controls = Array.from(articles[0].querySelectorAll('[data-testid="retweet"],[data-testid="unretweet"]'))
-      .filter(node => node.closest("article") === articles[0] && isVisible(node) && !isButtonDisabled(node));
+      .filter(article => readOwnedTweetIds(article).includes(expected));
+    return articles.length === 1 ? articles[0] : null;
+  }
+
+  function readOwnedTweetIds(article) {
+    return Array.from(article.querySelectorAll("a[href]"))
+      .filter(link => link.closest("article") === article && link.querySelector("time")
+        && !link.parentElement?.closest('[role="link"],[data-testid="quoteTweet"]'))
+      .map(link => {
+        try { return normalizeTweetUrl(new URL(link.getAttribute("href"), location.href).href, true); }
+        catch (_) { return ""; }
+      }).filter(Boolean);
+  }
+
+  function findRepostTargetControl() {
+    const article = findBoundTargetArticle();
+    if (!article) return null;
+    const controls = Array.from(article.querySelectorAll('[data-testid="retweet"],[data-testid="unretweet"]'))
+      .filter(node => node.closest("article") === article && isVisible(node) && !isButtonDisabled(node));
     return controls.length === 1 ? controls[0] : null;
   }
 
@@ -1759,139 +1703,93 @@
     }, timeoutMs, "点赞状态未确认");
   }
 
-  async function trySolaBridge(payload, settings) {
-    const requestId = `lh-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const response = await new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        window.removeEventListener("message", listener);
-        resolve(null);
-      }, Math.max(5000, settings.actionDelayMs * 5));
-
-      function listener(event) {
-        if (event.source !== window) return;
-        const data = event.data || {};
-        if (data.source !== "sola-login-reply" || data.requestId !== requestId) return;
-        clearTimeout(timer);
-        window.removeEventListener("message", listener);
-        resolve(data);
-      }
-
-      window.addEventListener("message", listener);
-      window.postMessage({
-        source: "lighthouse-comment-runner",
-        type: "REPLY_REQUEST",
-        requestId,
-        text: payload.replyText,
-        task: payload
-      }, "*");
-    });
-
-    if (!response) return { ok: false, message: "Sola bridge unavailable" };
-    return {
-      ok: Boolean(response.ok),
-      message: response.message || "Sola bridge finished",
-      mode: "sola_bridge",
-      replyText: payload.replyText
-    };
-  }
-
   async function openReplyComposer(settings) {
-    const existingComposer = await findReplyBox({ soft: true });
-    if (existingComposer) return;
+    const existingComposer = getBoundReplyBox();
+    if (existingComposer) return existingComposer;
 
-    const replyButton = await waitFor(() => {
-      const mainArticle = findMainTweetArticle();
-      const candidate = mainArticle?.querySelector("[data-testid='reply']");
-      return candidate && isVisible(candidate) ? candidate : null;
-    }, 15000, "未找到主推文回复按钮");
+    const getReplyButton = () => {
+      if (Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"]')).some(isVisible)) return null;
+      const article = findBoundTargetArticle();
+      const buttons = Array.from(article?.querySelectorAll("[data-testid='reply']") || [])
+        .filter(button => button.closest("article") === article && isVisible(button) && !isButtonDisabled(button));
+      return buttons.length === 1 ? buttons[0] : null;
+    };
+    const replyButton = await waitFor(getReplyButton, 15000, "未找到目标推文的唯一回复按钮");
     replyButton.scrollIntoView({ block: "center", inline: "center" });
     await wait(settings.actionDelayMs);
-    await clickElement(replyButton);
-    await findReplyBox({ timeoutMs: 12000 });
+    await clickElement(replyButton, { beforeClick() {
+      if (getReplyButton() !== replyButton) throw new Error("目标推文回复按钮已变化");
+    } });
+    return findReplyBox({ timeoutMs: 12000 });
   }
 
-  async function fillReplyText(text, settings) {
+  async function fillReplyText(text, settings, textbox) {
     const runId = activeRunId;
     assertActiveRun(runId);
-    const textbox = await findReplyBox({ timeoutMs: 12000 });
-    assertActiveRun(runId);
-    if (!(await activateReplyInput(textbox))) {
-      throw new Error("回复框激活失败");
-    }
-
     await wait(settings.actionDelayMs / 2);
-    assertActiveRun(runId);
-    await clearReplyBoxIfNeeded(textbox);
-    await wait(300);
     assertActiveRun(runId);
     await pasteTextLikeUser(text, textbox);
 
-    const stable = await waitForReplyBoxContentStable(text, 15000, 2000);
+    const stable = await waitForReplyBoxContentStable(text, 15000, 2000, textbox);
     if (!stable) {
-      const current = await getReplyBoxText();
+      const current = getReplyComposerText(textbox);
       throw new Error(`回复框内容未精确稳定，已停止以避免发送污染回复，expected=${String(text || "").length}, actual=${current.length}`);
     }
     await wait(800);
+    assertBoundReplyBox(textbox, text);
   }
 
-  async function clickPostButtonAndVerify(settings) {
+  async function clickPostButtonAndVerify(replyInput, text, task) {
     if (hasAccountRestrictionBanner()) {
       throw new Error("ACCOUNT_RESTRICTION: X 提示账号可能不允许执行操作，请刷新后重试");
     }
 
-    const replyInput = await findReplyBox({ timeoutMs: 5000 });
     const ready = await waitForReplySendButtonReady(replyInput, 10000, 250);
     if (!ready.ok || !ready.button) {
       throw new Error(ready.reason === "account_restriction" ? "ACCOUNT_RESTRICTION: X 提示账号可能不允许执行操作" : "回复按钮未就绪或不可点击");
     }
 
-    await clickElement(ready.button);
-    // The draft-state poll below already verifies the send; no fixed sleep.
-    const success = await waitForReplySuccess(30000, 600, { replyInput, replyButton: ready.button });
-    if (!success.ok) {
-      const draftState = success.draftState || (await getReplyDraftState());
-      throw new Error(success.reason === "account_restriction" ? "ACCOUNT_RESTRICTION: 回复后出现账号限制提示" : `回复确认失败：${success.reason || "草稿仍存在"}，draft=${JSON.stringify(draftState)}`);
-    }
-
-    replyInput.blur();
-    document.body.focus();
-    const postCheck = await waitForDraftClearAfterReplySuccess(6000, 400);
-    if (postCheck?.draftState?.hasDraft) {
-      throw new Error("回复成功后草稿仍存在，已按失败处理");
-    }
-    return { ok: true, reason: success.reason, message: "X 回复已发送并确认成功" };
+    let publication;
+    await clickElement(ready.button, { beforeClick() {
+      assertBoundReplyBox(replyInput, text);
+      if (findSendButton(replyInput) !== ready.button || !isReplySendButtonUsable(ready.button)
+          || hasAccountRestrictionBanner()) throw new Error("发送前回复按钮或账号状态已变化");
+      const column = findBoundTargetArticle()?.closest('[data-testid="primaryColumn"]');
+      const handle = getCurrentAccountHandle();
+      const actions = inferTaskActions(task);
+      if (!column || !handle || !actions.complete || !actions.steps.some(step => step.action === "comment" && !step.completed)) {
+        throw new Error("缺少可核对发布结果的目标线程、账号或评论状态，未发送");
+      }
+      publication = { column, handle, text, task, before: new Set(
+        Array.from(column.querySelectorAll("article")).flatMap(readOwnedTweetIds)
+      ) };
+    } });
+    return waitForReplySuccess(30000, 600, publication);
   }
 
   async function findReplyBox(options = {}) {
     const { timeoutMs = 10000, soft = false } = options;
-    const selectors = [
-      '[data-testid="tweetTextarea_0"]',
-      '[aria-label="帖子文本"]',
-      '[aria-label="Post text"]',
-      '[contenteditable="true"][role="textbox"]'
-    ];
     try {
-      return await waitFor(() => {
-        const mainArticle = findMainTweetArticle();
-        if (mainArticle) {
-          for (const selector of selectors) {
-            const scoped = mainArticle.querySelector(selector);
-            const composer = resolveReplyComposer(scoped);
-            if (composer && !hasAriaHiddenAncestor(composer) && isVisible(composer)) return composer;
-          }
-        }
-        for (const selector of selectors) {
-          const candidate = document.querySelector(selector);
-          const composer = resolveReplyComposer(candidate);
-          const ownerArticle = composer?.closest?.("article");
-          if (composer && !hasAriaHiddenAncestor(composer) && isVisible(composer)
-            && (!ownerArticle || ownerArticle === mainArticle)) return composer;
-        }
-        return null;
-      }, timeoutMs, "未找到回复框");
+      return await waitFor(getBoundReplyBox, timeoutMs, "未找到与目标推文绑定的唯一回复框");
     } catch (error) {
       if (soft && !automationPaused && !/已取消|已暂停/.test(error?.message || "")) return null;
       throw error;
+    }
+  }
+
+  function getBoundReplyBox() {
+    const article = findBoundTargetArticle();
+    const boxes = Array.from(article?.querySelectorAll('[data-testid="tweetTextarea_0"]') || [])
+      .map(resolveReplyComposer)
+      .filter(box => box.matches?.('[contenteditable="true"]') && box.closest("article") === article
+        && !hasAriaHiddenAncestor(box) && isVisible(box));
+    return new Set(boxes).size === 1 ? boxes[0] : null;
+  }
+
+  function assertBoundReplyBox(input, expectedText) {
+    if (!input?.isConnected || getBoundReplyBox() !== input) throw new Error("目标回复框已变化");
+    if (expectedText !== undefined && extractVisibleNodeText(input) !== expectedText) {
+      throw new Error(expectedText ? "回复框内容已变化，未发送" : "回复框已有草稿，未覆盖");
     }
   }
 
@@ -1901,67 +1799,27 @@
     return node.querySelector?.('[contenteditable="true"][role="textbox"], [contenteditable="true"][data-contents="true"], [contenteditable="true"]') || node;
   }
 
-  function getReplyTextRoot(input) {
-    if (!input) return null;
-    return input.querySelector?.('[data-contents="true"]') || input;
-  }
-
   async function activateReplyInput(input) {
     if (!input) return false;
     input.scrollIntoView({ block: "center", inline: "center" });
-    await clickElement(input);
+    await clickElement(input, { beforeClick: () => assertBoundReplyBox(input, "") });
+    assertBoundReplyBox(input, "");
     try {
       input.focus();
     } catch (_) {}
     return document.activeElement === input || input.contains(document.activeElement) || isSelectionInsideNode(input);
   }
 
-  async function clearReplyBoxIfNeeded(input) {
-    const box = input || (await findReplyBox({ timeoutMs: 5000 }));
-    await activateReplyInput(box);
-    const beforeText = getReplyComposerText(box);
-    if (!beforeText) {
-      dispatchReplyComposerInputEvents(box, null, "deleteContentBackward");
-      return;
-    }
-
-    try {
-      document.execCommand("selectAll", false, null);
-    } catch (_) {}
-    await wait(120);
-
-    const maxPresses = Math.max(beforeText.length + 5, 20);
-    for (let index = 0; index < maxPresses; index += 1) {
-      if (!getReplyComposerText(box)) break;
-      box.dispatchEvent(new KeyboardEvent("keydown", {
-        key: "Backspace",
-        code: "Backspace",
-        keyCode: 8,
-        which: 8,
-        bubbles: true,
-        cancelable: true
-      }));
-      await wait(55);
-    }
-
-    if (getReplyComposerText(box)) {
-      throw new Error("回复框已有草稿且清理失败，已停止以避免覆盖或乱删");
-    }
-    dispatchReplyComposerInputEvents(box, null, "deleteContentBackward");
-  }
-
   async function pasteTextLikeUser(text, input) {
     const box = input || (await findReplyBox({ timeoutMs: 5000 }));
+    assertBoundReplyBox(box, "");
     if (!(await activateReplyInput(box))) {
       throw new Error("回复框激活失败，未执行写入");
     }
     await wait(500 + Math.floor(Math.random() * 500));
 
     const normalizedText = String(text || "");
-    const beforeText = getReplyComposerText(box);
-    if (beforeText) {
-      throw new Error(`回复框写入前仍有草稿，已停止避免追加，draft=${beforeText.slice(0, 40)}`);
-    }
+    assertBoundReplyBox(box, "");
 
     const writeResult = await writeReplyTextOnce(box, normalizedText);
     await wait(400);
@@ -1983,12 +1841,10 @@
   async function setReplyComposerTextNatively(input, text) {
     const normalized = String(text || "");
     const beforeText = getReplyComposerText(input);
-    let insertResult = await tryWholeTextPasteOnce(input, normalized);
+    const insertResult = await tryWholeTextPasteOnce(input, normalized);
     if (!insertResult.success) {
-      // A partial or doubled whole-paste leaves residue the character path
-      // cannot handle; clean the box before falling back.
-      await clearReplyBoxIfNeeded(input);
-      insertResult = await insertReplyTextViaCharacterPaste(input, normalized);
+      // An ambiguous write may still settle late. Never clear or replay it.
+      throw new Error("回复写入未确认，已保留编辑框，未清空或重试");
     }
     let settle = insertResult.settle || {
       ok: false,
@@ -2091,11 +1947,10 @@
     }
   }
 
-  // One synthetic paste of the whole reply, verified the same way the
-  // character-by-character path verifies its prefix. Short replies rarely
-  // need the character fallback at all.
+  // A single paste is allowed; a partial write must not be cleared or replayed.
   async function tryWholeTextPasteOnce(input, text) {
     const normalized = String(text || "");
+    assertBoundReplyBox(input, "");
     const dispatch = dispatchReplyPasteText(input, normalized, "synthetic.clipboard.paste.whole");
     if (!dispatch.success) {
       return {
@@ -2319,73 +2174,65 @@
     } catch (_) {}
   }
 
-  async function findSendButton(options = {}) {
-    const { allowDisabled = true, replyBoxOverride = null } = options;
-    const replyBox = replyBoxOverride && replyBoxOverride.isConnected ? replyBoxOverride : await findReplyBox({ timeoutMs: 5000 });
-    const candidates = [];
-    const scopes = [
-      replyBox,
-      replyBox?.parentElement,
-      replyBox?.closest?.('[role="group"]'),
-      replyBox?.closest?.("form"),
-      replyBox?.closest?.("article"),
-      replyBox?.closest?.('[role="dialog"]'),
-      document
-    ].filter(Boolean);
-
-    for (const scope of scopes) {
-      scope.querySelectorAll?.('[data-testid="tweetButtonInline"], [data-testid="tweetButton"], button, [role="button"]').forEach((node) => {
-        if (!candidates.includes(node) && matchesSendButton(node)) candidates.push(node);
-      });
-    }
-
-    const ranked = candidates
-      .map((node) => ({ node: resolveClickableButtonNode(node), score: scoreSendButton(node, replyBox) }))
-      .filter((entry) => entry.node && isVisible(entry.node) && (allowDisabled || !isReplyButtonDisabled(entry.node)))
-      .sort((a, b) => b.score - a.score);
-    return ranked[0]?.node || null;
+  function findSendButton(replyBox) {
+    if (!replyBox || getBoundReplyBox() !== replyBox) return null;
+    const article = replyBox.closest("article");
+    const form = replyBox.closest("form");
+    const scope = form || article;
+    const candidates = Array.from(scope.querySelectorAll('[data-testid="tweetButtonInline"], [data-testid="tweetButton"]'))
+      .filter(node => node.closest("article") === article && node.closest("form") === form)
+      .map(resolveClickableButtonNode)
+      .filter(node => node && node.closest("article") === article && node.closest("form") === form
+        && !hasAriaHiddenAncestor(node) && isVisible(node));
+    return new Set(candidates).size === 1 ? candidates[0] : null;
   }
 
   async function waitForReplySendButtonReady(replyInput, timeoutMs, intervalMs) {
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {
       if (hasAccountRestrictionBanner()) return { ok: false, reason: "account_restriction" };
-      const button = await findSendButton({ allowDisabled: true, replyBoxOverride: replyInput });
+      const button = findSendButton(replyInput);
       if (button && isReplySendButtonUsable(button)) return { ok: true, button };
       await wait(intervalMs);
     }
     return { ok: false, reason: "timeout" };
   }
 
-  async function waitForReplySuccess(timeoutMs, intervalMs, refs = {}) {
+  async function waitForReplySuccess(timeoutMs, intervalMs, publication) {
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {
       if (hasAccountRestrictionBanner()) return { ok: false, reason: "account_restriction" };
-      const draftState = await getReplyDraftState(refs.replyInput);
-      if (!draftState.hasDraft) return { ok: true, reason: "draft_cleared", draftState };
+      const { column, handle, text, task, before } = publication;
+      const target = findBoundTargetArticle();
+      if (!target || target.closest('[data-testid="primaryColumn"]') !== column || getCurrentAccountHandle() !== handle) {
+        return { ok: false, reason: "publication_context_changed", message: "发送后目标线程或账号已变化，未确认发布" };
+      }
+      const actions = inferTaskActions(task);
+      const comment = actions.complete ? actions.steps.filter(step => step.action === "comment") : [];
+      if (comment.length && comment.every(step => step.completed)) {
+        for (const article of column.querySelectorAll("article")) {
+          if (article === target || !isVisible(article) || normalizeHandle(extractAuthorHandle(article)) !== handle) continue;
+          const ids = [...new Set(readOwnedTweetIds(article))];
+          const textNode = article.querySelector('[data-testid="tweetText"]');
+          if (ids.length === 1 && !before.has(ids[0]) && textNode?.closest("article") === article
+              && normalizeText(textNode.innerText) === normalizeText(text)) {
+            return { ok: true, reason: "published_reply", replyUrl: ids[0], message: "X 已显示新回复，官网已确认评论动作" };
+          }
+        }
+      }
       await wait(intervalMs);
     }
-    return { ok: false, reason: "timeout", draftState: await getReplyDraftState(refs.replyInput) };
+    return { ok: false, reason: "publication_unconfirmed", message: "已点击发送，但未核实新回复发布，保留本单，不重复发送" };
   }
 
-  async function waitForDraftClearAfterReplySuccess(timeoutMs, intervalMs) {
-    const started = Date.now();
-    while (Date.now() - started < timeoutMs) {
-      if (hasAccountRestrictionBanner()) return { ok: false, reason: "account_restriction_after_success", draftState: await getReplyDraftState() };
-      const draftState = await getReplyDraftState();
-      if (!draftState.hasDraft) return { ok: true, reason: "draft_cleared", draftState };
-      await wait(intervalMs);
-    }
-    return { ok: false, reason: "draft_still_present", draftState: await getReplyDraftState() };
-  }
-
-  async function waitForReplyBoxContentStable(expectedText, timeoutMs, stableMs) {
+  async function waitForReplyBoxContentStable(expectedText, timeoutMs, stableMs, input) {
     const started = Date.now();
     let last = "";
     let stableSince = Date.now();
     const expected = normalizeReplyTextForSend(expectedText);
     while (Date.now() - started < timeoutMs) {
-      const current = normalizeReplyTextForSend(await getReplyBoxText());
+      assertBoundReplyBox(input);
+      const current = normalizeReplyTextForSend(getReplyComposerText(input));
       if (current === last) {
         if (current === expected && Date.now() - stableSince >= stableMs) return true;
         if (current && current.length > expected.length && Date.now() - stableSince >= Math.max(900, stableMs)) return false;
@@ -2398,22 +2245,8 @@
     return false;
   }
 
-  async function getReplyBoxText() {
-    const box = await findReplyBox({ timeoutMs: 1000, soft: true });
-    return getReplyComposerText(box);
-  }
-
-  async function getReplyDraftState(input) {
-    const box = input && input.isConnected ? input : await findReplyBox({ timeoutMs: 1000, soft: true });
-    const text = getReplyComposerText(box);
-    return { hasDraft: Boolean(text), textLength: text.length, textSample: text.slice(0, 80) };
-  }
-
   function getReplyComposerText(input) {
-    if (!input) return "";
-    const text = extractVisibleNodeText(getReplyTextRoot(input) || input);
-    if (/^(发布你的回复|post your reply|write your reply|回复|reply)$/i.test(text)) return "";
-    return text;
+    return extractVisibleNodeText(input);
   }
 
   function extractVisibleNodeText(node) {
@@ -2432,28 +2265,6 @@
       current = walker.nextNode();
     }
     return text.trim();
-  }
-
-  function matchesSendButton(node) {
-    const clickNode = resolveClickableButtonNode(node);
-    const testid = node.getAttribute?.("data-testid") || clickNode?.getAttribute?.("data-testid") || "";
-    if (testid === "tweetButtonInline" || testid === "tweetButton") return true;
-    const text = node.textContent || clickNode?.textContent || "";
-    const ariaLabel = node.getAttribute?.("aria-label") || clickNode?.getAttribute?.("aria-label") || "";
-    return ["Reply", "回复", "Post", "发布"].some((matcher) => text.includes(matcher) || ariaLabel.includes(matcher));
-  }
-
-  function scoreSendButton(node, input) {
-    if (!node || !matchesSendButton(node)) return -1;
-    const clickNode = resolveClickableButtonNode(node);
-    let score = 0;
-    if (node.getAttribute?.("data-testid") === "tweetButtonInline") score += 50;
-    if (node.getAttribute?.("data-testid") === "tweetButton") score += 20;
-    if (isVisible(clickNode)) score += 20;
-    if (!isReplyButtonDisabled(clickNode)) score += 20;
-    if (input && input.closest?.("form") === clickNode.closest?.("form")) score += 15;
-    if (input && input.closest?.("article") === clickNode.closest?.("article")) score += 10;
-    return score;
   }
 
   function isReplySendButtonUsable(button) {
@@ -2619,6 +2430,12 @@
     try {
       node.scrollIntoView({ block: "center", inline: "center" });
     } catch (_) {}
+    options.beforeClick?.();
+    if (options.beforeClick) {
+      // Do not replay a guarded action if dispatch throws after side effects.
+      node.click();
+      return;
+    }
     try {
       node.click();
       return;
@@ -2676,7 +2493,7 @@
   function assertActiveRun(runId) {
     if (globalThis.__lighthouseCommentTaskRunnerXSingleton__?.paused) throw new Error("运行已停止，页面自动操作已暂停");
     const currentTarget = normalizeTweetUrl(location.href, true);
-    if (activeTargetUrl && currentTarget !== normalizeTweetUrl(activeTargetUrl, true) && !isExpectedReplyComposeTransition()) {
+    if (activeTargetUrl && currentTarget !== normalizeTweetUrl(activeTargetUrl, true)) {
       throw new Error("目标推文已变化，取消本单操作");
     }
     if (runId && (cancelledRunIds.has(runId) || activeRunId !== runId)) {
@@ -2684,15 +2501,4 @@
     }
   }
 
-  function isExpectedReplyComposeTransition() {
-    if (activeStepName !== "RUN_X_REPLY" || !activeTargetUrl || !activeStepStartedAt) return false;
-    if (Date.now() - activeStepStartedAt > 45000) return false;
-    try {
-      const url = new URL(location.href);
-      if (!/^(?:x|twitter)\.com$/i.test(url.hostname) || url.pathname !== "/compose/post") return false;
-    } catch (_) {
-      return false;
-    }
-    return Boolean(document.querySelector?.('[data-testid="tweetTextarea_0"], [aria-label="帖子文本"], [aria-label="Post text"], [contenteditable="true"][role="textbox"]'));
-  }
 })();

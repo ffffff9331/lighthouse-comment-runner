@@ -56,6 +56,7 @@ async function panel(options = {}) {
         return { ok: true, state: clone(state) };
       }
       if (message.type === "SAVE_SETTINGS") return hooks.save ? hooks.save() : { ok: true, settings: clone(settings) };
+      if (message.type === "MONITOR_SAVE_SETTINGS" && hooks.saveMonitor) return hooks.saveMonitor();
       return { ok: true };
     }
   } };
@@ -230,6 +231,13 @@ test("saving settings or requesting a voice test cannot resume a stopped panel",
   assert.equal(p.messages.filter((m) => m.type === "MONITOR_TEST_VOICE").length, 0);
   assert.equal(p.countdownReads(), 0);
   assertCleared(p);
+});
+
+test("monitor save rejection does not acknowledge the combined panel save", async () => {
+  const p = await panel();
+  p.hooks.saveMonitor = () => ({ ok: false, error: "fixture storage unavailable" });
+  assert.equal(await p.c.saveSettings(), false);
+  assert.match(p.node("saveStatus").textContent, /保存失败/);
 });
 
 test("old TTS completion after a fresh start cannot play or release the new speech owner", async () => {

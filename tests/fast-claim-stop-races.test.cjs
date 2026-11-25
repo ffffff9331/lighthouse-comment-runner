@@ -100,7 +100,7 @@ function fixture(name, boundary) {
     if (!held && kind === boundary) { held = true; entered.resolve(); await release.promise; }
     return result;
   };
-  const task = { taskKey: "old-task", taskType: "评论" };
+  const task = { taskKey: "old-task", taskType: "评论", tweetUrl: "https://x.com/fixture/status/123" };
   const c = load(name, {
     runtimeState: { running: true, runId: "old-run", stopEpoch: 1, mode: "debug", stage: "old-stage", failed: 0, completed: 0, currentTask: null },
     LIGHTHOUSE_CAMPAIGNS_URL: "https://app.lhdao.top/campaigns", hasLatchedLighthouseCompletion: () => false,
@@ -121,6 +121,7 @@ function fixture(name, boundary) {
     closeLighthouseTaskDetail: async () => edge("close", true),
     beginXOpenWatch() { effects.push("watch"); }, clearXOpenWatch() { effects.push("clear-watch"); }, markAttemptedTask() {},
     mergeTaskPreservingCapturedTweetUrl: (a, b) => ({ ...a, ...b }),
+    normalizeTweetUrl: value => value || "",
     ensureTweetTabAfterTargetClick: async () => edge("ensure-target", 12),
     openDirectTweetTabIfAvailable: async () => edge("direct-target", null),
     waitForLighthouseOpenedTweet: async () => edge("wait-target", false),
@@ -139,9 +140,9 @@ function fixture(name, boundary) {
 
 const cases = [
   ...["open-next", "RUN_X_WIDGET_CLAIM", "RUN_X_REPLY", "history", "completion", "campaigns"].map(boundary => ({ name: "debugFastXClaimReplyVerify", boundary, args: [] })),
-  ...["lookup", "refresh", "OPEN_CURRENT_DETAIL_TWEET_TARGET"].map(boundary => ({ name: "openNextLighthouseTaskTweetTab", boundary, args: [{ actionDelayMs: 500 }] })),
+  ...["lookup", "refresh", "direct-target"].map(boundary => ({ name: "openNextLighthouseTaskTweetTab", boundary, args: [{ actionDelayMs: 500 }] })),
   ...["lookup", "OPEN_SELECTED_COUNTDOWN_TASK_TWEET"].map(boundary => ({ name: "openSelectedTaskTweetTab", boundary, args: [{ taskKey: "old-task" }, {}] })),
-  ...["direct-target", "wait-target", "OPEN_CURRENT_DETAIL_TWEET_TARGET"].map(boundary => ({ name: "ensureTweetTabAfterTargetClick", boundary, args: [11, {}, { taskKey: "old-task" }, "debug"] })),
+  ...["direct-target", "wait-target"].map(boundary => ({ name: "ensureTweetTabAfterTargetClick", boundary, args: [11, {}, { taskKey: "old-task" }, "debug"] })),
 ];
 for (const item of cases) for (const restart of [false, true]) {
   test(`${item.name}: old ${item.boundary} response after STOP${restart ? " and restart" : ""} has no effects`, { timeout: 2000 }, async () => {

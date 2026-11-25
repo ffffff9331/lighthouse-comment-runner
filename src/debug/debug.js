@@ -105,7 +105,7 @@ const STEP_COMPLETION_STAGES = {
   DEBUG_LOCK_SEAT_OPEN_TWEET: ["tweet_opened"],
   DEBUG_FAST_X_CLAIM_REPLY_VERIFY: ["fast_flow_done"],
   RUN_SELECTED_COUNTDOWN_TASK: ["selected_flow_done", "selected_lock_failed"],
-  DEBUG_RUN_X_REPLY: ["x_replied"],
+  DEBUG_RUN_X_REPLY: ["x_replied", "x_draft_ready"],
   DEBUG_CLOSE_X_RETURN_LIGHTHOUSE: ["returned_lighthouse"],
   DEBUG_CLICK_DONE: ["done_clicked"],
   DEBUG_RETURN_CAMPAIGNS: ["campaigns_returned"]
@@ -114,11 +114,19 @@ const STEP_COMPLETION_STAGES = {
 saveBtn.addEventListener("click", () => runPanelTask(saveSettings));
 document.getElementById("stopBtn").addEventListener("click", () => {
   cancelStepQueue();
-  const stopEpoch = typeof pausePanelActivity === "function" ? pausePanelActivity() : null;
+  const stopEpoch = pausePanelActivity();
   return runPanelTask(async () => {
-    await chrome.runtime.sendMessage({ type: "STOP_RUN" });
-    if (typeof finishPanelStop === "function") finishPanelStop(stopEpoch);
-    await loadState();
+    let response;
+    try {
+      response = await chrome.runtime.sendMessage({ type: "STOP_RUN" });
+    } finally {
+      if (finishPanelStop(stopEpoch)) {
+        await loadState();
+        if (response?.ok === false && !response.cancelled && stopEpoch === panelEpoch) {
+          showCommandStatus(response.error || "未能确认停止状态", "error", 0);
+        }
+      }
+    }
   });
 });
 document.getElementById("clearReplyRecordsBtn").addEventListener("click", () => runPanelTask(clearReplyRecords));
@@ -184,7 +192,9 @@ function pausePanelActivity() {
 }
 
 function finishPanelStop(epoch) {
-  if (epoch === panelEpoch) panelStopPending = false;
+  if (epoch !== panelEpoch) return false;
+  panelStopPending = false;
+  return true;
 }
 
 function applyPanelPause(paused, force = false) {
@@ -256,14 +266,15 @@ async function loadState() {
 
 async function saveSettings() {
   const settings = readSettings();
+  const monitorSettings = readMonitorSettings();
   try {
     if (!(await requestCustomAIHostPermission(settings.aiApiUrl))) return false;
     const response = await chrome.runtime.sendMessage({ type: "SAVE_SETTINGS", settings });
     if (!response?.ok) throw new Error(response?.error || "保存失败，后台没有确认");
+    await saveMonitorSettings(monitorSettings);
     settingsDirty = false;
     renderSettings(response.settings);
     showSaveStatus("已保存，重启后无需重新输入 API Key");
-    await saveMonitorSettings();
     return true;
   } catch (error) {
     showSaveStatus(`保存失败：${error.message || "请重试"}`);
@@ -292,25 +303,9 @@ async function requestCustomAIHostPermission(apiUrl) {
   }
 }
 
-async function saveMonitorSettings() {
-  const ms = readMonitorSettings();
-  try {
-    await chrome.runtime.sendMessage({ type: "MONITOR_SET_ENABLED", enabled: ms.enabled });
-    await chrome.runtime.sendMessage({ type: "MONITOR_SET_THRESHOLD", minBounty: ms.minBounty });
-    await chrome.runtime.sendMessage({
-      type: "MONITOR_SET_VOICE",
-      voiceEnabled: ms.voiceEnabled,
-      voiceEngine: ms.voiceEngine,
-      voiceName: ms.voiceName,
-      rate: ms.rate,
-      pitch: ms.pitch,
-      mimoBaseUrl: ms.mimoBaseUrl,
-      mimoApiKey: ms.mimoApiKey,
-      templateAppear: ms.templateAppear,
-      templateCountdown2m: ms.templateCountdown2m,
-      templateCountdown1m: ms.templateCountdown1m
-    });
-  } catch (_) {}
+async function saveMonitorSettings(ms = readMonitorSettings()) {
+  const response = await chrome.runtime.sendMessage({ type: "MONITOR_SAVE_SETTINGS", ...ms });
+  if (!response?.ok) throw new Error(response?.error || "监控设置未获后台确认");
 }
 
 async function runSingleCommand(button) {
@@ -327,6 +322,8 @@ async function runSingleCommand(button) {
     if (!isCurrent()) return;
     if (!response?.ok) {
       showCommandStatus(response?.error || response?.result?.message || "指令未执行", "error");
+    } else if (response.state?.stage === "x_draft_ready") {
+      showCommandStatus("已填入草稿，等待人工发送", "info");
     } else if (button.dataset.command === "RUN_SELECTED_COUNTDOWN_TASK") {
       showCommandStatus("选中任务流程已完成", "success");
     }
@@ -381,6 +378,11 @@ async function runStepQueue(startIndex) {
         if (!response?.ok) {
           completed = false;
           showCommandStatus(response?.error || response?.result?.message || `${label}未完成`, "error");
+          break;
+        }
+        if (response.state?.stage === "x_draft_ready") {
+          completed = false;
+          showCommandStatus("已填入草稿，等待人工发送，后续步骤未执行", "info");
           break;
         }
       } finally {
@@ -1182,18 +1184,19 @@ function renderCountdowns(tasks, timestamp, reason = "local") {
     const selectedClass = taskKey && taskKey === selectedCountdownKey ? " isSelected" : "";
     const clickableClass = " isSelectable" + (tweetUrl ? " hasTweetUrl" : "");
     const tweetTitle = tweetUrl ? ` · 已有推文链接 ${tweetUrl}` : "";
-    const taskAttrs = ` data-countdown-index="${index}" role="button" tabindex="0" title="选择任务${escapeHtml(tweetTitle)}"`;
+    const taskAttrs = ` data-countdown-index="${index}" role="button" tabindex="0" title="选择任务${escapeHtmlAttribute(tweetTitle)}"`;
     const linkBadge = tweetUrl ? '<span class="cdLink">X</span>' : "";
-    const progressHTML = task.progress > 0
-      ? `<div class="cdProgress" title="进度 ${task.progress}%"><div class="cdProgressBar" style="width:${task.progress}%"></div></div>`
+    const progress = Math.max(0, Math.min(100, Number(task.progress) || 0));
+    const progressHTML = progress > 0
+      ? `<div class="cdProgress" title="进度 ${progress}%"><div class="cdProgressBar" style="width:${progress}%"></div></div>`
       : "";
     const title = task.title ? escapeHtml(task.title) : "";
     return `
       <div class="cdItem ${statusClass}${clickableClass}${selectedClass}"${taskAttrs}>
-        <span class="cdBounty ${bountyColor}">${task.bounty}L</span>
-        <span class="cdType">${task.taskType}</span>
-        <span class="cdTimer">${countdownText}</span>
-        <span class="cdTitle" title="${title}">${title}</span>
+        <span class="cdBounty ${bountyColor}">${escapeHtml(task.bounty)}L</span>
+        <span class="cdType">${escapeHtml(task.taskType)}</span>
+        <span class="cdTimer">${escapeHtml(countdownText)}</span>
+        <span class="cdTitle" title="${escapeHtmlAttribute(task.title || "")}">${title}</span>
         ${linkBadge}
         ${progressHTML}
       </div>
@@ -1247,6 +1250,10 @@ function formatCountdown(seconds) {
 
 function escapeHtml(text) {
   const div = document.createElement("div");
-  div.textContent = text;
+  div.textContent = String(text ?? "");
   return div.innerHTML;
+}
+
+function escapeHtmlAttribute(text) {
+  return escapeHtml(text).replace(/"/g, "&quot;");
 }

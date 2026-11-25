@@ -134,9 +134,26 @@ for (const [name, url, windowId] of [
   assert.equal(w.created.length, 0);
 });
 
+test("a captured target cannot adopt a tab after the order changes in the same run", async t => {
+  const w = await worker(t, [{ id: 21, windowId: 1, url: ALIAS, status: "complete", openerTabId: 11 }]);
+  let entered, release;
+  const querying = new Promise(resolve => { entered = resolve; });
+  const blocked = new Promise(resolve => { release = resolve; });
+  w.hooks.query = async () => { entered(); await blocked; };
+  const recovery = w.c.recoverPendingXOpenFromCapturedUrl(TARGET);
+  await querying;
+  w.state().currentTask = { taskKey: "next-order", tweetUrl: OTHER, seatLocked: true };
+  w.c.beginXOpenWatch(11, "auto");
+  release();
+  assert.equal(await recovery, null);
+  assert.equal(w.state().currentTask.tweetUrl, OTHER);
+  assert.equal(w.state().xTabId, null);
+  assert.equal(w.created.length, 0);
+});
+
 test("reply history recognizes a completed author alias for i/status", async t => {
   const w = await worker(t);
-  w.stored.replyHistoryRecords = [{ id: "prior", tweetUrl: ALIAS, replyText: "Already posted" }];
+  w.stored.replyHistoryRecords = [{ id: "prior", tweetUrl: ALIAS, replyText: "Already posted", mode: "post", publishedVerified: true }];
   const result = await w.c.queryTweetReplyHistory({ url: TARGET });
   assert.equal(result.replied, true);
   assert.equal(result.record.id, "prior");
@@ -147,7 +164,7 @@ test("completion evidence accepts the same ID alias but still binds run and task
   const w = await worker(t);
   const evidence = { runId: "identity-run", taskKey: "current-order", tweetUrl: ALIAS, officialCompletion: true };
   assert.equal(w.c.latchLighthouseCompletion(evidence, "identity-run"), true);
-  for (const change of [{ tweetUrl: OTHER }, { taskKey: "other-order" }, { runId: "old-run" }]) {
+  for (const change of [{ tweetUrl: OTHER }, { tweetUrl: "" }, { taskKey: "other-order" }, { runId: "old-run" }]) {
     assert.equal(w.c.latchLighthouseCompletion({ ...evidence, ...change }, "identity-run"), false);
   }
 });

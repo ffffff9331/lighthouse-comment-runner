@@ -102,8 +102,7 @@ async function buildLighthouseMonitorSnapshot(reason = "update") {
   const task = runtimeState.currentTask || {};
   const latestLog = Array.isArray(runtimeState.logs) ? runtimeState.logs[0] : null;
   const countdownTask = Array.isArray(monitorCountdowns.tasks) ? monitorCountdowns.tasks[0] : null;
-  let todayOrders = 0;
-  let todayIncome = 0;
+  let todayVerifiedReplies = 0;
   try {
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
@@ -111,12 +110,10 @@ async function buildLighthouseMonitorSnapshot(reason = "update") {
     for (const record of records) {
       const createdAt = new Date(record.createdAt || 0).getTime();
       if (!Number.isFinite(createdAt) || createdAt < todayStart.getTime()) continue;
-      todayOrders += 1;
-      todayIncome += Number(record.bounty || 0) || 0;
+      if (record.publishedVerified) todayVerifiedReplies += 1;
     }
   } catch (_) {
-    todayOrders = 0;
-    todayIncome = 0;
+    todayVerifiedReplies = 0;
   }
   return {
     module: "lighthouse",
@@ -136,8 +133,9 @@ async function buildLighthouseMonitorSnapshot(reason = "update") {
     completed: runtimeState.completed || 0,
     failed: runtimeState.failed || 0,
     attempts: runtimeState.attempts || 0,
-    todayOrders,
-    todayIncome: Number(todayIncome.toFixed(4)),
+    todayOrders: null,
+    todayIncome: null,
+    todayVerifiedReplies,
     logs: (Array.isArray(runtimeState.logs) ? runtimeState.logs : []).slice(0, 5),
     scheduledResumeAt: runtimeState.scheduledResumeAt || 0,
     countdownCount: Array.isArray(monitorCountdowns.tasks) ? monitorCountdowns.tasks.length : 0,
@@ -248,7 +246,7 @@ async function handleMessage(message, sender) {
     await manualStopPromise;
     if (requestedEpoch !== manualDebugCommandEpoch) return { ok: false, cancelled: true, state: runtimeState };
   }
-  if (runtimeState.manuallyStopped && !["START_RUN", "RUN_SELECTED_COUNTDOWN_TASK", "STOP_RUN", "GET_STATE", "GET_CONTENT_SETTINGS", "GET_REPLY_RECORDS", "SAVE_SETTINGS", "CLEAR_REPLY_RECORDS", "OPEN_DEBUG_PAGE", "MONITOR_GET_COUNTDOWNS", "MONITOR_GET_STATUS", "MONITOR_GET_SETTINGS", "MONITOR_MIGRATE_SETTINGS", "MONITOR_SET_ENABLED", "MONITOR_SET_THRESHOLD", "MONITOR_SET_VOICE"].includes(message.type) && !manualStep) {
+  if (runtimeState.manuallyStopped && !["START_RUN", "RUN_SELECTED_COUNTDOWN_TASK", "STOP_RUN", "GET_STATE", "GET_CONTENT_SETTINGS", "GET_REPLY_RECORDS", "SAVE_SETTINGS", "CLEAR_REPLY_RECORDS", "OPEN_DEBUG_PAGE", "MONITOR_GET_COUNTDOWNS", "MONITOR_GET_STATUS", "MONITOR_GET_SETTINGS", "MONITOR_MIGRATE_SETTINGS", "MONITOR_SET_ENABLED", "MONITOR_SET_THRESHOLD", "MONITOR_SET_VOICE", "MONITOR_SAVE_SETTINGS"].includes(message.type) && !manualStep) {
     return { ok: true, ignored: true, paused: true };
   }
   if (runtimeState.manuallyStopped && message.type === "MONITOR_GET_COUNTDOWNS") {
@@ -427,8 +425,10 @@ async function handleMessage(message, sender) {
       await broadcastMonitorMessage({ type: "MONITOR_APPLY_SETTINGS", settings: toPublicMonitorSettings(monitorSettings) });
       return { ok: true, ...monitorSettings };
     }
-    case "MONITOR_SET_VOICE": {
+    case "MONITOR_SET_VOICE":
+    case "MONITOR_SAVE_SETTINGS": {
       const monitorSettings = await updateMonitorSettings({
+        ...(message.type === "MONITOR_SAVE_SETTINGS" ? { enabled: Boolean(message.enabled), minBounty: message.minBounty } : {}),
         voiceEnabled: Boolean(message.voiceEnabled),
         voiceEngine: message.voiceEngine,
         voiceName: message.voiceName,
@@ -523,6 +523,8 @@ async function stopAndClearRun() {
     logs: [{ at: new Date().toISOString(), level: "warn", text: "已停止运行", source: "background", pagePhase: "" }]
   };
   const stoppingState = runtimeState;
+  const stoppedRunId = previousRun.stoppedRunId || previousRun.runId;
+  stoppingState.stoppedRunId = stoppedRunId;
   const ownsStop = () => runtimeState === stoppingState && manualDebugCommandEpoch === stopEpoch;
   manualDebugCommandTail = Promise.resolve();
   monitorCountdowns = { tasks: [], timestamp: 0 };
@@ -535,7 +537,16 @@ async function stopAndClearRun() {
   if (lighthouseMonitorPendingTimer) clearTimeout(lighthouseMonitorPendingTimer);
   lighthouseMonitorPendingTimer = null;
   const cancellation = cancelSupersededLighthouseRun(previousRun, true);
-  await persistAutoRunState(true);
+  let durable = false;
+  try {
+    await persistAutoRunState(true);
+    durable = true;
+  } catch (_) {
+    // A separate storage area can still fence a stale snapshot on worker wakeup.
+    try {
+      if (stoppedRunId) await chrome.storage.session?.set?.({ lighthouseStoppedRunId: stoppedRunId });
+    } catch (_) {}
+  }
   await cancellation;
   if (!ownsStop()) return { ok: false, cancelled: true, state: runtimeState };
   await clearAutoRunResumeSchedule();
@@ -544,16 +555,20 @@ async function stopAndClearRun() {
   if (!ownsStop()) return { ok: false, cancelled: true, state: runtimeState };
   await clearCampaignsIdleReloadAlarm();
   if (!ownsStop()) return { ok: false, cancelled: true, state: runtimeState };
-  if (previousRun.autoRecovery) {
-    await chrome.alarms.clear(AUTO_RECOVERY_ALARM);
-    if (!ownsStop()) return { ok: false, cancelled: true, state: runtimeState };
-  }
+  try { await chrome.alarms.clear(AUTO_RECOVERY_ALARM); } catch (_) {}
+  if (!ownsStop()) return { ok: false, cancelled: true, state: runtimeState };
   await broadcastAutomationPause(true, ownsStop, [previousRun.lighthouseTabId, previousRun.xTabId, previousRun.uncertainAction?.tabId]);
   if (!ownsStop()) return { ok: false, cancelled: true, state: runtimeState };
   runtimeState.runId = createRunId();
-  await persistAutoRunState(true);
-  if (ownsStop()) publishLighthouseMonitorSnapshot("stopped", { force: true });
-  return { ok: true, state: runtimeState };
+  try {
+    await persistAutoRunState(true);
+    durable = true;
+  } catch (_) {}
+  if (!ownsStop()) return { ok: false, cancelled: true, state: runtimeState };
+  publishLighthouseMonitorSnapshot("stopped", { force: true });
+  return durable ? { ok: true, state: runtimeState } : {
+    ok: false, stoppedInMemory: true, error: "当前进程已停止，但未能保存停止状态；请勿重启扩展后继续运行，先重试停止", state: runtimeState
+  };
 }
 
 async function broadcastAutomationPause(paused, isCurrent, alreadyCancelled = []) {
@@ -1424,15 +1439,13 @@ async function debugOpenCurrentDetailTweet() {
   const settings = await getSettings();
   await chrome.tabs.update(tabId, { active: true });
   setStage("opening_tweet_target");
-  beginXOpenWatch(tabId, "debug");
-  const result = await sendToTab(tabId, { type: "OPEN_CURRENT_DETAIL_TWEET_TARGET", runId: runtimeState.runId, settings });
+  const result = await clickCurrentDetailTweetTargetFallback(tabId, "debug");
   if (!result || !result.ok) {
     clearXOpenWatch();
     return failStep(result, "打开 X 推文入口失败");
   }
 
-  runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, result.task);
-  markAttemptedTask(result.task);
+  markAttemptedTask(runtimeState.currentTask);
 
   const tweetTabId = await ensureTweetTabAfterTargetClick(tabId, settings, runtimeState.currentTask, "debug");
   if (!tweetTabId) return failStep(result, "已点击在 X 打开/前往目标，但未检测到 Lighthouse 自己打开的 X 推文页");
@@ -1467,7 +1480,7 @@ async function debugRunXReply() {
   runtimeState.lastXResult = result;
   await recordReplyHistory(result);
   if (!isCurrent()) return cancelled();
-  setStage("x_replied");
+  setStage(result.mode === "fill" ? "x_draft_ready" : "x_replied");
   log("info", result.message || "X 回复步骤已完成");
   return { ok: true, result, state: runtimeState };
 }
@@ -1816,27 +1829,16 @@ async function openNextLighthouseTaskTweetTab(settings, stillCurrent = null) {
   }
 
   setStage("task_detail_opened_for_fast_flow");
-  log("info", openResult.message || "已打开评论/点赞/转发任务详情，准备点击在 X 打开/前往目标");
-
-  beginXOpenWatch(lighthouseTabId, "debug");
-  const targetResult = await sendToTab(lighthouseTabId, {
-    type: "OPEN_CURRENT_DETAIL_TWEET_TARGET",
-    runId,
-    settings
-  });
-  if (!isCurrent()) return null;
-  if (!targetResult || !targetResult.ok) {
-    clearXOpenWatch();
-    throw new Error(targetResult?.message || targetResult?.error || "已打开任务详情，但未能点击在 X 打开/前往目标");
+  log("info", openResult.message || "已打开任务详情，仅使用本单已知的精确推文链接");
+  if (!runtimeState.currentTask?.taskKey || !normalizeTweetUrl(runtimeState.currentTask.tweetUrl)) {
+    throw new Error("缺少本单目标链接，未点击未绑定的 X 入口");
   }
-
-  runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, targetResult.task);
   markAttemptedTask(runtimeState.currentTask);
 
-  const tweetTabId = await ensureTweetTabAfterTargetClick(lighthouseTabId, settings, runtimeState.currentTask, "debug", isCurrent);
+  const tweetTabId = await openDirectTweetTabIfAvailable(runtimeState.currentTask, lighthouseTabId, { isCurrent });
   if (!isCurrent()) return null;
   if (tweetTabId) return tweetTabId;
-  throw new Error("已点击在 X 打开/前往目标，但多次复核仍未检测到 Lighthouse 打开的 X 推文页");
+  throw new Error("未能打开本单已绑定的 X 推文页");
 }
 
 async function openSelectedTaskTweetTab(selectedTask, settings, stillCurrent = null) {
@@ -1893,66 +1895,37 @@ async function ensureTweetTabAfterTargetClick(lighthouseTabId, settings, task, m
     if (!isCurrent()) return null;
     return adopted ? runtimeState.xTabId : null;
   }
-  const maxAttempts = 4;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const directTabId = await openDirectTweetTabIfAvailable(runtimeState.currentTask, lighthouseTabId, { isCurrent });
-    if (!isCurrent()) return null;
-    if (directTabId) return directTabId;
-
-    const adopted = await waitForLighthouseOpenedTweet(runtimeState.currentTask, lighthouseTabId, mode, {
-      timeoutMs: attempt === maxAttempts ? 10000 : 5000,
-      logEveryMs: 2500
-    });
-    if (!isCurrent()) return null;
-    if (adopted && runtimeState.xTabId) {
-      log("info", `已接管 Lighthouse 打开的 X 推文：${runtimeState.currentTask?.tweetUrl || ""}`);
-      return runtimeState.xTabId;
-    }
-
-    const navigating = runtimeState.pendingXOpen && await hasPendingSiteXNavigation(lighthouseTabId, isCurrent);
-    if (!isCurrent() || navigating) return null;
-    clearXOpenWatch();
-    if (attempt >= maxAttempts) break;
-
-    log("warn", `X 推文标签未出现，第 ${attempt + 1}/${maxAttempts} 次重新点击在 X 打开/前往目标`);
-    await chrome.tabs.update(lighthouseTabId, { active: true });
-    if (!isCurrent()) return null;
-    await waitForTabComplete(lighthouseTabId);
-    if (!isCurrent()) return null;
-    await delay(Math.max(settings.actionDelayMs || 500, 800));
-    if (!isCurrent()) return null;
-    beginXOpenWatch(lighthouseTabId, mode);
-    const retryResult = await sendToTab(lighthouseTabId, {
-      type: "OPEN_CURRENT_DETAIL_TWEET_TARGET",
-      runId,
-      settings
-    });
-    if (!isCurrent()) return null;
-    if (!retryResult || !retryResult.ok) {
-      throw new Error(retryResult?.message || retryResult?.error || "重新点击在 X 打开/前往目标失败");
-    }
-    runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, retryResult.task);
-  }
-  return null;
+  const directTabId = await openDirectTweetTabIfAvailable(runtimeState.currentTask, lighthouseTabId, { isCurrent });
+  if (!isCurrent()) return null;
+  if (directTabId) return directTabId;
+  const adopted = await waitForLighthouseOpenedTweet(runtimeState.currentTask, lighthouseTabId, mode, {
+    timeoutMs: 10000, logEveryMs: 2500
+  });
+  return isCurrent() && adopted ? runtimeState.xTabId : null;
 }
 
 async function openDirectTweetTabIfAvailable(task, lighthouseTabId, options = {}) {
   const openingState = runtimeState;
   const openingRunId = runtimeState.runId;
   const openingTask = runtimeState.currentTask;
+  const openingWatch = runtimeState.pendingXOpen;
+  const tweetUrl = normalizeTweetUrl(task?.tweetUrl);
+  const target = normalizeTweetUrl(tweetUrl, true);
   const isCurrent = () => runtimeState === openingState && runtimeState.runId === openingRunId
     && runtimeState.running
     && runtimeState.currentTask === openingTask
+    && Boolean(target) && normalizeTweetUrl(openingTask?.tweetUrl, true) === target
+    && task?.taskKey === openingTask?.taskKey
+    && runtimeState.pendingXOpen === openingWatch
     && !runtimeState.currentTask?.claimRejected && !runtimeState.currentTask?.lockFailed
     && !runtimeState.manuallyStopped && (!options.isCurrent || options.isCurrent());
   if (!isCurrent()) return null;
   if (task?.claimRejected || task?.lockFailed) return null;
-  const tweetUrl = normalizeTweetUrl(task?.tweetUrl);
-  if (!tweetUrl || (task?.awaitingXTabAdoption && !options.allowAwaitingXTabAdoption)) return null;
+  if (task?.awaitingXTabAdoption && !options.allowAwaitingXTabAdoption) return null;
   const existing = await getBoundMatchingTaskXTab(tweetUrl, isCurrent);
   if (!isCurrent()) return null;
   if (existing) return existing.id;
-  if (directTweetOpenPromise) return directTweetOpenPromise;
+  if (directTweetOpenPromise?.isCurrent?.()) return directTweetOpenPromise.promise;
 
   const runId = runtimeState.runId;
   const opening = (async () => {
@@ -1962,17 +1935,18 @@ async function openDirectTweetTabIfAvailable(task, lighthouseTabId, options = {}
     if (runtimeState.runId !== runId || !runtimeState.running) return null;
 
     const pending = runtimeState.pendingXOpen;
-    let siteCandidate = consumeXOpenCandidate(lighthouseTabId, tweetUrl);
+    let siteCandidate = consumeXOpenCandidate(lighthouseTabId, tweetUrl, false);
     if (!siteCandidate) {
       const queriedCandidate = await findRecentTweetTab(
         pending?.startedAt || Date.now(), lighthouseTabId, getRuntimeWindowId(), tweetUrl
       );
       if (!isCurrent()) return null;
       // A tab event can arrive while tabs.query is still returning its snapshot.
-      siteCandidate = consumeXOpenCandidate(lighthouseTabId, tweetUrl) || queriedCandidate;
+      siteCandidate = consumeXOpenCandidate(lighthouseTabId, tweetUrl, false) || queriedCandidate;
     }
     if (!isCurrent()) return null;
     if (siteCandidate) {
+      clearXOpenWatch();
       adoptCurrentXTab(siteCandidate, task, "site");
       return siteCandidate.id;
     }
@@ -1984,14 +1958,14 @@ async function openDirectTweetTabIfAvailable(task, lighthouseTabId, options = {}
       adoptCurrentXTab(lateCandidate, task, "site");
       return lateCandidate.id;
     }
-    clearXOpenWatch();
     const createProperties = { url: tweetUrl, active: true, openerTabId: lighthouseTabId };
     const targetWindowId = getRuntimeWindowId();
     if (Number.isInteger(targetWindowId)) createProperties.windowId = targetWindowId;
     const tweetTab = await chrome.tabs.create(createProperties);
     if (!isCurrent()) return null;
-    await focusTaskXTab(tweetTab.id, tweetTab.windowId);
+    await focusTaskXTab(tweetTab.id, tweetTab.windowId, isCurrent);
     if (!isCurrent()) return null;
+    clearXOpenWatch();
     runtimeState.xTabId = tweetTab.id;
     runtimeState.xTabWindowId = tweetTab.windowId;
     runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, task, {
@@ -2002,11 +1976,11 @@ async function openDirectTweetTabIfAvailable(task, lighthouseTabId, options = {}
     log("info", `已通过任务详情直链打开 X 推文：${tweetUrl}`);
     return tweetTab.id;
   })();
-  directTweetOpenPromise = opening;
+  directTweetOpenPromise = { promise: opening, isCurrent };
   try {
     return await opening;
   } finally {
-    if (directTweetOpenPromise === opening) directTweetOpenPromise = null;
+    if (directTweetOpenPromise?.promise === opening) directTweetOpenPromise = null;
   }
 }
 
@@ -2581,7 +2555,7 @@ function latchLighthouseCompletion(evidence, runId) {
       || evidence.runId !== runId || !evidence.taskKey
       || evidence.taskKey !== runtimeState.currentTask?.taskKey) return false;
   const expectedUrl = normalizeTweetUrl(runtimeState.currentTask?.tweetUrl || "", true);
-  if (evidence.tweetUrl && expectedUrl && normalizeTweetUrl(evidence.tweetUrl, true) !== expectedUrl) return false;
+  if (!expectedUrl || normalizeTweetUrl(evidence.tweetUrl, true) !== expectedUrl) return false;
   runtimeState.completionEvidence = { ...evidence };
   runtimeState.uncertainAction = null;
   return true;
@@ -2605,9 +2579,15 @@ async function handleXReplyResult(result, message = {}) {
   if (!isCurrent()) return { ok: false, cancelled: true };
 
   if (runtimeState.mode === "debug") {
-    setStage(result && result.ok ? "x_replied" : "x_reply_failed");
+    setStage(result?.ok ? (result.mode === "fill" ? "x_draft_ready" : "x_replied") : "x_reply_failed");
     if (!result || !result.ok) runtimeState.failed += 1;
     return { ok: true, state: runtimeState };
+  }
+
+  if (result?.ok && result.mode === "fill") {
+    runtimeState.running = false;
+    setStage("x_draft_ready");
+    return { ok: true, pendingManualReply: true, state: runtimeState };
   }
 
   if (!result || !result.ok) {
@@ -3559,7 +3539,7 @@ function normalizeSettings(settings) {
     maxCooldownWaitMs: Number.isFinite(parsedCooldownWait) ? Math.min(Math.max(parsedCooldownWait, 0), 3600000) : DEFAULT_SETTINGS.maxCooldownWaitMs,
     cooldownPollMs: Number.isFinite(parsedCooldownPoll) ? Math.min(Math.max(parsedCooldownPoll, 200), 5000) : DEFAULT_SETTINGS.cooldownPollMs,
     replyMode: merged.replyMode === "post" ? "post" : "fill",
-    replyProvider: merged.replyProvider === "sola_bridge" ? "sola_bridge" : "native",
+    replyProvider: "native",
     readingSimulationMs: Number.isFinite(Number(merged.readingSimulationMs))
       ? Math.min(Math.max(Math.round(Number(merged.readingSimulationMs)), 500), 20000)
       : 4000,
@@ -4523,7 +4503,11 @@ async function getActiveTweetTab(options = {}) {
 async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options = {}) {
   const waitingState = runtimeState;
   const runId = runtimeState.runId;
-  const isCurrent = () => runtimeState === waitingState && runtimeState.runId === runId && runtimeState.running;
+  const taskKey = runtimeState.currentTask?.taskKey || task?.taskKey;
+  const initialTarget = normalizeTweetUrl(runtimeState.currentTask?.tweetUrl || task?.tweetUrl, true);
+  const isCurrent = () => runtimeState === waitingState && runtimeState.runId === runId && runtimeState.running
+    && (!taskKey || runtimeState.currentTask?.taskKey === taskKey)
+    && (!initialTarget || normalizeTweetUrl(runtimeState.currentTask?.tweetUrl, true) === initialTarget);
   const blockNotice = message => {
     runtimeState.running = false;
     setStage("locked_task_recovery_blocked");
@@ -4673,39 +4657,9 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
         const clickFallback = await clickCurrentDetailTweetTargetFallback(lighthouseTabId, mode, isCurrent);
         if (!isCurrent()) return false;
         if (clickFallback.ok) {
-          runtimeState.currentTask = mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, clickFallback.task, {
-            taskKey: task?.taskKey || runtimeState.currentTask?.taskKey,
-            seatLocked: runtimeState.currentTask?.seatLocked === true
-          });
-          log("warn", "当前详情未暴露直链，已单次点击“去 X 完成动作”并仅等待匹配目标页出现");
-          await delay(1000);
-          if (!isCurrent()) return false;
-          const clickedExpectedUrl = normalizeTweetUrl(runtimeState.currentTask?.tweetUrl || expectedTweetUrl);
-          const clickedBoundTab = await getBoundMatchingTaskXTab(clickedExpectedUrl, isCurrent);
-          if (!isCurrent()) return false;
-          if (clickedBoundTab) return true;
-          const clickedCandidate = consumeXOpenCandidate(lighthouseTabId, clickedExpectedUrl)
-            || await findRecentTweetTab(Date.now() - 1500, lighthouseTabId, lighthouseWindowId, clickedExpectedUrl);
-          if (!isCurrent()) return false;
-          if (clickedCandidate) {
-            adoptCurrentXTab(clickedCandidate, runtimeState.currentTask, "site");
-            return true;
-          }
-          const directAfterClick = await openDirectTweetTabIfAvailable(
-            runtimeState.currentTask || task,
-            lighthouseTabId,
-            { allowAwaitingXTabAdoption: true, source: "extension_fallback", isCurrent }
-          );
-          if (!isCurrent()) return false;
-          if (directAfterClick) {
-            clearXOpenWatch();
-            if (runtimeState.currentTask?.xOpenSource === "extension_fallback") {
-              log("warn", "单次详情按钮未产生匹配页面，插件已使用新提取的任务直链兜底打开 X");
-            }
-            return true;
-          }
-        } else {
-          log("warn", `当前详情未暴露直链，且单次点击“去 X 完成动作”失败：${clickFallback.message}`);
+          log("warn", "已单次点击本单已绑定的 X 入口，仅等待目标页出现");
+        } else if (!clickFallback.cancelled) {
+          log("warn", `未执行详情页 X 入口兜底：${clickFallback.message}`);
         }
       }
     }
@@ -4724,21 +4678,33 @@ async function waitForLighthouseOpenedTweet(task, lighthouseTabId, mode, options
 async function clickCurrentDetailTweetTargetFallback(lighthouseTabId, mode, isCurrent = () => true) {
   if (!lighthouseTabId) return { ok: false, message: "缺少 Lighthouse 任务页" };
   const runId = runtimeState.runId;
+  const task = runtimeState.currentTask;
+  const target = normalizeTweetUrl(task?.tweetUrl, true);
+  if (!task?.taskKey || !target || task.seatLocked !== true) {
+    return { ok: false, message: "缺少已锁定订单或已知目标，不从当前详情猜测目标" };
+  }
+  const state = runtimeState;
+  const ownsOrder = () => isCurrent() && runtimeState === state && state.runId === runId
+    && state.currentTask === task && normalizeTweetUrl(task.tweetUrl, true) === target;
   try {
     const settings = await getSettings();
-    if (!isCurrent()) return { ok: false, cancelled: true };
+    if (!ownsOrder()) return { ok: false, cancelled: true };
     beginXOpenWatch(lighthouseTabId, mode);
+    const watch = state.pendingXOpen;
     const result = await sendToTab(lighthouseTabId, {
       type: "OPEN_CURRENT_DETAIL_TWEET_TARGET",
       runId,
       settings,
-      taskTypeHint: runtimeState.currentTask?.taskType || "",
-      task: runtimeState.currentTask || null
+      task
     });
+    if (!ownsOrder() || state.pendingXOpen !== watch) return { ok: false, cancelled: true };
     if (!result?.ok) {
       return { ok: false, message: result?.message || result?.error || "未找到去 X 完成动作/前往 X 完成动作控件" };
     }
-    return { ok: true, task: result.task || null };
+    if (result.taskKey !== task.taskKey || normalizeTweetUrl(result.tweetUrl, true) !== target) {
+      return { ok: false, message: "详情兜底回执与本单身份不一致" };
+    }
+    return { ok: true };
   } catch (error) {
     return { ok: false, message: error?.message || String(error) };
   }
@@ -4802,7 +4768,7 @@ function recordPotentialLighthouseOpenedXTab(tab, created = false) {
   pending.candidates.push(tab);
 }
 
-function consumeXOpenCandidate(lighthouseTabId, expectedTweetUrl = "") {
+function consumeXOpenCandidate(lighthouseTabId, expectedTweetUrl = "", clearWatch = true) {
   const pending = runtimeState.pendingXOpen;
   if (!pending || pending.lighthouseTabId !== lighthouseTabId) return null;
   const expected = normalizeTweetUrl(expectedTweetUrl, true);
@@ -4810,25 +4776,28 @@ function consumeXOpenCandidate(lighthouseTabId, expectedTweetUrl = "") {
   const index = pending.candidates.findIndex((candidate) => normalizeTweetUrl(candidate.pendingUrl || candidate.url, true) === expected);
   if (index < 0) return null;
   const [candidate] = pending.candidates.splice(index, 1);
-  clearXOpenWatch();
+  if (clearWatch) clearXOpenWatch();
   return candidate;
 }
 
 async function recoverPendingXOpenFromCapturedUrl(tweetUrl) {
   const recoveryState = runtimeState;
   const recoveryRunId = runtimeState.runId;
-  const isCurrent = () => runtimeState === recoveryState && runtimeState.runId === recoveryRunId && runtimeState.running;
   const normalizedUrl = normalizeTweetUrl(tweetUrl);
   const pending = runtimeState.pendingXOpen;
-  const task = runtimeState.currentTask || {};
-  if (!normalizedUrl || !pending) return null;
-  if (!runtimeState.running || (task.seatLocked !== true && !task.seatLockedAt)) return null;
+  const task = runtimeState.currentTask;
+  const taskKey = task?.taskKey;
+  const target = normalizeTweetUrl(normalizedUrl, true);
+  const isCurrent = () => runtimeState === recoveryState && recoveryState.runId === recoveryRunId
+    && recoveryState.running && !recoveryState.manuallyStopped && recoveryState.pendingXOpen === pending
+    && recoveryState.currentTask === task && task.taskKey === taskKey
+    && normalizeTweetUrl(task.tweetUrl, true) === target && !task.claimRejected && !task.lockFailed;
+  if (!target || !pending || !taskKey || !isCurrent() || (task.seatLocked !== true && !task.seatLockedAt)) return null;
   const alreadyBound = await getBoundMatchingTaskXTab(normalizedUrl, isCurrent);
   if (!isCurrent()) return null;
   if (alreadyBound) return alreadyBound.id;
-  if (capturedTargetRecoveryPromise) return capturedTargetRecoveryPromise;
+  if (capturedTargetRecoveryPromise?.isCurrent?.()) return capturedTargetRecoveryPromise.promise;
 
-  const runId = runtimeState.runId;
   const lighthouseTabId = pending.lighthouseTabId;
   const lighthouseWindowId = pending.windowId;
   const startedAt = pending.startedAt || Date.now();
@@ -4838,36 +4807,30 @@ async function recoverPendingXOpenFromCapturedUrl(tweetUrl) {
       const boundTab = await getBoundMatchingTaskXTab(normalizedUrl, isCurrent);
       if (!isCurrent()) return null;
       if (boundTab) return boundTab.id;
-      const candidate = consumeXOpenCandidate(lighthouseTabId, normalizedUrl)
+      const candidate = consumeXOpenCandidate(lighthouseTabId, normalizedUrl, false)
         || await findRecentTweetTab(startedAt, lighthouseTabId, lighthouseWindowId, normalizedUrl);
       if (!isCurrent()) return null;
       if (candidate) {
-        adoptCurrentXTab(candidate, runtimeState.currentTask, "site");
+        clearXOpenWatch();
+        adoptCurrentXTab(candidate, task, "site");
         log("info", "已根据官网回传的精确地址接管 Lighthouse 打开的 X 标签页");
         return candidate.id;
       }
       await delay(1000);
     }
 
-    const directTabId = await openDirectTweetTabIfAvailable(
-      mergeTaskPreservingCapturedTweetUrl(runtimeState.currentTask, null, {
-        tweetUrl: normalizedUrl,
-        awaitingXTabAdoption: false
-      }),
+    if (!isCurrent()) return null;
+    return openDirectTweetTabIfAvailable(
+      task,
       lighthouseTabId,
       { allowAwaitingXTabAdoption: true, source: "extension_fallback", isCurrent }
     );
-    if (!isCurrent()) return null;
-    if (directTabId && runtimeState.currentTask?.xOpenSource === "extension_fallback") {
-      log("warn", "官网已回传目标地址但未创建可接管标签，插件已只创建一次精确兜底页");
-    }
-    return directTabId;
   })();
-  capturedTargetRecoveryPromise = recovery;
+  capturedTargetRecoveryPromise = { promise: recovery, isCurrent };
   try {
     return await recovery;
   } finally {
-    if (capturedTargetRecoveryPromise === recovery) capturedTargetRecoveryPromise = null;
+    if (capturedTargetRecoveryPromise?.promise === recovery) capturedTargetRecoveryPromise = null;
   }
 }
 
@@ -5152,7 +5115,7 @@ async function queryTweetReplyHistory(tweet = {}, task = {}) {
   if (!tweetUrl) return { ok: true, replied: false, reason: "missing_tweet_url" };
 
   const records = await getReplyHistoryRecords();
-  const record = records.find((item) => normalizeTweetUrl(item.tweetUrl || "", true) === normalizeTweetUrl(tweetUrl, true));
+  const record = records.find((item) => item.publishedVerified && normalizeTweetUrl(item.tweetUrl || "", true) === normalizeTweetUrl(tweetUrl, true));
   if (!record) return { ok: true, replied: false, tweetUrl };
 
   return {
@@ -5166,6 +5129,8 @@ async function queryTweetReplyHistory(tweet = {}, task = {}) {
 }
 
 async function recordReplyHistory(result = {}) {
+  if (result.ok !== true || result.mode !== "post" || result.verify?.ok !== true
+      || result.verify.reason !== "published_reply") return false;
   const isCurrent = captureRunGuard();
   const replyText = String(result.replyText || "").trim();
   if (!replyText) return false;
@@ -5181,6 +5146,7 @@ async function recordReplyHistory(result = {}) {
     tweetText: trimRecordText(tweet.text || task.tweetText || task.tweetContent || task.detailText || task.listText || "", 500),
     replyText: trimRecordText(replyText, 280),
     mode: trimRecordText(result.mode || "", 20),
+    publishedVerified: true,
     taskTitle: trimRecordText(task.candidateTitle || task.title || "", 120),
     bounty: resolveTaskBounty(task)
   };
@@ -5232,6 +5198,7 @@ function normalizeReplyHistoryRecords(value) {
       tweetText: trimRecordText(item.tweetText || "", 500),
       replyText: trimRecordText(item.replyText || "", 280),
       mode: trimRecordText(item.mode || "", 20),
+      publishedVerified: item.publishedVerified === true && item.mode === "post",
       taskTitle: trimRecordText(item.taskTitle || "", 120),
       bounty: item.bounty || ""
     }))
@@ -5389,7 +5356,9 @@ async function restoreAutoRunState() {
     const stored = await chrome.storage.local.get([AUTO_RUN_STATE_KEY]);
     const saved = stored[AUTO_RUN_STATE_KEY];
     if (!saved || typeof saved !== "object") return;
-    if (saved.manuallyStopped) {
+    const sessionStop = saved.manuallyStopped ? null
+      : await chrome.storage.session?.get?.(["lighthouseStoppedRunId"]);
+    if (saved.manuallyStopped || (saved.runId && saved.runId === sessionStop?.lighthouseStoppedRunId)) {
       runtimeState = { ...createInitialState(), manuallyStopped: true, stage: "stopped", runId: saved.runId || createRunId(), stopEpoch: saved.stopEpoch, logs: Array.isArray(saved.logs) ? saved.logs.filter(entry => entry.text === "已停止运行").slice(0, 1) : [] };
       return;
     }
@@ -5506,7 +5475,7 @@ async function clearCampaignsIdleReloadAlarm() {
 
 function isPlannedAutoStop(stage) {
   return ["finished", "attempt_limit_reached", "selected_flow_done", "auto_waiting_schedule",
-    "ai_key_required", "auto_blocked", "settings_error"].includes(stage);
+    "ai_key_required", "auto_blocked", "settings_error", "x_draft_ready"].includes(stage);
 }
 
 async function ensureAutoRecoveryAlarm() {
@@ -5633,6 +5602,7 @@ async function recoverTimedOutAutoRun() {
       }).catch(error => {
         if (!current()) return;
         state.running = false;
+        state.autoRecovery = { ...recovery, nextAttemptAt: Date.now() + AUTO_RECOVERY_RECHECK_MS };
         setStage("auto_timeout_recovery_failed");
         log("error", `恢复扫描失败，按恢复计时再次尝试：${error.message || error}`);
         void ensureAutoRecoveryAlarm().catch(() => {});
