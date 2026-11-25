@@ -2,7 +2,7 @@
 
 Chrome 扩展：在灯塔任务广场筛选任务，前往对应 X 推文完成评论、点赞或普通转发，核对结果后回广场继续。也支持这些动作的组合任务和专属邀请。
 
-**当前正式版：0.7.135** · [下载 lighthouse.zip](https://github.com/ffffff9331/lighthouse-comment-runner/releases/latest/download/lighthouse.zip) · [版本历史](CHANGELOG.md)
+**当前正式版：0.7.136** · [下载 lighthouse.zip](https://github.com/ffffff9331/lighthouse-comment-runner/releases/latest/download/lighthouse.zip) · [版本历史](CHANGELOG.md)
 
 ## 安装和更新
 
@@ -67,4 +67,4 @@ node tests/regression-check.mjs
 git diff --check
 ```
 
-项目未配置独立的 lint 或类型检查。离线测试使用模拟页面和测试 Key，不会真实接单或发帖。**0.7.135 的 20 分钟恢复尚未用真实订单验收。** 往期验收见[版本历史](CHANGELOG.md#旧版验证记录)。
+项目未配置独立的 lint 或类型检查。离线测试使用模拟页面和测试 Key，不会真实接单或发帖。**20 分钟恢复尚未用真实订单验收。** 往期验收见[版本历史](CHANGELOG.md#旧版验证记录)。
