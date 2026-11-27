@@ -1490,17 +1490,21 @@
     const expected = normalizeTweetUrl(activeTargetUrl, true);
     if (!expected || normalizeTweetUrl(location.href, true) !== expected) return null;
     const articles = Array.from(document.querySelectorAll("article")).filter(isVisible)
-      .filter(article => readOwnedTweetIds(article).includes(expected));
+      .filter(article => readOwnedTweetIds(article, { allowEditHistory: true }).includes(expected));
     return articles.length === 1 ? articles[0] : null;
   }
 
-  function readOwnedTweetIds(article) {
+  function readOwnedTweetIds(article, { allowEditHistory = false } = {}) {
     return Array.from(article.querySelectorAll("a[href]"))
       .filter(link => link.closest("article") === article && link.querySelector("time")
         && !link.parentElement?.closest('[role="link"],[data-testid="quoteTweet"]'))
       .map(link => {
-        try { return normalizeTweetUrl(new URL(link.getAttribute("href"), location.href).href, true); }
-        catch (_) { return ""; }
+        try {
+          const url = new URL(link.getAttribute("href"), location.href);
+          // Edited posts link their own timestamp to edit history, not the post page.
+          if (allowEditHistory) url.pathname = url.pathname.replace(/^(\/[A-Za-z0-9_]+\/status\/[0-9]+)\/history\/?$/, "$1");
+          return normalizeTweetUrl(url.href, true);
+        } catch (_) { return ""; }
       }).filter(Boolean);
   }
 
@@ -1788,7 +1792,7 @@
         throw new Error("缺少可核对发布结果的目标线程、账号或评论状态，未发送");
       }
       publication = { column, handle, text, task, before: new Set(
-        Array.from(column.querySelectorAll("article")).flatMap(readOwnedTweetIds)
+        Array.from(column.querySelectorAll("article")).flatMap(article => readOwnedTweetIds(article))
       ) };
     } });
     return waitForReplySuccess(30000, 600, publication);

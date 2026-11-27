@@ -20,7 +20,7 @@ function article(url, handle, text, children = []) {
   ]);
 }
 
-function page() {
+function page(orderUrl = TARGET) {
   let elapsed = 0;
   const box = new Element("div", "", [], {"data-testid": "tweetTextarea_0", contenteditable: "true", role: "textbox"});
   const send = new Element("button", "Reply", [], {"data-testid": "tweetButtonInline"});
@@ -45,7 +45,7 @@ function page() {
     function getCurrentAccountHandle() { return f.handle; }
     function inferTaskActions() { return {complete: true, steps: [{action: "comment", completed: f.complete}]}; }
     wait = tick;
-    activeTargetUrl = ${JSON.stringify(TARGET)};
+    activeTargetUrl = ${JSON.stringify(orderUrl)};
     activeRunId = "composer-run";
     globalThis.api = {getBoundReplyBox, openReplyComposer, findSendButton, assertBoundReplyBox, waitForReplySuccess, assertActiveRun};
   ` + source.slice(end), context);
@@ -106,6 +106,39 @@ function addInlineReply(p) {
   const inline = new Element("div", "", [p.box, p.send], {"data-testid": "inline_reply_offscreen"});
   p.column.appendChild(inline);
   return inline;
+}
+
+test("binds an edited target through its own /history timestamp on the post page", async () => {
+  const p = page("https://x.com/i/status/123");
+  p.target.querySelector("time").parentElement.href = "/author/status/123/history";
+  p.target.appendChild(new Element("a", "", [], {href: "/author/status/123/photo/1"}));
+  p.target.appendChild(new Element("a", "", [], {href: "/author/status/123/analytics"}));
+  addInlineReply(p);
+
+  assert.equal(await p.api.openReplyComposer({actionDelayMs: 100}), p.box);
+  assert.equal(p.api.findSendButton(p.box), p.send);
+  assert.equal(p.send.clicks, 0);
+});
+
+for (const scenario of ["quoted", "duplicate-target", "different-id", "different-host", "no-timestamp", "history-page"]) {
+  test(`does not bind an edit-history link with ${scenario}`, () => {
+    const p = page();
+    const timestamp = p.target.querySelector("time");
+    const link = timestamp.parentElement;
+    link.href = "/author/status/123/history";
+    if (scenario === "quoted") {
+      link.remove();
+      p.target.appendChild(new Element("div", "", [link], {role: "link"}));
+    }
+    if (scenario === "duplicate-target") p.column.appendChild(article(TARGET, "author", "Another copy"));
+    if (scenario === "different-id") link.href = "/author/status/456/history";
+    if (scenario === "different-host") link.href = "https://example.com/author/status/123/history";
+    if (scenario === "no-timestamp") timestamp.remove();
+    if (scenario === "history-page") p.location.href = `${TARGET}/history`;
+    assert.equal(p.api.getBoundReplyBox(), null);
+    assert.equal(p.api.findSendButton(p.box), null);
+    assert.equal(p.send.clicks, 0);
+  });
 }
 
 test("uses the native inline editor below the exact target with its own send button", async () => {
@@ -255,13 +288,14 @@ test("publication needs a fresh own reply plus same-task official comment comple
   assert.equal(result.replyUrl, "https://x.com/i/status/789");
 });
 
-for (const scenario of ["old-reply", "wrong-author", "wrong-text", "changed-account", "changed-target"]) {
+for (const scenario of ["old-reply", "wrong-author", "wrong-text", "changed-account", "changed-target", "history-only-reply"]) {
   test(`publication never confirms ${scenario}`, async () => {
     const p = page();
     p.f.complete = true;
     const before = new Set(["https://x.com/i/status/123"]);
     if (scenario === "old-reply") before.add("https://x.com/i/status/789");
-    p.column.appendChild(article("https://x.com/me/status/789", scenario === "wrong-author" ? "other" : "me",
+    const replyUrl = scenario === "history-only-reply" ? "https://x.com/me/status/789/history" : "https://x.com/me/status/789";
+    p.column.appendChild(article(replyUrl, scenario === "wrong-author" ? "other" : "me",
       scenario === "wrong-text" ? "Different reply" : "My reply"));
     if (scenario === "changed-account") p.f.handle = "@another";
     if (scenario === "changed-target") p.location.href = OTHER;
